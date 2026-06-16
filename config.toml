@@ -1,0 +1,12 @@
+media_libraries = []
+
+[database]
+path = "data/slint-bangumi.sqlite3"
+
+[dandanplay]
+app_id = ""
+app_secret = ""
+api_key = ""
+
+[logging]
+level = "info"

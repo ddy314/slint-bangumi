@@ -1,0 +1,109 @@
+import { Button, LineEdit, ListView, TextEdit, VerticalBox, HorizontalBox } from "std-widgets.slint";
+
+export component MainWindow inherits Window {
+    width: 900px;
+    height: 680px;
+    title: "Slint Bangumi Backend Test";
+
+    in-out property <string> media_path_input;
+    in property <[string]> media_items;
+    in-out property <string> selected_info;
+    in-out property <string> logs;
+    in-out property <string> scan_progress;
+
+    callback add_media_path(string);
+    callback scan_library();
+    callback select_media(int);
+    callback save_progress();
+    callback clear_progress();
+    callback load_danmaku();
+
+    VerticalBox {
+        padding: 12px;
+        spacing: 8px;
+
+        Text {
+            text: "Backend core test panel";
+            font-size: 20px;
+            font-weight: 700;
+        }
+
+        HorizontalBox {
+            spacing: 8px;
+            LineEdit {
+                text <=> root.media_path_input;
+                placeholder-text: "Local media folder path";
+            }
+            Button {
+                text: "Add Folder";
+                clicked => {
+                    root.add_media_path(root.media_path_input);
+                }
+            }
+            Button {
+                text: "Scan";
+                clicked => {
+                    root.scan_library();
+                }
+            }
+        }
+
+        Text {
+            text: "Scan progress: " + root.scan_progress;
+        }
+
+        HorizontalBox {
+            spacing: 12px;
+
+            VerticalBox {
+                Text { text: "Videos"; font-weight: 700; }
+                ListView {
+                    height: 260px;
+                    for item[index] in root.media_items : Button {
+                        text: item;
+                        clicked => {
+                            root.select_media(index);
+                        }
+                    }
+                }
+            }
+
+            VerticalBox {
+                Text { text: "Selected video"; font-weight: 700; }
+                TextEdit {
+                    height: 220px;
+                    text: root.selected_info;
+                    read-only: true;
+                }
+                HorizontalBox {
+                    spacing: 8px;
+                    Button {
+                        text: "Save Test Progress";
+                        clicked => {
+                            root.save_progress();
+                        }
+                    }
+                    Button {
+                        text: "Clear Progress";
+                        clicked => {
+                            root.clear_progress();
+                        }
+                    }
+                    Button {
+                        text: "Mock Danmaku Match";
+                        clicked => {
+                            root.load_danmaku();
+                        }
+                    }
+                }
+            }
+        }
+
+        Text { text: "Backend log"; font-weight: 700; }
+        TextEdit {
+            height: 220px;
+            text: root.logs;
+            read-only: true;
+        }
+    }
+}
