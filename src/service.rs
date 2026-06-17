@@ -26,6 +26,14 @@ pub struct MediaService {
     events: mpsc::Sender<AppEvent>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct SettingsFlags {
+    pub bangumi_enabled: bool,
+    pub bangumi_auto_match: bool,
+    pub bangumi_cache_images: bool,
+    pub dandanplay_configured: bool,
+}
+
 impl MediaService {
     pub fn new(
         config: Arc<ConfigStore>,
@@ -100,6 +108,17 @@ impl MediaService {
             config.bangumi.cache_images,
             media_libraries
         )
+    }
+
+    pub fn settings_flags(&self) -> SettingsFlags {
+        let config = self.config.snapshot();
+        SettingsFlags {
+            bangumi_enabled: config.bangumi.enabled,
+            bangumi_auto_match: config.bangumi.auto_match,
+            bangumi_cache_images: config.bangumi.cache_images,
+            dandanplay_configured: !config.dandanplay.app_id.trim().is_empty()
+                && !config.dandanplay.app_secret.trim().is_empty(),
+        }
     }
 
     pub fn open_media(&self, media: &MediaItem) -> AppResult<()> {
@@ -189,9 +208,47 @@ impl MetadataService {
                 let repository = self.repository.clone();
                 let events = self.events.clone();
                 let danmaku = self.danmaku.clone();
+                let image_cache = self.image_cache.clone();
+                let use_dandanplay = self.dandanplay_configured();
                 std::thread::spawn(move || {
-                    let danmaku_hint = danmaku.match_dandanplay(&media).ok();
-                    task::spawn_match_metadata(repository, provider, media, danmaku_hint, events);
+                    let danmaku_hint = if use_dandanplay {
+                        match danmaku.cached_or_match_dandanplay(&media) {
+                            Ok(result) => result,
+                            Err(error) => {
+                                let _ = events.send(AppEvent::Log(format!(
+                                    "dandanplay hint unavailable for {}: {error}",
+                                    media.file_name
+                                )));
+                                None
+                            }
+                        }
+                    } else {
+                        match danmaku.cached_dandanplay(&media) {
+                            Ok(Some(result)) => Some(result),
+                            Ok(None) => {
+                                let _ = events.send(AppEvent::Log(
+                                    "dandanplay hint skipped; app_id/app_secret are not configured"
+                                        .to_string(),
+                                ));
+                                None
+                            }
+                            Err(error) => {
+                                let _ = events.send(AppEvent::Log(format!(
+                                    "dandanplay cache unavailable for {}: {error}",
+                                    media.file_name
+                                )));
+                                None
+                            }
+                        }
+                    };
+                    task::spawn_match_metadata(
+                        repository,
+                        provider,
+                        image_cache,
+                        media,
+                        danmaku_hint,
+                        events,
+                    );
                 });
             }
             Ok(None) => {
@@ -225,7 +282,46 @@ impl MetadataService {
             return;
         };
 
-        task::spawn_match_all_unmatched(self.repository.clone(), provider, self.events.clone());
+        let danmaku = self.danmaku.clone();
+        let use_dandanplay = self.dandanplay_configured();
+        if !use_dandanplay {
+            let _ = self.events.send(AppEvent::Log(
+                "dandanplay hints skipped for match-all; app_id/app_secret are not configured"
+                    .to_string(),
+            ));
+        }
+        task::spawn_match_all_unmatched(
+            self.repository.clone(),
+            provider,
+            self.image_cache.clone(),
+            move |media| {
+                if use_dandanplay {
+                    danmaku
+                        .cached_or_match_dandanplay(media)
+                        .map_err(|error| error.to_string())
+                } else {
+                    danmaku
+                        .cached_dandanplay(media)
+                        .map_err(|error| error.to_string())
+                }
+            },
+            self.events.clone(),
+        );
+    }
+
+    pub fn start_auto_match_after_scan(&self) {
+        let config = self.config.snapshot().bangumi;
+        if !config.enabled || !config.auto_match {
+            let _ = self.events.send(AppEvent::Log(
+                "auto metadata match skipped by Bangumi config".to_string(),
+            ));
+            return;
+        }
+
+        let _ = self.events.send(AppEvent::MetadataStatus(
+            "Auto metadata match queued".to_string(),
+        ));
+        self.start_match_all_unmatched();
     }
 
     pub fn start_download_subject_images(&self, subject_id: i64) {
@@ -354,6 +450,11 @@ impl MetadataService {
             }
         }
     }
+
+    fn dandanplay_configured(&self) -> bool {
+        let config = self.config.snapshot().dandanplay;
+        !config.app_id.trim().is_empty() && !config.app_secret.trim().is_empty()
+    }
 }
 
 fn image_cache_root(database_path: &std::path::Path) -> PathBuf {
@@ -438,18 +539,24 @@ impl WatchHistoryService {
 #[derive(Clone)]
 pub struct DanmakuService {
     config: Arc<ConfigStore>,
+    repository: Repository,
     client: Client,
     events: mpsc::Sender<AppEvent>,
 }
 
 impl DanmakuService {
-    pub fn new(config: Arc<ConfigStore>, events: mpsc::Sender<AppEvent>) -> AppResult<Self> {
+    pub fn new(
+        config: Arc<ConfigStore>,
+        repository: Repository,
+        events: mpsc::Sender<AppEvent>,
+    ) -> AppResult<Self> {
         let client = Client::builder()
             .timeout(Duration::from_secs(20))
             .user_agent(concat!("slint-bangumi/", env!("CARGO_PKG_VERSION")))
             .build()?;
         Ok(Self {
             config,
+            repository,
             client,
             events,
         })
@@ -463,6 +570,15 @@ impl DanmakuService {
 
         match self.match_dandanplay(media) {
             Ok(result) => {
+                if let Err(error) = self.repository.upsert_danmaku_match(
+                    media.id,
+                    &result,
+                    task::unix_timestamp_ms(),
+                ) {
+                    let _ = self
+                        .events
+                        .send(AppEvent::Log(format!("danmaku cache failed: {error}")));
+                }
                 let _ = self.events.send(AppEvent::DanmakuMatched(result));
             }
             Err(error) => {
@@ -471,6 +587,21 @@ impl DanmakuService {
                     .send(AppEvent::Log(format!("danmaku load failed: {error}")));
             }
         }
+    }
+
+    pub fn cached_or_match_dandanplay(&self, media: &MediaItem) -> AppResult<Option<DanmakuMatch>> {
+        if let Some(result) = self.repository.danmaku_match_for_media(media.id)? {
+            return Ok(Some(result));
+        }
+
+        let result = self.match_dandanplay(media)?;
+        self.repository
+            .upsert_danmaku_match(media.id, &result, task::unix_timestamp_ms())?;
+        Ok(Some(result))
+    }
+
+    pub fn cached_dandanplay(&self, media: &MediaItem) -> AppResult<Option<DanmakuMatch>> {
+        self.repository.danmaku_match_for_media(media.id)
     }
 
     pub fn match_dandanplay(&self, media: &MediaItem) -> AppResult<DanmakuMatch> {

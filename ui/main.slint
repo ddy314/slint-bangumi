@@ -336,6 +336,70 @@ component SettingsRow inherits Rectangle {
     }
 }
 
+component LogPanel inherits Rectangle {
+    in property <[UiLogLine]> logs;
+
+    height: 150px;
+    border-radius: 16px;
+    background: #211f1c;
+    border-width: 1px;
+    border-color: #3e3932;
+
+    Text {
+        x: 16px;
+        y: 12px;
+        text: "Activity";
+        color: #f0e9df;
+        font-size: 14px;
+        font-weight: 800;
+    }
+
+    Text {
+        x: 92px;
+        y: 14px;
+        text: root.logs.length == 0 ? "No messages yet" : "Recent messages";
+        color: #a9a097;
+        font-size: 11px;
+    }
+
+    ListView {
+        x: 12px;
+        y: 38px;
+        width: parent.width - 24px;
+        height: parent.height - 48px;
+        for line in root.logs : Rectangle {
+            height: 28px;
+            background: #00000000;
+            Text {
+                x: 4px;
+                width: 66px;
+                text: line.timestamp;
+                color: #8f877d;
+                font-size: 11px;
+                vertical-alignment: center;
+            }
+            Text {
+                x: 76px;
+                width: 58px;
+                text: line.level;
+                color: line.level == "error" ? #ffb4be : line.level == "warn" ? #e7c681 : #9fc8a3;
+                font-size: 11px;
+                font-weight: 800;
+                vertical-alignment: center;
+            }
+            Text {
+                x: 138px;
+                width: parent.width - 146px;
+                text: line.message;
+                color: #d8d0c7;
+                font-size: 11px;
+                overflow: elide;
+                vertical-alignment: center;
+            }
+        }
+    }
+}
+
 export component MainWindow inherits Window {
     width: 1320px;
     height: 860px;
@@ -360,9 +424,20 @@ export component MainWindow inherits Window {
     in-out property <string> metadata_status;
     in-out property <string> settings_summary;
     in-out property <string> home_summary;
+    in-out property <string> library_filter: "all";
+    in-out property <string> library_sort: "title";
+    in-out property <bool> library_view_grid: false;
+    in-out property <bool> bangumi_enabled: true;
+    in-out property <bool> bangumi_auto_match: true;
+    in-out property <bool> bangumi_cache_images: true;
+    in-out property <bool> dandanplay_configured: false;
 
     callback add_media_path(string);
     callback scan_library();
+    callback update_library_search(string);
+    callback set_library_filter(string);
+    callback set_library_sort(string);
+    callback set_library_view_grid(bool);
     callback select_media_id(int);
     callback select_candidate_id(int);
     callback play_selected_media();
@@ -418,7 +493,7 @@ export component MainWindow inherits Window {
                     Rectangle { width: parent.width; height: parent.height; background: #120f0ab0; }
 
                     TonalButton { x: 24px; y: 22px; width: 142px; text: "Back to Library"; clicked => { root.detail_open = false; root.active_page = 1; } }
-                    TonalButton { x: parent.width - 116px; y: 22px; width: 92px; text: "More"; clicked => { } }
+                    TonalButton { x: parent.width - 142px; y: 22px; width: 118px; text: "Cache Images"; clicked => { root.refresh_subject_images(); } }
                     Chip { x: 24px; y: 176px; text: root.subject_detail.match_status; selected: true; tone: root.subject_detail.subject_id > 0 ? "green" : "blue"; }
                     Text { x: 24px; y: 216px; width: parent.width - 48px; text: root.subject_detail.title; color: #fff7ed; font-size: 34px; font-weight: 850; overflow: elide; }
                     Text { x: 26px; y: 258px; width: parent.width - 52px; text: root.subject_detail.title_cn; color: #d8cfc4; font-size: 15px; overflow: elide; }
@@ -498,8 +573,8 @@ export component MainWindow inherits Window {
                 if root.subject_detail.subject_id == 0 : HorizontalBox {
                     spacing: 16px;
                     VerticalBox {
-                        Text { text: "Search Bangumi"; color: #f3ece3; font-size: 18px; font-weight: 800; }
-                        LineEdit { height: 40px; text <=> root.library_search; placeholder-text: "Search Bangumi candidates"; }
+                        Text { text: "Bangumi Match"; color: #f3ece3; font-size: 18px; font-weight: 800; }
+                        Text { text: "Run Rematch to fetch candidates, then confirm one below."; color: #b8afa4; font-size: 12px; }
                     }
                     VerticalBox {
                         Text { text: "Candidates"; color: #f3ece3; font-size: 18px; font-weight: 800; }
@@ -592,27 +667,32 @@ export component MainWindow inherits Window {
 
                 HorizontalBox {
                     spacing: 10px;
-                    LineEdit { height: 40px; text <=> root.library_search; placeholder-text: "Search title, filename, tag"; }
-                    Chip { text: "All"; selected: true; }
-                    Chip { text: "Watching"; selected: false; }
-                    Chip { text: "Completed"; selected: false; }
-                    Chip { text: "Unmatched"; selected: false; tone: "blue"; }
-                    Chip { text: "Tentative"; selected: false; }
-                    TonalButton { width: 118px; text: "Title"; }
-                    TonalButton { width: 126px; text: "Date Added"; }
-                    TonalButton { width: 126px; text: "Grid/List"; }
+                    LineEdit {
+                        height: 40px;
+                        text <=> root.library_search;
+                        placeholder-text: "Search title, filename, tag";
+                        edited(text) => { root.update_library_search(text); }
+                    }
+                    Chip { text: "All"; selected: root.library_filter == "all"; clicked => { root.set_library_filter("all"); } }
+                    Chip { text: "Watching"; selected: root.library_filter == "watching"; tone: "green"; clicked => { root.set_library_filter("watching"); } }
+                    Chip { text: "Completed"; selected: root.library_filter == "completed"; tone: "green"; clicked => { root.set_library_filter("completed"); } }
+                    Chip { text: "Unmatched"; selected: root.library_filter == "unmatched"; tone: "blue"; clicked => { root.set_library_filter("unmatched"); } }
+                    Chip { text: "Tentative"; selected: root.library_filter == "tentative"; clicked => { root.set_library_filter("tentative"); } }
+                    TonalButton { width: 118px; text: root.library_sort == "title" ? "Title *" : "Title"; primary: root.library_sort == "title"; clicked => { root.set_library_sort("title"); } }
+                    TonalButton { width: 126px; text: root.library_sort == "date" ? "Date *" : "Date Added"; primary: root.library_sort == "date"; clicked => { root.set_library_sort("date"); } }
+                    TonalButton { width: 126px; text: root.library_view_grid ? "Grid" : "List"; primary: root.library_view_grid; clicked => { root.set_library_view_grid(!root.library_view_grid); } }
                 }
 
                 if root.media_rows.length == 0 : Rectangle {
                     height: 520px;
                     border-radius: 24px;
                     background: #24221f;
-                    Text { y: 190px; width: parent.width; text: "No media indexed"; color: #f4eee8; font-size: 28px; font-weight: 850; horizontal-alignment: center; }
-                    Text { y: 232px; width: parent.width; text: "Add a folder and run Scan to build the local library."; color: #b8afa4; horizontal-alignment: center; }
+                    Text { y: 190px; width: parent.width; text: root.library_search == "" && root.library_filter == "all" ? "No media indexed" : "No media matches"; color: #f4eee8; font-size: 28px; font-weight: 850; horizontal-alignment: center; }
+                    Text { y: 232px; width: parent.width; text: root.library_search == "" && root.library_filter == "all" ? "Add a folder and run Scan to build the local library." : "Adjust search, filter, or sorting to widen the result set."; color: #b8afa4; horizontal-alignment: center; }
                     TonalButton { x: parent.width / 2 - 77px; y: 278px; text: "Add Folder"; primary: true; clicked => { root.active_page = 3; } }
                 }
 
-                if root.media_rows.length > 0 : ListView {
+                if root.media_rows.length > 0 && root.library_view_grid : ListView {
                     height: 640px;
                     for row in root.media_rows : HorizontalBox {
                         height: 350px;
@@ -624,6 +704,16 @@ export component MainWindow inherits Window {
                         if row.show4 : PosterCard { card: row.card4; clicked(id) => { root.select_media_id(id); root.detail_open = true; } }
                     }
                 }
+
+                if root.media_cards.length > 0 && !root.library_view_grid : ListView {
+                    height: 520px;
+                    for card in root.media_cards : ContinueRow {
+                        card: card;
+                        clicked(id) => { root.select_media_id(id); root.detail_open = true; }
+                    }
+                }
+
+                LogPanel { logs: root.log_lines; }
             }
 
             if !root.detail_open && root.active_page == 2 : HorizontalBox {
@@ -658,7 +748,7 @@ export component MainWindow inherits Window {
                 VerticalBox {
                     Text { text: "Preview"; color: #f4eee8; font-size: 22px; font-weight: 850; }
                     Rectangle {
-                        height: 520px;
+                        height: 500px;
                         border-radius: 22px;
                         background: #25231f;
                         Text { x: 22px; y: 22px; width: parent.width - 44px; text: root.candidate_preview.title; color: #f8f1e7; font-size: 22px; font-weight: 850; overflow: elide; }
@@ -666,6 +756,7 @@ export component MainWindow inherits Window {
                         TextEdit { x: 18px; y: 92px; width: parent.width - 36px; height: 340px; text: root.candidate_preview.summary; read-only: true; }
                         HorizontalBox { x: 18px; y: 454px; spacing: 10px; TonalButton { text: "Confirm"; primary: true; clicked => { root.confirm_selected_candidate(); } } TonalButton { text: "Cache Images"; clicked => { root.refresh_subject_images(); } } }
                     }
+                    LogPanel { logs: root.log_lines; }
                 }
             }
 
@@ -699,12 +790,13 @@ export component MainWindow inherits Window {
                         TonalButton { text: "Add Folder"; primary: true; clicked => { root.add_media_path(root.media_path_input); } }
                         TonalButton { text: "Scan Now"; clicked => { root.scan_library(); } }
                     }
-                    SettingsRow { title: "Auto scan on launch"; subtitle: "Index first, then match metadata in the background."; enabled: true; }
-                    SettingsRow { title: "Bangumi metadata"; subtitle: "Token is stored locally and never displayed in logs."; enabled: true; }
-                    SettingsRow { title: "Cache poster and hero images"; subtitle: "One subject stores one poster and one hero image."; enabled: true; }
-                    SettingsRow { title: "Dandanplay file recognition"; subtitle: "Uses hash and filename when credentials are configured."; enabled: true; }
+                    SettingsRow { title: "Bangumi metadata"; subtitle: "Token is stored locally and never displayed in logs."; enabled: root.bangumi_enabled; }
+                    SettingsRow { title: "Auto metadata match"; subtitle: "Runs after library scans when enabled in config.toml."; enabled: root.bangumi_auto_match; }
+                    SettingsRow { title: "Cache poster and hero images"; subtitle: "One subject stores one poster and one hero image."; enabled: root.bangumi_cache_images; }
+                    SettingsRow { title: "Dandanplay file recognition"; subtitle: "Uses hash and filename when credentials are configured."; enabled: root.dandanplay_configured; }
                     HorizontalBox { spacing: 10px; TonalButton { text: "Test Bangumi"; clicked => { root.test_bangumi_connection(); } } TonalButton { text: "Match All"; clicked => { root.match_all_metadata(); } } }
-                    TextEdit { height: 250px; text: root.settings_summary; read-only: true; }
+                    TextEdit { height: 190px; text: root.settings_summary; read-only: true; }
+                    LogPanel { logs: root.log_lines; }
                 }
             }
 

@@ -3,8 +3,9 @@ use std::path::{Path, PathBuf};
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::domain::{
-    MediaFile, MediaItem, MetadataCandidate, ScanUpsertStatus, Subject, SubjectEpisode,
-    SubjectImageCache, UiCandidateData, UiMediaCardData, UiSubjectDetailData, WatchProgress,
+    DanmakuMatch, MediaFile, MediaItem, MetadataCandidate, ScanUpsertStatus, Subject,
+    SubjectEpisode, SubjectImageCache, UiCandidateData, UiMediaCardData, UiSubjectDetailData,
+    WatchProgress,
 };
 use crate::error::AppResult;
 use crate::metadata::provider::{SubjectDetail, SubjectSearchResult};
@@ -157,6 +158,20 @@ impl Repository {
 
             CREATE UNIQUE INDEX IF NOT EXISTS idx_media_episode_links_media
                 ON media_episode_links(media_id);
+
+            CREATE TABLE IF NOT EXISTS danmaku_matches (
+                media_id INTEGER PRIMARY KEY,
+                provider TEXT NOT NULL,
+                title TEXT NOT NULL,
+                anime_id INTEGER,
+                episode_id INTEGER,
+                anime_title TEXT,
+                episode TEXT,
+                comment_count INTEGER NOT NULL DEFAULT 0,
+                exact INTEGER NOT NULL DEFAULT 0,
+                updated_at INTEGER NOT NULL,
+                FOREIGN KEY(media_id) REFERENCES media_items(id) ON DELETE CASCADE
+            );
             "#,
         )?;
         add_column_if_missing(
@@ -357,7 +372,11 @@ impl Repository {
     ) -> AppResult<Vec<MetadataCandidate>> {
         let conn = self.connect()?;
         for (index, candidate) in candidates.iter().enumerate() {
-            let confidence = if index == 0 { 0.72 } else { 0.42 };
+            let confidence = match (source, index) {
+                ("dandanplay_exact", 0) => 0.95,
+                (_, 0) => 0.72,
+                _ => 0.42,
+            };
             let selected = if index == 0 { 1 } else { 0 };
             conn.execute(
                 r#"
@@ -1173,6 +1192,72 @@ impl Repository {
             params![media_id],
         )?;
         Ok(())
+    }
+
+    pub fn upsert_danmaku_match(
+        &self,
+        media_id: i64,
+        result: &DanmakuMatch,
+        now: i64,
+    ) -> AppResult<()> {
+        let conn = self.connect()?;
+        conn.execute(
+            r#"
+            INSERT INTO danmaku_matches
+                (media_id, provider, title, anime_id, episode_id, anime_title, episode,
+                 comment_count, exact, updated_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            ON CONFLICT(media_id) DO UPDATE SET
+                provider = excluded.provider,
+                title = excluded.title,
+                anime_id = excluded.anime_id,
+                episode_id = excluded.episode_id,
+                anime_title = excluded.anime_title,
+                episode = excluded.episode,
+                comment_count = excluded.comment_count,
+                exact = excluded.exact,
+                updated_at = excluded.updated_at
+            "#,
+            params![
+                media_id,
+                result.provider,
+                result.title,
+                result.anime_id,
+                result.episode_id,
+                result.anime_title,
+                result.episode,
+                result.comment_count as i64,
+                if result.exact { 1 } else { 0 },
+                now
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn danmaku_match_for_media(&self, media_id: i64) -> AppResult<Option<DanmakuMatch>> {
+        let conn = self.connect()?;
+        conn.query_row(
+            r#"
+            SELECT provider, title, anime_id, episode_id, anime_title, episode, comment_count, exact
+            FROM danmaku_matches
+            WHERE media_id = ?1
+            "#,
+            params![media_id],
+            |row| {
+                Ok(DanmakuMatch {
+                    provider: row.get(0)?,
+                    title: row.get(1)?,
+                    anime_id: row.get(2)?,
+                    episode_id: row.get(3)?,
+                    anime_title: row.get(4)?,
+                    episode: row.get(5)?,
+                    comment_count: row.get::<_, i64>(6)? as usize,
+                    exact: row.get::<_, i64>(7)? != 0,
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
     }
 
     fn connect(&self) -> AppResult<Connection> {

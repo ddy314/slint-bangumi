@@ -7,10 +7,20 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use walkdir::WalkDir;
 
-use crate::domain::{DanmakuMatch, MediaFile, MediaItem, ScanSummary, ScanUpsertStatus};
+use crate::domain::{
+    DanmakuMatch, MediaFile, MediaItem, MetadataCandidate, ScanSummary, ScanUpsertStatus,
+};
 use crate::metadata::cache::ImageCache;
 use crate::metadata::provider::MetadataProvider;
 use crate::repository::Repository;
+
+const AUTO_CONFIRM_CONFIDENCE: f64 = 0.90;
+
+#[derive(Debug, Clone)]
+struct MatchOutcome {
+    title: Option<String>,
+    subject_id: Option<i64>,
+}
 
 #[derive(Debug, Clone)]
 pub enum AppEvent {
@@ -266,6 +276,7 @@ mod tests {
 pub fn spawn_match_metadata<P>(
     repository: Repository,
     provider: P,
+    image_cache: ImageCache,
     media: MediaItem,
     danmaku_hint: Option<DanmakuMatch>,
     events: mpsc::Sender<AppEvent>,
@@ -274,12 +285,12 @@ pub fn spawn_match_metadata<P>(
 {
     thread::spawn(move || {
         let _ = events.send(AppEvent::MetadataMatchStarted { media_id: media.id });
-        match match_one_media(&repository, &provider, &media, danmaku_hint) {
-            Ok(title) => {
+        match match_one_media(&repository, &provider, &image_cache, &media, danmaku_hint) {
+            Ok(outcome) => {
                 let _ = events.send(AppEvent::MetadataMatchFinished {
                     media_id: media.id,
-                    subject_id: None,
-                    title,
+                    subject_id: outcome.subject_id,
+                    title: outcome.title,
                 });
             }
             Err(error) => {
@@ -295,6 +306,8 @@ pub fn spawn_match_metadata<P>(
 pub fn spawn_match_all_unmatched<P>(
     repository: Repository,
     provider: P,
+    image_cache: ImageCache,
+    hint_loader: impl Fn(&MediaItem) -> Result<Option<DanmakuMatch>, String> + Send + 'static,
     events: mpsc::Sender<AppEvent>,
 ) where
     P: MetadataProvider + Clone + Send + 'static,
@@ -317,12 +330,22 @@ pub fn spawn_match_all_unmatched<P>(
                 processed: index,
                 total,
             });
-            match match_one_media(&repository, &provider, &item, None) {
-                Ok(title) => {
+            let danmaku_hint = match hint_loader(&item) {
+                Ok(result) => result,
+                Err(error) => {
+                    let _ = events.send(AppEvent::Log(format!(
+                        "dandanplay hint unavailable for {}: {error}",
+                        item.file_name
+                    )));
+                    None
+                }
+            };
+            match match_one_media(&repository, &provider, &image_cache, &item, danmaku_hint) {
+                Ok(outcome) => {
                     let _ = events.send(AppEvent::MetadataMatchFinished {
                         media_id: item.id,
-                        subject_id: None,
-                        title,
+                        subject_id: outcome.subject_id,
+                        title: outcome.title,
                     });
                 }
                 Err(error) => {
@@ -391,26 +414,65 @@ pub fn spawn_download_subject_images<P>(
 fn match_one_media<P>(
     repository: &Repository,
     provider: &P,
+    image_cache: &ImageCache,
     media: &MediaItem,
     danmaku_hint: Option<DanmakuMatch>,
-) -> crate::error::AppResult<Option<String>>
+) -> crate::error::AppResult<MatchOutcome>
 where
     P: MetadataProvider,
 {
     let keyword = crate::metadata::matcher::keyword_for_media(media, danmaku_hint.as_ref());
+    let dandanplay_exact = danmaku_hint
+        .as_ref()
+        .map(|hint| hint.exact)
+        .unwrap_or(false);
     let candidates = provider.search_subjects(&keyword)?;
     let Some(candidate) = candidates.first() else {
-        return Ok(None);
+        return Ok(MatchOutcome {
+            title: None,
+            subject_id: None,
+        });
     };
     let title = display_title(candidate);
 
-    repository.upsert_metadata_candidates(
+    let source = if dandanplay_exact {
+        "dandanplay_exact"
+    } else {
+        "bangumi_search"
+    };
+    let saved_candidates = repository.upsert_metadata_candidates(
         media.id,
         &candidates.into_iter().take(8).collect::<Vec<_>>(),
-        "bangumi_search",
+        source,
         unix_timestamp_ms(),
     )?;
-    Ok(Some(title))
+
+    let Some(selected) = saved_candidates.first() else {
+        return Ok(MatchOutcome {
+            title: Some(title),
+            subject_id: None,
+        });
+    };
+    if dandanplay_exact && selected.confidence >= AUTO_CONFIRM_CONFIDENCE {
+        let subject_id = confirm_candidate_record(
+            repository,
+            provider,
+            image_cache,
+            media.id,
+            selected,
+            true,
+            unix_timestamp_ms(),
+        )?;
+        return Ok(MatchOutcome {
+            title: Some(title),
+            subject_id: Some(subject_id),
+        });
+    }
+
+    Ok(MatchOutcome {
+        title: Some(title),
+        subject_id: None,
+    })
 }
 
 pub fn confirm_candidate_and_fetch<P>(
@@ -428,13 +490,36 @@ where
     let candidate = repository
         .get_candidate(candidate_id)?
         .ok_or_else(|| crate::error::AppError::Api("metadata candidate not found".to_string()))?;
-    let mut subject_id = repository.upsert_subject_from_candidate(&candidate, now)?;
+    confirm_candidate_record(
+        &repository,
+        &provider,
+        &image_cache,
+        media_id,
+        &candidate,
+        true,
+        now,
+    )
+}
+
+fn confirm_candidate_record<P>(
+    repository: &Repository,
+    provider: &P,
+    image_cache: &ImageCache,
+    media_id: i64,
+    candidate: &MetadataCandidate,
+    confirmed: bool,
+    now: i64,
+) -> crate::error::AppResult<i64>
+where
+    P: MetadataProvider,
+{
+    let mut subject_id = repository.upsert_subject_from_candidate(candidate, now)?;
     repository.link_media_subject(
         media_id,
         subject_id,
         &candidate.source,
         candidate.confidence,
-        true,
+        confirmed,
         now,
     )?;
 
@@ -452,8 +537,8 @@ where
             )?;
         }
         cache_subject_images(
-            &repository,
-            &image_cache,
+            repository,
+            image_cache,
             subject_id,
             &detail.provider,
             [
@@ -464,8 +549,8 @@ where
         )?;
     } else {
         cache_subject_images(
-            &repository,
-            &image_cache,
+            repository,
+            image_cache,
             subject_id,
             &candidate.provider,
             [

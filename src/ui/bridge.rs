@@ -20,6 +20,9 @@ struct UiState {
     cards: Vec<UiMediaCardData>,
     selected_media_id: Option<i64>,
     selected_candidate_id: Option<i64>,
+    library_search: String,
+    library_filter: String,
+    library_sort: String,
     logs: VecDeque<LogLineData>,
 }
 
@@ -43,6 +46,9 @@ pub fn bind(window: Weak<MainWindow>, context: AppContext) -> AppResult<BridgeSt
         cards,
         selected_media_id: None,
         selected_candidate_id: None,
+        library_search: String::new(),
+        library_filter: "all".to_string(),
+        library_sort: "title".to_string(),
         logs: VecDeque::new(),
     }));
 
@@ -55,11 +61,16 @@ pub fn bind(window: Weak<MainWindow>, context: AppContext) -> AppResult<BridgeSt
             },
         );
         set_empty_detail(&window);
+        window.set_metadata_status("idle".into());
+        window.set_library_filter("all".into());
+        window.set_library_sort("title".into());
+        window.set_library_view_grid(false);
         push_log(&window, &state, "info", "ready");
     }
 
     bind_add_path(window.clone(), context.clone(), state.clone());
     bind_scan(window.clone(), context.clone());
+    bind_library_controls(window.clone(), context.clone(), state.clone());
     bind_select_media(window.clone(), context.clone(), state.clone());
     bind_play_selected_media(window.clone(), context.clone(), state.clone());
     bind_save_progress(window.clone(), context.clone(), state.clone());
@@ -141,6 +152,92 @@ fn bind_scan(window: Weak<MainWindow>, context: AppContext) {
         .expect("window dropped before callback binding")
         .on_scan_library(move || {
             context.media.start_scan();
+        });
+}
+
+fn bind_library_controls(
+    window: Weak<MainWindow>,
+    context: AppContext,
+    state: Arc<Mutex<UiState>>,
+) {
+    let weak = window.clone();
+    let context_for_search = context.clone();
+    let state_for_search = state.clone();
+    window
+        .upgrade()
+        .expect("window dropped before callback binding")
+        .on_update_library_search(move |search| {
+            state_for_search
+                .lock()
+                .expect("ui state mutex poisoned")
+                .library_search = search.trim().to_string();
+            if let Some(window) = weak.upgrade() {
+                refresh_window_models(
+                    &window,
+                    &context_for_search,
+                    &BridgeState {
+                        inner: state_for_search.clone(),
+                    },
+                );
+            }
+        });
+
+    let weak = window.clone();
+    let context_for_filter = context.clone();
+    let state_for_filter = state.clone();
+    window
+        .upgrade()
+        .expect("window dropped before callback binding")
+        .on_set_library_filter(move |filter| {
+            let filter = filter.to_string();
+            state_for_filter
+                .lock()
+                .expect("ui state mutex poisoned")
+                .library_filter = filter.clone();
+            if let Some(window) = weak.upgrade() {
+                window.set_library_filter(filter.into());
+                refresh_window_models(
+                    &window,
+                    &context_for_filter,
+                    &BridgeState {
+                        inner: state_for_filter.clone(),
+                    },
+                );
+            }
+        });
+
+    let weak = window.clone();
+    let context_for_sort = context.clone();
+    let state_for_sort = state.clone();
+    window
+        .upgrade()
+        .expect("window dropped before callback binding")
+        .on_set_library_sort(move |sort| {
+            let sort = sort.to_string();
+            state_for_sort
+                .lock()
+                .expect("ui state mutex poisoned")
+                .library_sort = sort.clone();
+            if let Some(window) = weak.upgrade() {
+                window.set_library_sort(sort.into());
+                refresh_window_models(
+                    &window,
+                    &context_for_sort,
+                    &BridgeState {
+                        inner: state_for_sort.clone(),
+                    },
+                );
+            }
+        });
+
+    let weak = window.clone();
+    window
+        .upgrade()
+        .expect("window dropped before callback binding")
+        .on_set_library_view_grid(move |view_grid| {
+            if let Some(window) = weak.upgrade() {
+                window.set_library_view_grid(view_grid);
+            }
         });
 }
 
@@ -542,6 +639,7 @@ fn apply_event(window: &MainWindow, context: &AppContext, state: &BridgeState, e
             );
             refresh_window_models(window, context, state);
             push_log(window, &state.inner, "info", "scan finished");
+            context.metadata.start_auto_match_after_scan();
         }
         AppEvent::ScanFailed(error) => {
             window.set_scan_progress("scan failed".into());
@@ -664,8 +762,9 @@ fn refresh_window_models(window: &MainWindow, context: &AppContext, state: &Brid
         state.cards = cards.clone();
     }
 
-    set_media_cards(window, &cards);
-    set_media_rows(window, &cards);
+    let visible_cards = visible_library_cards(&cards, state);
+    set_media_cards(window, &visible_cards);
+    set_media_rows(window, &visible_cards);
     set_recent_cards(window, &cards.iter().take(8).cloned().collect::<Vec<_>>());
     let queue = cards
         .iter()
@@ -676,9 +775,50 @@ fn refresh_window_models(window: &MainWindow, context: &AppContext, state: &Brid
     set_home_and_settings(window, context);
 }
 
+fn visible_library_cards(cards: &[UiMediaCardData], state: &BridgeState) -> Vec<UiMediaCardData> {
+    let (search, filter, sort) = {
+        let state = state.inner.lock().expect("ui state mutex poisoned");
+        (
+            state.library_search.to_ascii_lowercase(),
+            state.library_filter.clone(),
+            state.library_sort.clone(),
+        )
+    };
+
+    let mut visible = cards
+        .iter()
+        .filter(|card| {
+            search.is_empty()
+                || card.title.to_ascii_lowercase().contains(&search)
+                || card.subtitle.to_ascii_lowercase().contains(&search)
+                || card.status_text.to_ascii_lowercase().contains(&search)
+        })
+        .filter(|card| match filter.as_str() {
+            "watching" => card.progress_percent > 0 && card.progress_percent < 95,
+            "completed" => card.progress_percent >= 95,
+            "unmatched" => card.match_status == "unmatched",
+            "tentative" => card.match_status == "tentative",
+            _ => true,
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+
+    match sort.as_str() {
+        "date" => visible.sort_by(|left, right| right.media_id.cmp(&left.media_id)),
+        _ => visible.sort_by(|left, right| {
+            left.title
+                .to_ascii_lowercase()
+                .cmp(&right.title.to_ascii_lowercase())
+        }),
+    }
+
+    visible
+}
+
 fn set_home_and_settings(window: &MainWindow, context: &AppContext) {
     let (indexed, matched, unmatched) = context.media.library_counts().unwrap_or_default();
     let tentative = context.metadata.tentative_count().unwrap_or_default();
+    let flags = context.media.settings_flags();
     window.set_home_summary(
         format!(
             "Indexed media {indexed}    Matched subjects {matched}    Unmatched {unmatched}    Tentative {tentative}"
@@ -686,6 +826,10 @@ fn set_home_and_settings(window: &MainWindow, context: &AppContext) {
         .into(),
     );
     window.set_settings_summary(context.media.settings_summary(indexed).into());
+    window.set_bangumi_enabled(flags.bangumi_enabled);
+    window.set_bangumi_auto_match(flags.bangumi_auto_match);
+    window.set_bangumi_cache_images(flags.bangumi_cache_images);
+    window.set_dandanplay_configured(flags.dandanplay_configured);
 }
 
 fn set_media_cards(window: &MainWindow, cards: &[UiMediaCardData]) {

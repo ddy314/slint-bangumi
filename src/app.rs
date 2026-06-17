@@ -22,7 +22,7 @@ impl AppContext {
         let repository = Repository::new(config.snapshot().database.path);
         repository.init()?;
 
-        let danmaku = DanmakuService::new(config.clone(), events.clone())?;
+        let danmaku = DanmakuService::new(config.clone(), repository.clone(), events.clone())?;
         let database_path = config.snapshot().database.path;
 
         Ok(Self {
