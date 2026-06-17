@@ -1,19 +1,31 @@
+use std::collections::VecDeque;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
 use slint::{ModelRc, SharedString, VecModel, Weak};
 
-use crate::MainWindow;
 use crate::app::AppContext;
-use crate::domain::MediaItem;
+use crate::domain::{MediaItem, UiMediaCardData, UiSubjectDetailData};
 use crate::error::{AppError, AppResult};
 use crate::task::AppEvent;
+use crate::{MainWindow, UiLogLine, UiMediaCard, UiSubjectDetail};
+
+const MAX_LOG_LINES: usize = 200;
 
 #[derive(Default)]
 struct UiState {
     media: Vec<MediaItem>,
-    selected_index: Option<usize>,
+    cards: Vec<UiMediaCardData>,
+    selected_media_id: Option<i64>,
+    logs: VecDeque<LogLineData>,
+}
+
+#[derive(Debug, Clone)]
+struct LogLineData {
+    level: String,
+    message: String,
+    timestamp: String,
 }
 
 #[derive(Clone)]
@@ -22,17 +34,25 @@ pub struct BridgeState {
 }
 
 pub fn bind(window: Weak<MainWindow>, context: AppContext) -> AppResult<BridgeState> {
+    let media = context.media.list_media()?;
+    let cards = context.media.list_media_cards()?;
     let state = Arc::new(Mutex::new(UiState {
-        media: context.media.list_media()?,
-        selected_index: None,
+        media,
+        cards,
+        selected_media_id: None,
+        logs: VecDeque::new(),
     }));
 
     if let Some(window) = window.upgrade() {
-        let media = state.lock().expect("ui state mutex poisoned").media.clone();
-        set_media_items(&window, &media);
-        window.set_logs("ready\n".into());
-        window.set_scan_progress("idle".into());
-        window.set_settings_summary(context.media.settings_summary(media.len()).into());
+        refresh_window_models(
+            &window,
+            &context,
+            &BridgeState {
+                inner: state.clone(),
+            },
+        );
+        set_empty_detail(&window);
+        push_log(&window, &state, "info", "ready");
     }
 
     bind_add_path(window.clone(), context.clone(), state.clone());
@@ -41,7 +61,8 @@ pub fn bind(window: Weak<MainWindow>, context: AppContext) -> AppResult<BridgeSt
     bind_play_selected_media(window.clone(), context.clone(), state.clone());
     bind_save_progress(window.clone(), context.clone(), state.clone());
     bind_clear_progress(window.clone(), context.clone(), state.clone());
-    bind_load_danmaku(window, context, state.clone());
+    bind_load_danmaku(window.clone(), context.clone(), state.clone());
+    bind_metadata_actions(window, context, state.clone());
 
     Ok(BridgeState { inner: state })
 }
@@ -82,7 +103,7 @@ fn bind_add_path(window: Weak<MainWindow>, context: AppContext, state: Arc<Mutex
         .on_add_media_path(move |path| {
             let path = path.trim().to_string();
             if path.is_empty() {
-                append_log(&weak, "media path is empty");
+                append_log(&weak, &state, "warn", "media path is empty");
                 return;
             }
 
@@ -90,38 +111,23 @@ fn bind_add_path(window: Weak<MainWindow>, context: AppContext, state: Arc<Mutex
                 Ok(paths) => {
                     append_log(
                         &weak,
+                        &state,
+                        "info",
                         &format!("added media path; total paths: {}", paths.len()),
                     );
                     if let Some(window) = weak.upgrade() {
-                        let media_count =
-                            state.lock().expect("ui state mutex poisoned").media.len();
-                        window.set_settings_summary(
-                            context.media.settings_summary(media_count).into(),
+                        refresh_window_models(
+                            &window,
+                            &context,
+                            &BridgeState {
+                                inner: state.clone(),
+                            },
                         );
                     }
                 }
-                Err(error) => append_log(&weak, &format!("add path failed: {error}")),
-            }
-        });
-}
-
-fn bind_play_selected_media(
-    window: Weak<MainWindow>,
-    context: AppContext,
-    state: Arc<Mutex<UiState>>,
-) {
-    let weak = window.clone();
-    window
-        .upgrade()
-        .expect("window dropped before callback binding")
-        .on_play_selected_media(move || {
-            let Some(media) = selected_media(&state) else {
-                append_log(&weak, "select a media item before playing");
-                return;
-            };
-
-            if let Err(error) = context.media.open_media(&media) {
-                append_log(&weak, &format!("play failed: {error}"));
+                Err(error) => {
+                    append_log(&weak, &state, "error", &format!("add path failed: {error}"))
+                }
             }
         });
 }
@@ -140,32 +146,68 @@ fn bind_select_media(window: Weak<MainWindow>, context: AppContext, state: Arc<M
     window
         .upgrade()
         .expect("window dropped before callback binding")
-        .on_select_media(move |index| {
-            let selected = {
+        .on_select_media_id(move |media_id| {
+            let media_id = media_id as i64;
+            {
                 let mut state = state.lock().expect("ui state mutex poisoned");
-                let index = index as usize;
-                state.selected_index = Some(index);
-                state.media.get(index).cloned()
+                state.selected_media_id = Some(media_id);
+            }
+
+            if let Some(window) = weak.upgrade() {
+                match context.metadata.subject_detail_for_media(media_id) {
+                    Ok(detail) => set_subject_detail(&window, detail),
+                    Err(error) => append_log_to_window(
+                        &window,
+                        &state,
+                        "error",
+                        &format!("load detail failed: {error}"),
+                    ),
+                }
+            }
+
+            match context.watch_history.load(media_id) {
+                Ok(Some(progress)) => append_log(
+                    &weak,
+                    &state,
+                    "info",
+                    &format!(
+                        "loaded progress: media #{} {} / {} ms",
+                        progress.media_id, progress.position_ms, progress.duration_ms
+                    ),
+                ),
+                Ok(None) => append_log(
+                    &weak,
+                    &state,
+                    "info",
+                    "no watch progress for selected media",
+                ),
+                Err(error) => append_log(
+                    &weak,
+                    &state,
+                    "error",
+                    &format!("load progress failed: {error}"),
+                ),
+            }
+        });
+}
+
+fn bind_play_selected_media(
+    window: Weak<MainWindow>,
+    context: AppContext,
+    state: Arc<Mutex<UiState>>,
+) {
+    let weak = window.clone();
+    window
+        .upgrade()
+        .expect("window dropped before callback binding")
+        .on_play_selected_media(move || {
+            let Some(media) = selected_media(&state) else {
+                append_log(&weak, &state, "warn", "select a media item before playing");
+                return;
             };
 
-            match selected {
-                Some(media) => {
-                    if let Some(window) = weak.upgrade() {
-                        window.set_selected_info(media_info(&media).into());
-                    }
-                    match context.watch_history.load(media.id) {
-                        Ok(Some(progress)) => append_log(
-                            &weak,
-                            &format!(
-                                "loaded progress: media #{} {} / {} ms",
-                                progress.media_id, progress.position_ms, progress.duration_ms
-                            ),
-                        ),
-                        Ok(None) => append_log(&weak, "no watch progress for selected media"),
-                        Err(error) => append_log(&weak, &format!("load progress failed: {error}")),
-                    }
-                }
-                None => append_log(&weak, "invalid media selection"),
+            if let Err(error) = context.media.open_media(&media) {
+                append_log(&weak, &state, "error", &format!("play failed: {error}"));
             }
         });
 }
@@ -180,12 +222,19 @@ fn bind_save_progress(window: Weak<MainWindow>, context: AppContext, state: Arc<
             match media_id.and_then(|id| context.watch_history.save_test_progress(id).ok()) {
                 Some(progress) => append_log(
                     &weak,
+                    &state,
+                    "info",
                     &format!(
                         "test progress saved at {} ms, updated_at={}",
                         progress.position_ms, progress.updated_at
                     ),
                 ),
-                None => append_log(&weak, "select a media item before saving progress"),
+                None => append_log(
+                    &weak,
+                    &state,
+                    "warn",
+                    "select a media item before saving progress",
+                ),
             }
         });
 }
@@ -197,13 +246,23 @@ fn bind_clear_progress(window: Weak<MainWindow>, context: AppContext, state: Arc
         .expect("window dropped before callback binding")
         .on_clear_progress(move || {
             let Some(media_id) = selected_media_id(&state) else {
-                append_log(&weak, "select a media item before clearing progress");
+                append_log(
+                    &weak,
+                    &state,
+                    "warn",
+                    "select a media item before clearing progress",
+                );
                 return;
             };
 
             match context.watch_history.clear(media_id) {
-                Ok(()) => append_log(&weak, "progress cleared"),
-                Err(error) => append_log(&weak, &format!("clear progress failed: {error}")),
+                Ok(()) => append_log(&weak, &state, "info", "progress cleared"),
+                Err(error) => append_log(
+                    &weak,
+                    &state,
+                    "error",
+                    &format!("clear progress failed: {error}"),
+                ),
             }
         });
 }
@@ -215,7 +274,12 @@ fn bind_load_danmaku(window: Weak<MainWindow>, context: AppContext, state: Arc<M
         .expect("window dropped before callback binding")
         .on_load_danmaku(move || {
             let Some(media) = selected_media(&state) else {
-                append_log(&weak, "select a media item before loading danmaku");
+                append_log(
+                    &weak,
+                    &state,
+                    "warn",
+                    "select a media item before loading danmaku",
+                );
                 return;
             };
 
@@ -226,20 +290,136 @@ fn bind_load_danmaku(window: Weak<MainWindow>, context: AppContext, state: Arc<M
         });
 }
 
+fn bind_metadata_actions(
+    window: Weak<MainWindow>,
+    context: AppContext,
+    state: Arc<Mutex<UiState>>,
+) {
+    let weak = window.clone();
+    let context_for_match = context.clone();
+    let state_for_match = state.clone();
+    window
+        .upgrade()
+        .expect("window dropped before callback binding")
+        .on_match_selected_metadata(move || {
+            let Some(media_id) = selected_media_id(&state_for_match) else {
+                append_log(
+                    &weak,
+                    &state_for_match,
+                    "warn",
+                    "select a media item before matching",
+                );
+                return;
+            };
+            context_for_match.metadata.start_match_media(media_id);
+        });
+
+    let context_for_all = context.clone();
+    window
+        .upgrade()
+        .expect("window dropped before callback binding")
+        .on_match_all_metadata(move || {
+            context_for_all.metadata.start_match_all_unmatched();
+        });
+
+    let weak = window.clone();
+    let context_for_images = context.clone();
+    let state_for_images = state.clone();
+    window
+        .upgrade()
+        .expect("window dropped before callback binding")
+        .on_refresh_subject_images(move || {
+            let Some(media_id) = selected_media_id(&state_for_images) else {
+                append_log(
+                    &weak,
+                    &state_for_images,
+                    "warn",
+                    "select a subject before caching images",
+                );
+                return;
+            };
+            match context_for_images
+                .metadata
+                .subject_detail_for_media(media_id)
+            {
+                Ok(detail) if detail.subject_id > 0 => context_for_images
+                    .metadata
+                    .start_download_subject_images(detail.subject_id),
+                Ok(_) => append_log(&weak, &state_for_images, "warn", "media is not matched yet"),
+                Err(error) => append_log(
+                    &weak,
+                    &state_for_images,
+                    "error",
+                    &format!("cache images failed: {error}"),
+                ),
+            }
+        });
+
+    let weak = window.clone();
+    let context_for_confirm = context;
+    let state_for_confirm = state;
+    window
+        .upgrade()
+        .expect("window dropped before callback binding")
+        .on_confirm_selected_match(move || {
+            let Some(media_id) = selected_media_id(&state_for_confirm) else {
+                append_log(
+                    &weak,
+                    &state_for_confirm,
+                    "warn",
+                    "select a media item before confirming",
+                );
+                return;
+            };
+            match context_for_confirm
+                .metadata
+                .subject_detail_for_media(media_id)
+            {
+                Ok(detail) if detail.subject_id > 0 => match context_for_confirm
+                    .metadata
+                    .confirm_media_subject(media_id, detail.subject_id)
+                {
+                    Ok(()) => append_log(&weak, &state_for_confirm, "info", "match confirmed"),
+                    Err(error) => append_log(
+                        &weak,
+                        &state_for_confirm,
+                        "error",
+                        &format!("confirm failed: {error}"),
+                    ),
+                },
+                Ok(_) => append_log(
+                    &weak,
+                    &state_for_confirm,
+                    "warn",
+                    "no tentative match to confirm",
+                ),
+                Err(error) => append_log(
+                    &weak,
+                    &state_for_confirm,
+                    "error",
+                    &format!("confirm failed: {error}"),
+                ),
+            }
+        });
+}
+
 fn apply_event(window: &MainWindow, context: &AppContext, state: &BridgeState, event: AppEvent) {
-    match event {
-        AppEvent::Log(message) => append_log_to_window(window, &message),
+    context.metadata.finish_for_event(&event);
+    match &event {
+        AppEvent::Log(message) => push_log(window, &state.inner, "info", message),
         AppEvent::ScanStarted => {
             window.set_scan_progress("scan started".into());
-            append_log_to_window(window, "scan started");
+            push_log(window, &state.inner, "info", "scan started");
         }
         AppEvent::ScanProgress { scanned, indexed } => {
             window.set_scan_progress(format!("scanned {scanned}, indexed {indexed}").into());
         }
         AppEvent::ScanFinished { summary, media } => {
-            replace_media_state(state, media.clone());
-            set_media_items(window, &media);
-            window.set_settings_summary(context.media.settings_summary(media.len()).into());
+            {
+                let mut state = state.inner.lock().expect("ui state mutex poisoned");
+                state.media = media.clone();
+                state.selected_media_id = None;
+            }
             window.set_scan_progress(
                 format!(
                     "done: scanned={}, added={}, modified={}, restored={}, deleted={}",
@@ -251,84 +431,285 @@ fn apply_event(window: &MainWindow, context: &AppContext, state: &BridgeState, e
                 )
                 .into(),
             );
-            append_log_to_window(window, "scan finished");
+            refresh_window_models(window, context, state);
+            push_log(window, &state.inner, "info", "scan finished");
         }
         AppEvent::ScanFailed(error) => {
             window.set_scan_progress("scan failed".into());
-            append_log_to_window(window, &format!("scan failed: {error}"));
+            push_log(
+                window,
+                &state.inner,
+                "error",
+                &format!("scan failed: {error}"),
+            );
         }
-        AppEvent::DanmakuMatched(result) => append_log_to_window(
+        AppEvent::DanmakuMatched(result) => push_log(
             window,
+            &state.inner,
+            "info",
             &format!(
-                "danmaku event: {} matched {} comments, title={}, episode={}",
+                "danmaku: {} matched {} comments, title={}, episode={}",
                 result.provider,
                 result.comment_count,
                 result.title,
                 result.episode.as_deref().unwrap_or("(none)")
             ),
         ),
+        AppEvent::MetadataMatchStarted { media_id } => {
+            window.set_metadata_status(format!("matching media #{media_id}").into());
+            push_log(
+                window,
+                &state.inner,
+                "info",
+                &format!("metadata match started for #{media_id}"),
+            );
+        }
+        AppEvent::MetadataMatchProgress { processed, total } => {
+            window.set_metadata_status(format!("metadata queue {processed}/{total}").into());
+        }
+        AppEvent::MetadataMatchFinished {
+            media_id,
+            subject_id,
+            title,
+        } => {
+            window.set_metadata_status("idle".into());
+            refresh_window_models(window, context, state);
+            refresh_selected_detail(window, context, state);
+            let message = match (subject_id, title) {
+                (Some(id), Some(title)) => {
+                    format!("media #{media_id} matched subject #{id}: {title}")
+                }
+                _ => format!("media #{media_id} has no Bangumi match"),
+            };
+            push_log(window, &state.inner, "info", &message);
+        }
+        AppEvent::SubjectUpdated { subject_id } => {
+            refresh_window_models(window, context, state);
+            refresh_selected_detail(window, context, state);
+            push_log(
+                window,
+                &state.inner,
+                "info",
+                &format!("subject #{subject_id} updated"),
+            );
+        }
+        AppEvent::ImageCached {
+            subject_id,
+            image_kind,
+        } => {
+            refresh_window_models(window, context, state);
+            refresh_selected_detail(window, context, state);
+            push_log(
+                window,
+                &state.inner,
+                "info",
+                &format!("cached {image_kind} for subject #{subject_id}"),
+            );
+        }
+        AppEvent::MetadataFailed { target_id, error } => {
+            window.set_metadata_status("failed".into());
+            push_log(
+                window,
+                &state.inner,
+                "error",
+                &format!("metadata failed for #{target_id}: {error}"),
+            );
+        }
     }
 }
 
-fn replace_media_state(state: &BridgeState, media: Vec<MediaItem>) {
-    let mut state = state.inner.lock().expect("ui state mutex poisoned");
-    state.media = media;
-    state.selected_index = None;
+fn refresh_window_models(window: &MainWindow, context: &AppContext, state: &BridgeState) {
+    let cards = match context.media.list_media_cards() {
+        Ok(cards) => cards,
+        Err(error) => {
+            push_log(
+                window,
+                &state.inner,
+                "error",
+                &format!("refresh media failed: {error}"),
+            );
+            Vec::new()
+        }
+    };
+    let media = context.media.list_media().unwrap_or_default();
+    {
+        let mut state = state.inner.lock().expect("ui state mutex poisoned");
+        state.media = media;
+        state.cards = cards.clone();
+    }
+
+    set_media_cards(window, &cards);
+    let queue = cards
+        .iter()
+        .filter(|card| card.match_status != "matched")
+        .cloned()
+        .collect::<Vec<_>>();
+    set_match_queue(window, &queue);
+    set_home_and_settings(window, context);
 }
 
-fn set_media_items(window: &MainWindow, media: &[MediaItem]) {
-    let labels = media
+fn set_home_and_settings(window: &MainWindow, context: &AppContext) {
+    let (indexed, matched, unmatched) = context.media.library_counts().unwrap_or_default();
+    window.set_home_summary(
+        format!("indexed media: {indexed}    matched subjects: {matched}    unmatched media: {unmatched}").into(),
+    );
+    window.set_settings_summary(context.media.settings_summary(indexed).into());
+}
+
+fn set_media_cards(window: &MainWindow, cards: &[UiMediaCardData]) {
+    window.set_media_cards(ModelRc::from(Rc::new(VecModel::from(
+        cards.iter().map(to_slint_card).collect::<Vec<_>>(),
+    ))));
+}
+
+fn set_match_queue(window: &MainWindow, cards: &[UiMediaCardData]) {
+    window.set_match_queue(ModelRc::from(Rc::new(VecModel::from(
+        cards.iter().map(to_slint_card).collect::<Vec<_>>(),
+    ))));
+}
+
+fn to_slint_card(card: &UiMediaCardData) -> UiMediaCard {
+    UiMediaCard {
+        media_id: card.media_id as i32,
+        subject_id: card.subject_id as i32,
+        title: card.title.as_str().into(),
+        subtitle: card.subtitle.as_str().into(),
+        status_text: card.status_text.as_str().into(),
+        match_status: card.match_status.as_str().into(),
+        progress_percent: card.progress_percent,
+        episode_text: card.episode_text.as_str().into(),
+        poster_path: card.poster_path.as_str().into(),
+        has_cached_poster: card.has_cached_poster,
+    }
+}
+
+fn set_subject_detail(window: &MainWindow, detail: UiSubjectDetailData) {
+    let files = detail
+        .files
         .iter()
-        .map(|item| SharedString::from(item.display_label()))
+        .map(|file| SharedString::from(file.as_str()))
         .collect::<Vec<_>>();
-    window.set_media_items(ModelRc::from(Rc::new(VecModel::from(labels))));
+    window.set_detail_files(ModelRc::from(Rc::new(VecModel::from(files))));
+    window.set_subject_detail(UiSubjectDetail {
+        media_id: detail.media_id as i32,
+        subject_id: detail.subject_id as i32,
+        title: detail.title.as_str().into(),
+        title_cn: detail.title_cn.as_str().into(),
+        summary: detail.summary.as_str().into(),
+        air_date: detail.air_date.as_str().into(),
+        rating_text: detail.rating_text.as_str().into(),
+        rank_text: detail.rank_text.as_str().into(),
+        poster_path: detail.poster_path.as_str().into(),
+        hero_path: detail.hero_path.as_str().into(),
+        match_status: detail.match_status.as_str().into(),
+        cache_status: detail.cache_status.as_str().into(),
+    });
+}
+
+fn set_empty_detail(window: &MainWindow) {
+    set_subject_detail(
+        window,
+        UiSubjectDetailData {
+            media_id: 0,
+            subject_id: 0,
+            title: "Select a media item".to_string(),
+            title_cn: String::new(),
+            summary: "No media selected.".to_string(),
+            air_date: "-".to_string(),
+            rating_text: "-".to_string(),
+            rank_text: "-".to_string(),
+            poster_path: String::new(),
+            hero_path: String::new(),
+            match_status: "idle".to_string(),
+            cache_status: "poster: not cached, hero: not cached".to_string(),
+            files: Vec::new(),
+        },
+    );
+}
+
+fn refresh_selected_detail(window: &MainWindow, context: &AppContext, state: &BridgeState) {
+    let media_id = state
+        .inner
+        .lock()
+        .expect("ui state mutex poisoned")
+        .selected_media_id;
+    if let Some(media_id) = media_id {
+        match context.metadata.subject_detail_for_media(media_id) {
+            Ok(detail) => set_subject_detail(window, detail),
+            Err(error) => push_log(
+                window,
+                &state.inner,
+                "error",
+                &format!("refresh detail failed: {error}"),
+            ),
+        }
+    }
 }
 
 fn selected_media_id(state: &Arc<Mutex<UiState>>) -> Option<i64> {
-    selected_media(state).map(|media| media.id)
+    state
+        .lock()
+        .expect("ui state mutex poisoned")
+        .selected_media_id
 }
 
 fn selected_media(state: &Arc<Mutex<UiState>>) -> Option<MediaItem> {
     let state = state.lock().expect("ui state mutex poisoned");
+    let selected = state.selected_media_id?;
     state
-        .selected_index
-        .and_then(|index| state.media.get(index).cloned())
+        .media
+        .iter()
+        .find(|media| media.id == selected)
+        .cloned()
 }
 
-fn append_log(window: &Weak<MainWindow>, message: &str) {
+fn append_log(window: &Weak<MainWindow>, state: &Arc<Mutex<UiState>>, level: &str, message: &str) {
     if let Some(window) = window.upgrade() {
-        append_log_to_window(&window, message);
+        append_log_to_window(&window, state, level, message);
     }
 }
 
-fn append_log_to_window(window: &MainWindow, message: &str) {
-    const MAX_LOG_BYTES: usize = 24 * 1024;
+fn append_log_to_window(
+    window: &MainWindow,
+    state: &Arc<Mutex<UiState>>,
+    level: &str,
+    message: &str,
+) {
+    push_log(window, state, level, message);
+}
 
-    let mut logs = window.get_logs().to_string();
-    logs.push_str(message);
-    logs.push('\n');
-    if logs.len() > MAX_LOG_BYTES {
-        let mut keep_from = logs.len() - MAX_LOG_BYTES;
-        while !logs.is_char_boundary(keep_from) {
-            keep_from += 1;
+fn push_log(window: &MainWindow, state: &Arc<Mutex<UiState>>, level: &str, message: &str) {
+    let logs = {
+        let mut state = state.lock().expect("ui state mutex poisoned");
+        if state.logs.len() == MAX_LOG_LINES {
+            state.logs.pop_front();
         }
-        let keep_from = logs[keep_from..]
-            .find('\n')
-            .map(|offset| keep_from + offset + 1)
-            .unwrap_or(keep_from);
-        logs.replace_range(..keep_from, "");
-    }
-    window.set_logs(logs.into());
+        state.logs.push_back(LogLineData {
+            level: level.to_string(),
+            message: message.to_string(),
+            timestamp: log_timestamp(),
+        });
+        state.logs.iter().cloned().collect::<Vec<_>>()
+    };
+
+    window.set_log_lines(ModelRc::from(Rc::new(VecModel::from(
+        logs.iter()
+            .map(|line| UiLogLine {
+                level: line.level.as_str().into(),
+                message: line.message.as_str().into(),
+                timestamp: line.timestamp.as_str().into(),
+            })
+            .collect::<Vec<_>>(),
+    ))));
 }
 
-fn media_info(media: &MediaItem) -> String {
+fn log_timestamp() -> String {
+    let now = crate::task::unix_timestamp_ms();
+    let seconds = (now / 1000) % 86_400;
     format!(
-        "id: {}\nfile: {}\npath: {}\nsize: {} bytes\nmodified_at: {}\nhash: {}",
-        media.id,
-        media.file_name,
-        media.path.display(),
-        media.file_size,
-        media.modified_at,
-        media.file_hash.as_deref().unwrap_or("(not computed)")
+        "{:02}:{:02}:{:02}",
+        seconds / 3600,
+        (seconds % 3600) / 60,
+        seconds % 60
     )
 }

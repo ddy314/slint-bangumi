@@ -1,191 +1,277 @@
 import { Button, LineEdit, ListView, TextEdit, VerticalBox, HorizontalBox } from "std-widgets.slint";
 
+export struct UiMediaCard {
+    media_id: int,
+    subject_id: int,
+    title: string,
+    subtitle: string,
+    status_text: string,
+    match_status: string,
+    progress_percent: int,
+    episode_text: string,
+    poster_path: string,
+    has_cached_poster: bool,
+}
+
+export struct UiSubjectDetail {
+    media_id: int,
+    subject_id: int,
+    title: string,
+    title_cn: string,
+    summary: string,
+    air_date: string,
+    rating_text: string,
+    rank_text: string,
+    poster_path: string,
+    hero_path: string,
+    match_status: string,
+    cache_status: string,
+}
+
+export struct UiLogLine {
+    level: string,
+    message: string,
+    timestamp: string,
+}
+
+component LogList inherits ListView {
+    in property <[UiLogLine]> lines;
+    height: 610px;
+    for line in root.lines : Text {
+        text: "[" + line.timestamp + "] " + line.level + "  " + line.message;
+        color: line.level == "error" ? #a32323 : #2f3a48;
+    }
+}
+
 export component MainWindow inherits Window {
-    width: 1000px;
-    height: 720px;
+    width: 1180px;
+    height: 760px;
     title: "Slint Bangumi";
 
-    in-out property <int> active_tab: 0;
+    in-out property <int> active_page: 0;
     in-out property <string> media_path_input;
-    in property <[string]> media_items;
-    in-out property <string> selected_info;
-    in-out property <string> logs;
+    in-out property <string> library_search;
+    in property <[UiMediaCard]> media_cards;
+    in property <[UiMediaCard]> match_queue;
+    in property <UiSubjectDetail> subject_detail;
+    in property <[string]> detail_files;
+    in property <[UiLogLine]> log_lines;
     in-out property <string> scan_progress;
+    in-out property <string> metadata_status;
     in-out property <string> settings_summary;
+    in-out property <string> home_summary;
 
     callback add_media_path(string);
     callback scan_library();
-    callback select_media(int);
+    callback select_media_id(int);
     callback play_selected_media();
     callback save_progress();
     callback clear_progress();
     callback load_danmaku();
+    callback match_selected_metadata();
+    callback match_all_metadata();
+    callback refresh_subject_images();
+    callback confirm_selected_match();
 
-    VerticalBox {
-        padding: 12px;
-        spacing: 8px;
+    HorizontalBox {
+        padding: 0px;
+        spacing: 0px;
 
-        HorizontalBox {
-            spacing: 8px;
-            Button {
-                text: root.active_tab == 0 ? "Home *" : "Home";
-                clicked => { root.active_tab = 0; }
-            }
-            Button {
-                text: root.active_tab == 1 ? "Media Library *" : "Media Library";
-                clicked => { root.active_tab = 1; }
-            }
-            Button {
-                text: root.active_tab == 2 ? "Settings *" : "Settings";
-                clicked => { root.active_tab = 2; }
+        Rectangle {
+            width: 170px;
+            background: #20242b;
+
+            VerticalBox {
+                padding: 12px;
+                spacing: 8px;
+
+                Text {
+                    text: "Slint Bangumi";
+                    color: #f5f7fa;
+                    font-size: 18px;
+                    font-weight: 700;
+                }
+
+                Button { text: root.active_page == 0 ? "Home *" : "Home"; clicked => { root.active_page = 0; } }
+                Button { text: root.active_page == 1 ? "Library *" : "Library"; clicked => { root.active_page = 1; } }
+                Button { text: root.active_page == 2 ? "Subject *" : "Subject"; clicked => { root.active_page = 2; } }
+                Button { text: root.active_page == 3 ? "Metadata *" : "Metadata"; clicked => { root.active_page = 3; } }
+                Button { text: root.active_page == 4 ? "Settings *" : "Settings"; clicked => { root.active_page = 4; } }
+                Button { text: root.active_page == 5 ? "Activity *" : "Activity"; clicked => { root.active_page = 5; } }
             }
         }
 
-        if root.active_tab == 0 : VerticalBox {
-            spacing: 8px;
+        Rectangle {
+            background: #f5f6f8;
 
-            Text {
-                text: "Home";
-                font-size: 20px;
-                font-weight: 700;
-            }
+            VerticalBox {
+                padding: 14px;
+                spacing: 10px;
 
-            Text {
-                text: "Scan progress: " + root.scan_progress;
-            }
+                if root.active_page == 0 : VerticalBox {
+                    spacing: 10px;
 
-            HorizontalBox {
-                spacing: 8px;
-                Button {
-                    text: "Scan Library";
-                    clicked => { root.scan_library(); }
+                    Text { text: "Home"; font-size: 22px; font-weight: 700; color: #1c2430; }
+                    Text { text: root.home_summary; color: #2f3a48; }
+                    Text { text: "Scan: " + root.scan_progress + "    Metadata: " + root.metadata_status; color: #4a5564; }
+
+                    HorizontalBox {
+                        spacing: 8px;
+                        Button { text: "Scan Library"; clicked => { root.scan_library(); } }
+                        Button { text: "Match Metadata"; clicked => { root.match_all_metadata(); } }
+                        Button { text: "Open Library"; clicked => { root.active_page = 1; } }
+                    }
+
+                    Text { text: "Recent activity"; font-weight: 700; color: #1c2430; }
+                    LogList { lines: root.log_lines; }
                 }
-                Button {
-                    text: "Open Media Library";
-                    clicked => { root.active_tab = 1; }
-                }
-                Button {
-                    text: "Open Settings";
-                    clicked => { root.active_tab = 2; }
-                }
-            }
 
-            Text { text: "Runtime log"; font-weight: 700; }
-            TextEdit {
-                height: 520px;
-                text: root.logs;
-                read-only: true;
-            }
-        }
+                if root.active_page == 1 : VerticalBox {
+                    spacing: 8px;
 
-        if root.active_tab == 1 : VerticalBox {
-            spacing: 8px;
+                    Text { text: "My Library / 媒体库"; font-size: 22px; font-weight: 700; color: #1c2430; }
+                    Text { text: root.home_summary + "    Scan: " + root.scan_progress; color: #4a5564; }
 
-            Text {
-                text: "Media Library";
-                font-size: 20px;
-                font-weight: 700;
-            }
+                    HorizontalBox {
+                        spacing: 8px;
+                        LineEdit { text <=> root.library_search; placeholder-text: "Search title or filename"; }
+                        Button { text: "Title"; }
+                        Button { text: "Date"; }
+                        Button { text: "Status"; }
+                        Button { text: "All"; }
+                        Button { text: "Matched"; }
+                        Button { text: "Unmatched"; }
+                        Button { text: "Grid/List"; }
+                    }
 
-            HorizontalBox {
-                spacing: 8px;
-                LineEdit {
-                    text <=> root.media_path_input;
-                    placeholder-text: "Local media folder path";
-                }
-                Button {
-                    text: "Add Folder";
-                    clicked => { root.add_media_path(root.media_path_input); }
-                }
-                Button {
-                    text: "Scan";
-                    clicked => { root.scan_library(); }
-                }
-            }
-
-            HorizontalBox {
-                spacing: 12px;
-
-                VerticalBox {
-                    Text { text: "Videos"; font-weight: 700; }
                     ListView {
-                        height: 420px;
-                        for item[index] in root.media_items : Button {
-                            text: item;
-                            clicked => { root.select_media(index); }
+                        height: 575px;
+                        for card in root.media_cards : Button {
+                            text: (card.has_cached_poster ? "[poster cached] " : "[poster placeholder] ")
+                                  + card.title + "\n"
+                                  + card.subtitle + "    " + card.status_text
+                                  + "    ep: " + (card.episode_text == "" ? "-" : card.episode_text)
+                                  + "    progress: " + card.progress_percent + "%";
+                            clicked => {
+                                root.select_media_id(card.media_id);
+                                root.active_page = 2;
+                            }
                         }
                     }
                 }
 
-                VerticalBox {
-                    Text { text: "Selected video"; font-weight: 700; }
-                    TextEdit {
-                        height: 280px;
-                        text: root.selected_info;
-                        read-only: true;
+                if root.active_page == 2 : VerticalBox {
+                    spacing: 8px;
+
+                    Rectangle {
+                        height: 92px;
+                        background: root.subject_detail.hero_path == "" ? #d7dde6 : #c6d8ed;
+                        Text {
+                            x: 14px;
+                            y: 14px;
+                            text: root.subject_detail.hero_path == "" ? "hero placeholder" : "hero cached: " + root.subject_detail.hero_path;
+                            color: #1c2430;
+                        }
                     }
+
+                    HorizontalBox {
+                        spacing: 14px;
+
+                        Rectangle {
+                            width: 150px;
+                            height: 220px;
+                            background: root.subject_detail.poster_path == "" ? #d8dce3 : #bfd1e5;
+                            Text {
+                                x: 10px;
+                                y: 10px;
+                                width: 130px;
+                                text: root.subject_detail.poster_path == "" ? "poster placeholder" : "poster cached";
+                                color: #1c2430;
+                            }
+                        }
+
+                        VerticalBox {
+                            spacing: 6px;
+                            Text { text: root.subject_detail.title; font-size: 22px; font-weight: 700; color: #1c2430; }
+                            Text { text: root.subject_detail.title_cn; color: #4a5564; }
+                            Text { text: "Air date: " + root.subject_detail.air_date + "    Rating: " + root.subject_detail.rating_text + "    Rank: " + root.subject_detail.rank_text; color: #4a5564; }
+                            Text { text: "Match: " + root.subject_detail.match_status + "    Cache: " + root.subject_detail.cache_status; color: #4a5564; }
+                            TextEdit { height: 145px; text: root.subject_detail.summary; read-only: true; }
+                        }
+                    }
+
                     HorizontalBox {
                         spacing: 8px;
-                        Button {
-                            text: "Play";
-                            clicked => { root.play_selected_media(); }
+                        Button { text: "Play"; clicked => { root.play_selected_media(); } }
+                        Button { text: "Load Danmaku"; clicked => { root.load_danmaku(); } }
+                        Button { text: "Rematch"; clicked => { root.match_selected_metadata(); } }
+                        Button { text: "Confirm Match"; clicked => { root.confirm_selected_match(); } }
+                        Button { text: "Cache Images"; clicked => { root.refresh_subject_images(); } }
+                        Button { text: "Save Test Progress"; clicked => { root.save_progress(); } }
+                        Button { text: "Clear Progress"; clicked => { root.clear_progress(); } }
+                    }
+
+                    HorizontalBox {
+                        spacing: 12px;
+                        VerticalBox {
+                            Text { text: "Local files"; font-weight: 700; color: #1c2430; }
+                            ListView {
+                                height: 190px;
+                                for file in root.detail_files : Text { text: file; color: #2f3a48; }
+                            }
                         }
-                        Button {
-                            text: "Load Danmaku";
-                            clicked => { root.load_danmaku(); }
+                        VerticalBox {
+                            Text { text: "Episodes / Candidates"; font-weight: 700; color: #1c2430; }
+                            Text { text: root.subject_detail.subject_id == 0 ? "未匹配：使用 Rematch 搜索 Bangumi，并将第一个候选保存为待确认。" : "分集列表和候选切换接口已预留。"; color: #4a5564; }
                         }
                     }
+                }
+
+                if root.active_page == 3 : VerticalBox {
+                    spacing: 8px;
+                    Text { text: "Metadata / Match Queue"; font-size: 22px; font-weight: 700; color: #1c2430; }
+                    Text { text: root.metadata_status; color: #4a5564; }
                     HorizontalBox {
                         spacing: 8px;
-                        Button {
-                            text: "Save Test Progress";
-                            clicked => { root.save_progress(); }
-                        }
-                        Button {
-                            text: "Clear Progress";
-                            clicked => { root.clear_progress(); }
+                        Button { text: "Match All"; clicked => { root.match_all_metadata(); } }
+                        Button { text: "Retry Failed"; clicked => { root.match_all_metadata(); } }
+                        Button { text: "Clear Completed Jobs"; }
+                    }
+                    Text { text: "Unmatched / tentative queue"; font-weight: 700; color: #1c2430; }
+                    ListView {
+                        height: 560px;
+                        for card in root.match_queue : Button {
+                            text: card.title + "\n" + card.subtitle + "    " + card.status_text;
+                            clicked => {
+                                root.select_media_id(card.media_id);
+                                root.active_page = 2;
+                            }
                         }
                     }
                 }
-            }
 
-            Text { text: "Scan progress: " + root.scan_progress; }
-        }
-
-        if root.active_tab == 2 : VerticalBox {
-            spacing: 8px;
-
-            Text {
-                text: "Settings";
-                font-size: 20px;
-                font-weight: 700;
-            }
-
-            Text { text: "Media paths"; font-weight: 700; }
-            HorizontalBox {
-                spacing: 8px;
-                LineEdit {
-                    text <=> root.media_path_input;
-                    placeholder-text: "Add local media folder";
+                if root.active_page == 4 : VerticalBox {
+                    spacing: 8px;
+                    Text { text: "Settings"; font-size: 22px; font-weight: 700; color: #1c2430; }
+                    HorizontalBox {
+                        spacing: 8px;
+                        LineEdit { text <=> root.media_path_input; placeholder-text: "Add local media folder"; }
+                        Button { text: "Add Path"; clicked => { root.add_media_path(root.media_path_input); } }
+                    }
+                    TextEdit { height: 340px; text: root.settings_summary; read-only: true; }
+                    HorizontalBox {
+                        spacing: 8px;
+                        Button { text: "Scan Library"; clicked => { root.scan_library(); } }
+                        Button { text: "Clear Image Cache"; }
+                    }
+                    Text { text: "Scan settings and cache size calculation are placeholders in this skeleton."; color: #4a5564; }
                 }
-                Button {
-                    text: "Add";
-                    clicked => { root.add_media_path(root.media_path_input); }
+
+                if root.active_page == 5 : VerticalBox {
+                    spacing: 8px;
+                    Text { text: "Activity"; font-size: 22px; font-weight: 700; color: #1c2430; }
+                    LogList { lines: root.log_lines; }
                 }
-            }
-
-            Text { text: "Current configuration"; font-weight: 700; }
-            TextEdit {
-                height: 220px;
-                text: root.settings_summary;
-                read-only: true;
-            }
-
-            Text { text: "Runtime log"; font-weight: 700; }
-            TextEdit {
-                height: 300px;
-                text: root.logs;
-                read-only: true;
             }
         }
     }

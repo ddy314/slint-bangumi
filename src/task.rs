@@ -8,6 +8,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use walkdir::WalkDir;
 
 use crate::domain::{DanmakuMatch, MediaFile, MediaItem, ScanSummary, ScanUpsertStatus};
+use crate::metadata::cache::ImageCache;
+use crate::metadata::provider::{MetadataProvider, SubjectSearchResult};
 use crate::repository::Repository;
 
 #[derive(Debug, Clone)]
@@ -24,6 +26,29 @@ pub enum AppEvent {
     },
     ScanFailed(String),
     DanmakuMatched(DanmakuMatch),
+    MetadataMatchStarted {
+        media_id: i64,
+    },
+    MetadataMatchProgress {
+        processed: usize,
+        total: usize,
+    },
+    MetadataMatchFinished {
+        media_id: i64,
+        subject_id: Option<i64>,
+        title: Option<String>,
+    },
+    SubjectUpdated {
+        subject_id: i64,
+    },
+    ImageCached {
+        subject_id: i64,
+        image_kind: String,
+    },
+    MetadataFailed {
+        target_id: i64,
+        error: String,
+    },
 }
 
 pub fn spawn_media_scan(
@@ -200,4 +225,209 @@ pub fn unix_timestamp_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as i64)
         .unwrap_or_default()
+}
+
+pub fn spawn_match_metadata<P>(
+    repository: Repository,
+    provider: P,
+    image_cache: ImageCache,
+    media: MediaItem,
+    danmaku_hint: Option<DanmakuMatch>,
+    events: mpsc::Sender<AppEvent>,
+) where
+    P: MetadataProvider + Send + 'static,
+{
+    thread::spawn(move || {
+        let _ = events.send(AppEvent::MetadataMatchStarted { media_id: media.id });
+        match match_one_media(&repository, &provider, &image_cache, &media, danmaku_hint) {
+            Ok((subject_id, title)) => {
+                let _ = events.send(AppEvent::MetadataMatchFinished {
+                    media_id: media.id,
+                    subject_id,
+                    title,
+                });
+            }
+            Err(error) => {
+                let _ = events.send(AppEvent::MetadataFailed {
+                    target_id: media.id,
+                    error: error.to_string(),
+                });
+            }
+        }
+    });
+}
+
+pub fn spawn_match_all_unmatched<P>(
+    repository: Repository,
+    provider: P,
+    image_cache: ImageCache,
+    events: mpsc::Sender<AppEvent>,
+) where
+    P: MetadataProvider + Clone + Send + 'static,
+{
+    thread::spawn(move || {
+        let media = match repository.unmatched_media() {
+            Ok(media) => media,
+            Err(error) => {
+                let _ = events.send(AppEvent::MetadataFailed {
+                    target_id: 0,
+                    error: error.to_string(),
+                });
+                return;
+            }
+        };
+
+        let total = media.len();
+        for (index, item) in media.into_iter().enumerate() {
+            let _ = events.send(AppEvent::MetadataMatchProgress {
+                processed: index,
+                total,
+            });
+            match match_one_media(&repository, &provider, &image_cache, &item, None) {
+                Ok((subject_id, title)) => {
+                    let _ = events.send(AppEvent::MetadataMatchFinished {
+                        media_id: item.id,
+                        subject_id,
+                        title,
+                    });
+                }
+                Err(error) => {
+                    let _ = events.send(AppEvent::MetadataFailed {
+                        target_id: item.id,
+                        error: error.to_string(),
+                    });
+                }
+            }
+        }
+        let _ = events.send(AppEvent::MetadataMatchProgress {
+            processed: total,
+            total,
+        });
+    });
+}
+
+pub fn spawn_download_subject_images<P>(
+    repository: Repository,
+    provider: P,
+    image_cache: ImageCache,
+    subject_id: i64,
+    events: mpsc::Sender<AppEvent>,
+) where
+    P: MetadataProvider + Send + 'static,
+{
+    thread::spawn(move || {
+        let result = (|| {
+            let subject = repository
+                .get_subject(subject_id)?
+                .ok_or_else(|| crate::error::AppError::Api("subject not found".to_string()))?;
+            let images = provider.get_subject_images(&subject.provider_subject_id)?;
+            let cached = cache_subject_images(
+                &repository,
+                &image_cache,
+                subject_id,
+                &subject.provider,
+                [
+                    ("poster", images.common.or(subject.image_common)),
+                    ("hero", images.large.or(subject.image_large)),
+                ],
+            )?;
+            for image_kind in cached {
+                let _ = events.send(AppEvent::ImageCached {
+                    subject_id,
+                    image_kind,
+                });
+            }
+            Ok::<_, crate::error::AppError>(())
+        })();
+
+        match result {
+            Ok(()) => {
+                let _ = events.send(AppEvent::SubjectUpdated { subject_id });
+            }
+            Err(error) => {
+                let _ = events.send(AppEvent::MetadataFailed {
+                    target_id: subject_id,
+                    error: error.to_string(),
+                });
+            }
+        }
+    });
+}
+
+fn match_one_media<P>(
+    repository: &Repository,
+    provider: &P,
+    image_cache: &ImageCache,
+    media: &MediaItem,
+    danmaku_hint: Option<DanmakuMatch>,
+) -> crate::error::AppResult<(Option<i64>, Option<String>)>
+where
+    P: MetadataProvider,
+{
+    let keyword = crate::metadata::matcher::keyword_for_media(media, danmaku_hint.as_ref());
+    let candidates = provider.search_subjects(&keyword)?;
+    let Some(candidate) = candidates.first() else {
+        return Ok((None, None));
+    };
+
+    let now = unix_timestamp_ms();
+    let subject_id = repository.upsert_subject_from_search(candidate, now)?;
+    repository.link_media_subject(media.id, subject_id, "bangumi_search", 0.6, false, now)?;
+    if let Ok(detail) = provider.get_subject(&candidate.provider_subject_id) {
+        let detail_subject_id = repository.upsert_subject_detail(&detail, unix_timestamp_ms())?;
+        cache_subject_images(
+            repository,
+            image_cache,
+            detail_subject_id,
+            &detail.provider,
+            [
+                ("poster", detail.images.common.clone()),
+                ("hero", detail.images.large.clone()),
+            ],
+        )?;
+        return Ok((Some(detail_subject_id), Some(display_title(candidate))));
+    }
+
+    cache_subject_images(
+        repository,
+        image_cache,
+        subject_id,
+        &candidate.provider,
+        [
+            ("poster", candidate.image_common.clone()),
+            ("hero", candidate.image_large.clone()),
+        ],
+    )?;
+    Ok((Some(subject_id), Some(display_title(candidate))))
+}
+
+fn cache_subject_images<'a>(
+    repository: &Repository,
+    image_cache: &ImageCache,
+    subject_id: i64,
+    provider: &str,
+    images: impl IntoIterator<Item = (&'a str, Option<String>)>,
+) -> crate::error::AppResult<Vec<String>> {
+    let mut cached = Vec::new();
+    for (kind, url) in images {
+        let Some(url) = url.filter(|url| !url.trim().is_empty()) else {
+            continue;
+        };
+        if repository.get_image_cache(subject_id, kind)?.is_some() {
+            continue;
+        }
+        let path = image_cache.download_subject_image(provider, subject_id, kind, &url)?;
+        repository.upsert_image_cache(subject_id, kind, &url, &path, unix_timestamp_ms())?;
+        cached.push(kind.to_string());
+    }
+    Ok(cached)
+}
+
+fn display_title(candidate: &SubjectSearchResult) -> String {
+    candidate
+        .title_cn
+        .as_ref()
+        .filter(|title| !title.is_empty())
+        .unwrap_or(&candidate.title)
+        .to_string()
 }

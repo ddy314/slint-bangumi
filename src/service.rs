@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
@@ -10,8 +10,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::config::{ConfigStore, DandanplayConfig};
-use crate::domain::{DanmakuMatch, MediaItem, WatchProgress};
+use crate::domain::{DanmakuMatch, MediaItem, UiMediaCardData, UiSubjectDetailData, WatchProgress};
 use crate::error::{AppError, AppResult};
+use crate::metadata::bangumi::BangumiProvider;
+use crate::metadata::cache::ImageCache;
 use crate::repository::Repository;
 use crate::task::{self, AppEvent};
 
@@ -45,6 +47,14 @@ impl MediaService {
         self.repository.list_media(false)
     }
 
+    pub fn list_media_cards(&self) -> AppResult<Vec<UiMediaCardData>> {
+        self.repository.list_media_cards()
+    }
+
+    pub fn library_counts(&self) -> AppResult<(usize, usize, usize)> {
+        self.repository.library_counts()
+    }
+
     pub fn settings_summary(&self, indexed_media_count: usize) -> String {
         let config = self.config.snapshot();
         let dandanplay_status =
@@ -65,8 +75,9 @@ impl MediaService {
         };
 
         format!(
-            "database: {}\nindexed media: {}\ndandanplay: {}\nmedia libraries:\n{}",
+            "database: {}\ncache: {}\nindexed media: {}\ndandanplay: {}\nbangumi: public API\nmedia libraries:\n{}",
             config.database.path.display(),
+            image_cache_root(&config.database.path).display(),
             indexed_media_count,
             dandanplay_status,
             media_libraries
@@ -99,6 +110,163 @@ impl MediaService {
     fn send_log(&self, message: String) {
         let _ = self.events.send(AppEvent::Log(message));
     }
+}
+
+#[derive(Clone)]
+pub struct MetadataService {
+    repository: Repository,
+    danmaku: DanmakuService,
+    provider: BangumiProvider,
+    image_cache: ImageCache,
+    events: mpsc::Sender<AppEvent>,
+    running: Arc<Mutex<std::collections::HashSet<String>>>,
+}
+
+impl MetadataService {
+    pub fn new(
+        repository: Repository,
+        danmaku: DanmakuService,
+        database_path: PathBuf,
+        events: mpsc::Sender<AppEvent>,
+    ) -> AppResult<Self> {
+        Ok(Self {
+            repository,
+            danmaku,
+            provider: BangumiProvider::new()?,
+            image_cache: ImageCache::new(image_cache_root(&database_path))?,
+            events,
+            running: Arc::new(Mutex::new(std::collections::HashSet::new())),
+        })
+    }
+
+    pub fn subject_detail_for_media(&self, media_id: i64) -> AppResult<UiSubjectDetailData> {
+        self.repository.subject_detail_for_media(media_id)
+    }
+
+    pub fn start_match_media(&self, media_id: i64) {
+        let key = format!("match:{media_id}");
+        if !self.try_start(&key) {
+            let _ = self.events.send(AppEvent::Log(format!(
+                "metadata match already running for #{media_id}"
+            )));
+            return;
+        }
+
+        match self.repository.get_media(media_id) {
+            Ok(Some(media)) => {
+                let repository = self.repository.clone();
+                let provider = self.provider.clone();
+                let image_cache = self.image_cache.clone();
+                let events = self.events.clone();
+                let danmaku = self.danmaku.clone();
+                std::thread::spawn(move || {
+                    let danmaku_hint = danmaku.match_dandanplay(&media).ok();
+                    task::spawn_match_metadata(
+                        repository,
+                        provider,
+                        image_cache,
+                        media,
+                        danmaku_hint,
+                        events,
+                    );
+                });
+            }
+            Ok(None) => {
+                self.finish(&key);
+                let _ = self.events.send(AppEvent::MetadataFailed {
+                    target_id: media_id,
+                    error: "media not found".to_string(),
+                });
+            }
+            Err(error) => {
+                self.finish(&key);
+                let _ = self.events.send(AppEvent::MetadataFailed {
+                    target_id: media_id,
+                    error: error.to_string(),
+                });
+            }
+        }
+    }
+
+    pub fn start_match_all_unmatched(&self) {
+        let key = "match-all".to_string();
+        if !self.try_start(&key) {
+            let _ = self.events.send(AppEvent::Log(
+                "metadata match-all already running".to_string(),
+            ));
+            return;
+        }
+
+        task::spawn_match_all_unmatched(
+            self.repository.clone(),
+            self.provider.clone(),
+            self.image_cache.clone(),
+            self.events.clone(),
+        );
+    }
+
+    pub fn start_download_subject_images(&self, subject_id: i64) {
+        let key = format!("images:{subject_id}");
+        if !self.try_start(&key) {
+            return;
+        }
+        task::spawn_download_subject_images(
+            self.repository.clone(),
+            self.provider.clone(),
+            self.image_cache.clone(),
+            subject_id,
+            self.events.clone(),
+        );
+    }
+
+    pub fn confirm_media_subject(&self, media_id: i64, subject_id: i64) -> AppResult<()> {
+        self.repository
+            .confirm_media_subject(media_id, subject_id, task::unix_timestamp_ms())?;
+        let _ = self.events.send(AppEvent::SubjectUpdated { subject_id });
+        Ok(())
+    }
+
+    pub fn finish_for_event(&self, event: &AppEvent) {
+        match event {
+            AppEvent::MetadataMatchFinished { media_id, .. } => {
+                self.finish(&format!("match:{media_id}"))
+            }
+            AppEvent::MetadataFailed { target_id: 0, .. } => self.finish("match-all"),
+            AppEvent::MetadataFailed {
+                target_id: media_id,
+                ..
+            } => self.finish(&format!("match:{media_id}")),
+            AppEvent::MetadataMatchProgress { processed, total } if processed == total => {
+                self.finish("match-all")
+            }
+            AppEvent::SubjectUpdated { subject_id } | AppEvent::ImageCached { subject_id, .. } => {
+                self.finish(&format!("images:{subject_id}"))
+            }
+            _ => {}
+        }
+    }
+
+    fn try_start(&self, key: &str) -> bool {
+        self.running
+            .lock()
+            .expect("metadata running mutex poisoned")
+            .insert(key.to_string())
+    }
+
+    fn finish(&self, key: &str) {
+        self.running
+            .lock()
+            .expect("metadata running mutex poisoned")
+            .remove(key);
+    }
+}
+
+fn image_cache_root(database_path: &std::path::Path) -> PathBuf {
+    database_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("data"))
+        .join("cache")
+        .join("images")
 }
 
 fn open_with_default_player(path: &PathBuf) -> AppResult<()> {

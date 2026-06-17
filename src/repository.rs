@@ -2,8 +2,12 @@ use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, OptionalExtension, params};
 
-use crate::domain::{MediaFile, MediaItem, ScanUpsertStatus, WatchProgress};
+use crate::domain::{
+    MediaFile, MediaItem, ScanUpsertStatus, Subject, SubjectImageCache, UiMediaCardData,
+    UiSubjectDetailData, WatchProgress,
+};
 use crate::error::AppResult;
+use crate::metadata::provider::{SubjectDetail, SubjectSearchResult};
 
 #[derive(Debug, Clone)]
 pub struct Repository {
@@ -43,6 +47,87 @@ impl Repository {
                 updated_at INTEGER NOT NULL,
                 FOREIGN KEY(media_id) REFERENCES media_items(id) ON DELETE CASCADE
             );
+
+            CREATE TABLE IF NOT EXISTS subjects (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                provider TEXT NOT NULL,
+                provider_subject_id TEXT NOT NULL,
+                title TEXT NOT NULL,
+                title_cn TEXT,
+                summary TEXT,
+                air_date TEXT,
+                rating REAL,
+                rank INTEGER,
+                image_large TEXT,
+                image_common TEXT,
+                tags TEXT,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                UNIQUE(provider, provider_subject_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS media_subject_links (
+                media_id INTEGER NOT NULL,
+                subject_id INTEGER NOT NULL,
+                match_source TEXT NOT NULL,
+                confidence REAL,
+                confirmed INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY(media_id, subject_id),
+                FOREIGN KEY(media_id) REFERENCES media_items(id) ON DELETE CASCADE,
+                FOREIGN KEY(subject_id) REFERENCES subjects(id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_media_subject_links_media
+                ON media_subject_links(media_id);
+
+            CREATE TABLE IF NOT EXISTS subject_image_cache (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                subject_id INTEGER NOT NULL,
+                image_kind TEXT NOT NULL,
+                source_url TEXT NOT NULL,
+                local_path TEXT NOT NULL,
+                content_hash TEXT,
+                width INTEGER,
+                height INTEGER,
+                downloaded_at INTEGER NOT NULL,
+                last_accessed_at INTEGER NOT NULL,
+                UNIQUE(subject_id, image_kind),
+                FOREIGN KEY(subject_id) REFERENCES subjects(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS episodes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                subject_id INTEGER NOT NULL,
+                provider_episode_id TEXT,
+                sort_number REAL,
+                title TEXT,
+                title_cn TEXT,
+                air_date TEXT,
+                FOREIGN KEY(subject_id) REFERENCES subjects(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS media_episode_links (
+                media_id INTEGER NOT NULL,
+                episode_id INTEGER,
+                episode_title TEXT,
+                episode_number REAL,
+                match_source TEXT,
+                confidence REAL,
+                FOREIGN KEY(media_id) REFERENCES media_items(id) ON DELETE CASCADE,
+                FOREIGN KEY(episode_id) REFERENCES episodes(id) ON DELETE SET NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS metadata_jobs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_type TEXT NOT NULL,
+                target_id INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                error TEXT,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
             "#,
         )?;
         Ok(())
@@ -59,6 +144,448 @@ impl Repository {
         let mut stmt = conn.prepare(sql)?;
         let rows = stmt.query_map([], map_media_item)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn get_media(&self, media_id: i64) -> AppResult<Option<MediaItem>> {
+        let conn = self.connect()?;
+        conn.query_row(
+            "SELECT id, path, file_name, file_size, modified_at, file_hash, deleted_at FROM media_items WHERE id = ?1",
+            params![media_id],
+            map_media_item,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn list_media_cards(&self) -> AppResult<Vec<UiMediaCardData>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT
+                m.id,
+                COALESCE(s.id, 0),
+                COALESCE(NULLIF(s.title_cn, ''), s.title, m.file_name),
+                m.file_name,
+                CASE
+                    WHEN s.id IS NULL THEN '未匹配'
+                    WHEN l.confirmed = 0 THEN '待确认'
+                    ELSE '已匹配'
+                END,
+                CASE
+                    WHEN s.id IS NULL THEN 'unmatched'
+                    WHEN l.confirmed = 0 THEN 'tentative'
+                    ELSE 'matched'
+                END,
+                COALESCE(CAST((wp.position_ms * 100) / NULLIF(wp.duration_ms, 0) AS INTEGER), 0),
+                COALESCE(mel.episode_title, ''),
+                COALESCE(pic.local_path, '')
+            FROM media_items m
+            LEFT JOIN (
+                SELECT media_id, subject_id, confirmed, MAX(updated_at)
+                FROM media_subject_links
+                GROUP BY media_id
+            ) l ON l.media_id = m.id
+            LEFT JOIN subjects s ON s.id = l.subject_id
+            LEFT JOIN watch_progress wp ON wp.media_id = m.id
+            LEFT JOIN media_episode_links mel ON mel.media_id = m.id
+            LEFT JOIN subject_image_cache pic
+                ON pic.subject_id = s.id AND pic.image_kind = 'poster'
+            WHERE m.deleted_at IS NULL
+            ORDER BY title COLLATE NOCASE
+            "#,
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let poster_path: String = row.get(8)?;
+            Ok(UiMediaCardData {
+                media_id: row.get(0)?,
+                subject_id: row.get(1)?,
+                title: row.get(2)?,
+                subtitle: row.get(3)?,
+                status_text: row.get(4)?,
+                match_status: row.get(5)?,
+                progress_percent: row.get::<_, i64>(6)? as i32,
+                episode_text: row.get(7)?,
+                has_cached_poster: !poster_path.is_empty(),
+                poster_path,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn library_counts(&self) -> AppResult<(usize, usize, usize)> {
+        let conn = self.connect()?;
+        let indexed = conn.query_row(
+            "SELECT COUNT(*) FROM media_items WHERE deleted_at IS NULL",
+            [],
+            |row| row.get::<_, i64>(0),
+        )? as usize;
+        let matched = conn.query_row(
+            r#"
+            SELECT COUNT(DISTINCT media_id)
+            FROM media_subject_links l
+            JOIN media_items m ON m.id = l.media_id
+            WHERE m.deleted_at IS NULL
+            "#,
+            [],
+            |row| row.get::<_, i64>(0),
+        )? as usize;
+        Ok((indexed, matched, indexed.saturating_sub(matched)))
+    }
+
+    pub fn unmatched_media(&self) -> AppResult<Vec<MediaItem>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT m.id, m.path, m.file_name, m.file_size, m.modified_at, m.file_hash, m.deleted_at
+            FROM media_items m
+            LEFT JOIN media_subject_links l ON l.media_id = m.id
+            WHERE m.deleted_at IS NULL AND l.media_id IS NULL
+            ORDER BY m.file_name COLLATE NOCASE
+            "#,
+        )?;
+        let rows = stmt.query_map([], map_media_item)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn upsert_subject_from_search(
+        &self,
+        subject: &SubjectSearchResult,
+        now: i64,
+    ) -> AppResult<i64> {
+        let conn = self.connect()?;
+        conn.execute(
+            r#"
+            INSERT INTO subjects
+                (provider, provider_subject_id, title, title_cn, summary, air_date, rating, rank,
+                 image_large, image_common, tags, created_at, updated_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL, ?11, ?11)
+            ON CONFLICT(provider, provider_subject_id) DO UPDATE SET
+                title = excluded.title,
+                title_cn = excluded.title_cn,
+                summary = COALESCE(excluded.summary, subjects.summary),
+                air_date = COALESCE(excluded.air_date, subjects.air_date),
+                rating = COALESCE(excluded.rating, subjects.rating),
+                rank = COALESCE(excluded.rank, subjects.rank),
+                image_large = COALESCE(excluded.image_large, subjects.image_large),
+                image_common = COALESCE(excluded.image_common, subjects.image_common),
+                updated_at = excluded.updated_at
+            "#,
+            params![
+                subject.provider,
+                subject.provider_subject_id,
+                subject.title,
+                subject.title_cn,
+                subject.summary,
+                subject.air_date,
+                subject.rating,
+                subject.rank,
+                subject.image_large,
+                subject.image_common,
+                now
+            ],
+        )?;
+        self.find_subject_id(&subject.provider, &subject.provider_subject_id)
+    }
+
+    pub fn upsert_subject_detail(&self, detail: &SubjectDetail, now: i64) -> AppResult<i64> {
+        let conn = self.connect()?;
+        let tags = serde_json::to_string(&detail.tags).unwrap_or_else(|_| "[]".to_string());
+        conn.execute(
+            r#"
+            INSERT INTO subjects
+                (provider, provider_subject_id, title, title_cn, summary, air_date, rating, rank,
+                 image_large, image_common, tags, created_at, updated_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12)
+            ON CONFLICT(provider, provider_subject_id) DO UPDATE SET
+                title = excluded.title,
+                title_cn = excluded.title_cn,
+                summary = excluded.summary,
+                air_date = excluded.air_date,
+                rating = excluded.rating,
+                rank = excluded.rank,
+                image_large = excluded.image_large,
+                image_common = excluded.image_common,
+                tags = excluded.tags,
+                updated_at = excluded.updated_at
+            "#,
+            params![
+                detail.provider,
+                detail.provider_subject_id,
+                detail.title,
+                detail.title_cn,
+                detail.summary,
+                detail.air_date,
+                detail.rating,
+                detail.rank,
+                detail.images.large,
+                detail.images.common,
+                tags,
+                now
+            ],
+        )?;
+        self.find_subject_id(&detail.provider, &detail.provider_subject_id)
+    }
+
+    pub fn link_media_subject(
+        &self,
+        media_id: i64,
+        subject_id: i64,
+        match_source: &str,
+        confidence: f64,
+        confirmed: bool,
+        now: i64,
+    ) -> AppResult<()> {
+        let conn = self.connect()?;
+        conn.execute(
+            r#"
+            INSERT INTO media_subject_links
+                (media_id, subject_id, match_source, confidence, confirmed, created_at, updated_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)
+            ON CONFLICT(media_id, subject_id) DO UPDATE SET
+                match_source = excluded.match_source,
+                confidence = excluded.confidence,
+                confirmed = excluded.confirmed,
+                updated_at = excluded.updated_at
+            "#,
+            params![
+                media_id,
+                subject_id,
+                match_source,
+                confidence,
+                if confirmed { 1 } else { 0 },
+                now
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn confirm_media_subject(&self, media_id: i64, subject_id: i64, now: i64) -> AppResult<()> {
+        let conn = self.connect()?;
+        conn.execute(
+            r#"
+            UPDATE media_subject_links
+            SET confirmed = 1, updated_at = ?3
+            WHERE media_id = ?1 AND subject_id = ?2
+            "#,
+            params![media_id, subject_id, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_subject(&self, subject_id: i64) -> AppResult<Option<Subject>> {
+        let conn = self.connect()?;
+        conn.query_row(
+            r#"
+            SELECT id, provider, provider_subject_id, title, title_cn, summary, air_date,
+                   rating, rank, image_large, image_common
+            FROM subjects WHERE id = ?1
+            "#,
+            params![subject_id],
+            |row| {
+                Ok(Subject {
+                    id: row.get(0)?,
+                    provider: row.get(1)?,
+                    provider_subject_id: row.get(2)?,
+                    title: row.get(3)?,
+                    title_cn: row.get(4)?,
+                    summary: row.get(5)?,
+                    air_date: row.get(6)?,
+                    rating: row.get(7)?,
+                    rank: row.get(8)?,
+                    image_large: row.get(9)?,
+                    image_common: row.get(10)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn subject_for_media(&self, media_id: i64) -> AppResult<Option<Subject>> {
+        let conn = self.connect()?;
+        conn.query_row(
+            r#"
+            SELECT s.id, s.provider, s.provider_subject_id, s.title, s.title_cn, s.summary,
+                   s.air_date, s.rating, s.rank, s.image_large, s.image_common
+            FROM media_subject_links l
+            JOIN subjects s ON s.id = l.subject_id
+            WHERE l.media_id = ?1
+            ORDER BY l.confirmed DESC, l.updated_at DESC
+            LIMIT 1
+            "#,
+            params![media_id],
+            |row| {
+                Ok(Subject {
+                    id: row.get(0)?,
+                    provider: row.get(1)?,
+                    provider_subject_id: row.get(2)?,
+                    title: row.get(3)?,
+                    title_cn: row.get(4)?,
+                    summary: row.get(5)?,
+                    air_date: row.get(6)?,
+                    rating: row.get(7)?,
+                    rank: row.get(8)?,
+                    image_large: row.get(9)?,
+                    image_common: row.get(10)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn upsert_image_cache(
+        &self,
+        subject_id: i64,
+        image_kind: &str,
+        source_url: &str,
+        local_path: &Path,
+        now: i64,
+    ) -> AppResult<()> {
+        let conn = self.connect()?;
+        conn.execute(
+            r#"
+            INSERT INTO subject_image_cache
+                (subject_id, image_kind, source_url, local_path, downloaded_at, last_accessed_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?5)
+            ON CONFLICT(subject_id, image_kind) DO UPDATE SET
+                source_url = excluded.source_url,
+                local_path = excluded.local_path,
+                downloaded_at = excluded.downloaded_at,
+                last_accessed_at = excluded.last_accessed_at
+            "#,
+            params![
+                subject_id,
+                image_kind,
+                source_url,
+                local_path.to_string_lossy(),
+                now
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_image_cache(
+        &self,
+        subject_id: i64,
+        image_kind: &str,
+    ) -> AppResult<Option<SubjectImageCache>> {
+        let conn = self.connect()?;
+        conn.query_row(
+            r#"
+            SELECT subject_id, image_kind, source_url, local_path
+            FROM subject_image_cache
+            WHERE subject_id = ?1 AND image_kind = ?2
+            "#,
+            params![subject_id, image_kind],
+            |row| {
+                Ok(SubjectImageCache {
+                    subject_id: row.get(0)?,
+                    image_kind: row.get(1)?,
+                    source_url: row.get(2)?,
+                    local_path: PathBuf::from(row.get::<_, String>(3)?),
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn subject_detail_for_media(&self, media_id: i64) -> AppResult<UiSubjectDetailData> {
+        let media = self
+            .get_media(media_id)?
+            .ok_or(crate::error::AppError::MediaNotFound)?;
+        let subject = self.subject_for_media(media_id)?;
+        let files = vec![format!(
+            "{}  ({} MB, modified_at={})",
+            media.path.display(),
+            media.file_size / 1024 / 1024,
+            media.modified_at
+        )];
+
+        if let Some(subject) = subject {
+            let confirmed = self.media_subject_confirmed(media_id, subject.id)?;
+            let poster = self
+                .get_image_cache(subject.id, "poster")?
+                .map(|cache| cache.local_path.display().to_string())
+                .unwrap_or_default();
+            let hero = self
+                .get_image_cache(subject.id, "hero")?
+                .map(|cache| cache.local_path.display().to_string())
+                .unwrap_or_default();
+            let poster_cached = !poster.is_empty();
+            let hero_cached = !hero.is_empty();
+            Ok(UiSubjectDetailData {
+                media_id,
+                subject_id: subject.id,
+                title: subject.title,
+                title_cn: subject.title_cn.unwrap_or_default(),
+                summary: subject
+                    .summary
+                    .unwrap_or_else(|| "No summary cached yet.".to_string()),
+                air_date: subject.air_date.unwrap_or_else(|| "-".to_string()),
+                rating_text: subject
+                    .rating
+                    .map(|rating| format!("{rating:.1}"))
+                    .unwrap_or_else(|| "-".to_string()),
+                rank_text: subject
+                    .rank
+                    .map(|rank| format!("#{rank}"))
+                    .unwrap_or_else(|| "-".to_string()),
+                poster_path: poster,
+                hero_path: hero,
+                match_status: if confirmed { "已匹配" } else { "待确认" }.to_string(),
+                cache_status: format!(
+                    "poster: {}, hero: {}",
+                    if poster_cached {
+                        "cached"
+                    } else {
+                        "not cached"
+                    },
+                    if hero_cached { "cached" } else { "not cached" }
+                ),
+                files,
+            })
+        } else {
+            Ok(UiSubjectDetailData {
+                media_id,
+                subject_id: 0,
+                title: media.file_name.clone(),
+                title_cn: String::new(),
+                summary: "未匹配。可以在这里搜索 Bangumi 候选并绑定。".to_string(),
+                air_date: "-".to_string(),
+                rating_text: "-".to_string(),
+                rank_text: "-".to_string(),
+                poster_path: String::new(),
+                hero_path: String::new(),
+                match_status: "未匹配".to_string(),
+                cache_status: "poster: not cached, hero: not cached".to_string(),
+                files,
+            })
+        }
+    }
+
+    fn find_subject_id(&self, provider: &str, provider_subject_id: &str) -> AppResult<i64> {
+        let conn = self.connect()?;
+        conn.query_row(
+            "SELECT id FROM subjects WHERE provider = ?1 AND provider_subject_id = ?2",
+            params![provider, provider_subject_id],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
+    }
+
+    fn media_subject_confirmed(&self, media_id: i64, subject_id: i64) -> AppResult<bool> {
+        let conn = self.connect()?;
+        let confirmed = conn
+            .query_row(
+                "SELECT confirmed FROM media_subject_links WHERE media_id = ?1 AND subject_id = ?2",
+                params![media_id, subject_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .unwrap_or_default();
+        Ok(confirmed != 0)
     }
 
     pub fn needs_hash_update(

@@ -40,9 +40,13 @@ The content is organized as follows:
 </file_summary>
 
 <directory_structure>
-data/
-  slint-bangumi.sqlite3
 src/
+  metadata/
+    bangumi.rs
+    cache.rs
+    matcher.rs
+    mod.rs
+    provider.rs
   ui/
     bridge.rs
     mod.rs
@@ -59,12 +63,342 @@ ui/
 .gitignore
 build.rs
 Cargo.toml
-config.toml
 README.md
 </directory_structure>
 
 <files>
 This section contains the contents of the repository's files.
+
+<file path="src/metadata/bangumi.rs">
+use std::time::Duration;
+
+use reqwest::blocking::Client;
+use serde::{Deserialize, Serialize};
+
+use crate::error::{AppError, AppResult};
+
+use super::provider::{MetadataProvider, SubjectDetail, SubjectImages, SubjectSearchResult};
+
+const BANGUMI_BASE_URL: &str = "https://api.bgm.tv";
+
+#[derive(Clone)]
+pub struct BangumiProvider {
+    client: Client,
+}
+
+impl BangumiProvider {
+    pub fn new() -> AppResult<Self> {
+        let user_agent = format!(
+            "slint-bangumi/{} (https://github.com/ddy314/slint-bangumi)",
+            env!("CARGO_PKG_VERSION")
+        );
+        let client = Client::builder()
+            .timeout(Duration::from_secs(20))
+            .user_agent(user_agent)
+            .build()?;
+        Ok(Self { client })
+    }
+}
+
+impl MetadataProvider for BangumiProvider {
+    fn search_subjects(&self, keyword: &str) -> AppResult<Vec<SubjectSearchResult>> {
+        let keyword = keyword.trim();
+        if keyword.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let response = self
+            .client
+            .post(format!("{BANGUMI_BASE_URL}/v0/search/subjects"))
+            .json(&SearchRequest {
+                keyword,
+                filter: SearchFilter {
+                    subject_type: vec![2],
+                },
+            })
+            .send()?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(AppError::Api(format!("bangumi search rejected: {status}")));
+        }
+
+        let response = response.json::<SearchResponse>()?;
+        Ok(response
+            .data
+            .into_iter()
+            .map(|subject| subject.into_search_result())
+            .collect())
+    }
+
+    fn get_subject(&self, provider_subject_id: &str) -> AppResult<SubjectDetail> {
+        let response = self
+            .client
+            .get(format!(
+                "{BANGUMI_BASE_URL}/v0/subjects/{provider_subject_id}"
+            ))
+            .send()?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(AppError::Api(format!("bangumi subject rejected: {status}")));
+        }
+
+        Ok(response.json::<BangumiSubject>()?.into_detail())
+    }
+
+    fn get_subject_images(&self, provider_subject_id: &str) -> AppResult<SubjectImages> {
+        Ok(self.get_subject(provider_subject_id)?.images)
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct SearchRequest<'a> {
+    keyword: &'a str,
+    filter: SearchFilter,
+}
+
+#[derive(Debug, Serialize)]
+struct SearchFilter {
+    #[serde(rename = "type")]
+    subject_type: Vec<i32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SearchResponse {
+    data: Vec<BangumiSubject>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BangumiSubject {
+    id: i64,
+    name: String,
+    name_cn: Option<String>,
+    summary: Option<String>,
+    date: Option<String>,
+    rank: Option<i64>,
+    rating: Option<BangumiRating>,
+    images: Option<BangumiImages>,
+    tags: Option<Vec<BangumiTag>>,
+}
+
+impl BangumiSubject {
+    fn into_search_result(self) -> SubjectSearchResult {
+        let images = self.images.unwrap_or_default();
+        SubjectSearchResult {
+            provider: "bangumi".to_string(),
+            provider_subject_id: self.id.to_string(),
+            title: self.name,
+            title_cn: non_empty(self.name_cn),
+            summary: non_empty(self.summary),
+            air_date: non_empty(self.date),
+            rating: self.rating.and_then(|rating| rating.score),
+            rank: self.rank,
+            image_large: non_empty(images.large),
+            image_common: non_empty(images.common),
+        }
+    }
+
+    fn into_detail(self) -> SubjectDetail {
+        let images = self.images.unwrap_or_default();
+        SubjectDetail {
+            provider: "bangumi".to_string(),
+            provider_subject_id: self.id.to_string(),
+            title: self.name,
+            title_cn: non_empty(self.name_cn),
+            summary: non_empty(self.summary),
+            air_date: non_empty(self.date),
+            rating: self.rating.and_then(|rating| rating.score),
+            rank: self.rank,
+            tags: self
+                .tags
+                .unwrap_or_default()
+                .into_iter()
+                .map(|tag| tag.name)
+                .filter(|tag| !tag.trim().is_empty())
+                .collect(),
+            images: SubjectImages {
+                large: non_empty(images.large),
+                common: non_empty(images.common),
+            },
+        }
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct BangumiImages {
+    large: Option<String>,
+    common: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BangumiRating {
+    score: Option<f64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BangumiTag {
+    name: String,
+}
+
+fn non_empty(value: Option<String>) -> Option<String> {
+    value.and_then(|value| {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    })
+}
+</file>
+
+<file path="src/metadata/cache.rs">
+use std::fs;
+use std::path::PathBuf;
+use std::time::Duration;
+
+use reqwest::blocking::Client;
+
+use crate::error::{AppResult, io_error};
+
+#[derive(Clone)]
+pub struct ImageCache {
+    root: PathBuf,
+    client: Client,
+}
+
+impl ImageCache {
+    pub fn new(root: PathBuf) -> AppResult<Self> {
+        let client = Client::builder()
+            .timeout(Duration::from_secs(30))
+            .user_agent(concat!("slint-bangumi/", env!("CARGO_PKG_VERSION")))
+            .build()?;
+        Ok(Self { root, client })
+    }
+
+    pub fn subject_image_path(&self, provider: &str, subject_id: i64, kind: &str) -> PathBuf {
+        self.root
+            .join(provider)
+            .join("subjects")
+            .join(subject_id.to_string())
+            .join(format!("{kind}.jpg"))
+    }
+
+    pub fn download_subject_image(
+        &self,
+        provider: &str,
+        subject_id: i64,
+        kind: &str,
+        url: &str,
+    ) -> AppResult<PathBuf> {
+        let path = self.subject_image_path(provider, subject_id, kind);
+        if path.is_file() {
+            return Ok(path);
+        }
+
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|err| io_error(parent, err))?;
+        }
+
+        let tmp = path.with_extension("jpg.tmp");
+        let bytes = self.client.get(url).send()?.error_for_status()?.bytes()?;
+        fs::write(&tmp, bytes).map_err(|err| io_error(&tmp, err))?;
+        fs::rename(&tmp, &path).map_err(|err| io_error(&path, err))?;
+        Ok(path)
+    }
+}
+</file>
+
+<file path="src/metadata/matcher.rs">
+use std::path::Path;
+
+use crate::domain::{DanmakuMatch, MediaItem};
+
+pub fn keyword_for_media(media: &MediaItem, danmaku: Option<&DanmakuMatch>) -> String {
+    if let Some(danmaku) = danmaku {
+        let title = danmaku
+            .title
+            .split(" - ")
+            .next()
+            .unwrap_or(&danmaku.title)
+            .trim();
+        if !title.is_empty() {
+            return title.to_string();
+        }
+    }
+
+    clean_file_title(&media.file_name)
+}
+
+fn clean_file_title(file_name: &str) -> String {
+    let stem = Path::new(file_name)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or(file_name);
+    let mut out = String::new();
+    let mut bracket_depth = 0;
+    for ch in stem.chars() {
+        match ch {
+            '[' | '【' | '(' | '（' => bracket_depth += 1,
+            ']' | '】' | ')' | '）' => bracket_depth = (bracket_depth - 1).max(0),
+            '_' | '.' if bracket_depth == 0 => out.push(' '),
+            _ if bracket_depth == 0 => out.push(ch),
+            _ => {}
+        }
+    }
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+</file>
+
+<file path="src/metadata/mod.rs">
+pub mod bangumi;
+pub mod cache;
+pub mod matcher;
+pub mod provider;
+</file>
+
+<file path="src/metadata/provider.rs">
+use crate::error::AppResult;
+
+#[derive(Debug, Clone)]
+pub struct SubjectSearchResult {
+    pub provider: String,
+    pub provider_subject_id: String,
+    pub title: String,
+    pub title_cn: Option<String>,
+    pub summary: Option<String>,
+    pub air_date: Option<String>,
+    pub rating: Option<f64>,
+    pub rank: Option<i64>,
+    pub image_large: Option<String>,
+    pub image_common: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SubjectDetail {
+    pub provider: String,
+    pub provider_subject_id: String,
+    pub title: String,
+    pub title_cn: Option<String>,
+    pub summary: Option<String>,
+    pub air_date: Option<String>,
+    pub rating: Option<f64>,
+    pub rank: Option<i64>,
+    pub tags: Vec<String>,
+    pub images: SubjectImages,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct SubjectImages {
+    pub large: Option<String>,
+    pub common: Option<String>,
+}
+
+pub trait MetadataProvider {
+    fn search_subjects(&self, keyword: &str) -> AppResult<Vec<SubjectSearchResult>>;
+    fn get_subject(&self, provider_subject_id: &str) -> AppResult<SubjectDetail>;
+    fn get_subject_images(&self, provider_subject_id: &str) -> AppResult<SubjectImages>;
+}
+</file>
 
 <file path="src/ui/mod.rs">
 pub mod bridge;
@@ -203,22 +537,6 @@ pub struct MediaItem {
     pub deleted_at: Option<i64>,
 }
 
-impl MediaItem {
-    pub fn display_label(&self) -> String {
-        let deleted = if self.deleted_at.is_some() {
-            " [missing]"
-        } else {
-            ""
-        };
-        format!(
-            "{}{}  ({} MB)",
-            self.file_name,
-            deleted,
-            self.file_size / 1024 / 1024
-        )
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct MediaFile {
     pub path: PathBuf,
@@ -261,10 +579,63 @@ pub struct DanmakuMatch {
     pub episode: Option<String>,
     pub comment_count: usize,
 }
-</file>
 
-<file path=".gitignore">
-/target
+#[derive(Debug, Clone)]
+pub struct Subject {
+    pub id: i64,
+    pub provider: String,
+    pub provider_subject_id: String,
+    pub title: String,
+    pub title_cn: Option<String>,
+    pub summary: Option<String>,
+    pub air_date: Option<String>,
+    pub rating: Option<f64>,
+    pub rank: Option<i64>,
+    pub image_large: Option<String>,
+    pub image_common: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SubjectImageCache {
+    #[allow(dead_code)]
+    pub subject_id: i64,
+    #[allow(dead_code)]
+    pub image_kind: String,
+    #[allow(dead_code)]
+    pub source_url: String,
+    pub local_path: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+pub struct UiMediaCardData {
+    pub media_id: i64,
+    pub subject_id: i64,
+    pub title: String,
+    pub subtitle: String,
+    pub status_text: String,
+    pub match_status: String,
+    pub progress_percent: i32,
+    pub episode_text: String,
+    pub poster_path: String,
+    pub has_cached_poster: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct UiSubjectDetailData {
+    pub media_id: i64,
+    pub subject_id: i64,
+    pub title: String,
+    pub title_cn: String,
+    pub summary: String,
+    pub air_date: String,
+    pub rating_text: String,
+    pub rank_text: String,
+    pub poster_path: String,
+    pub hero_path: String,
+    pub match_status: String,
+    pub cache_status: String,
+    pub files: Vec<String>,
+}
 </file>
 
 <file path="build.rs">
@@ -279,7 +650,7 @@ use std::sync::{Arc, mpsc};
 use crate::config::ConfigStore;
 use crate::error::AppResult;
 use crate::repository::Repository;
-use crate::service::{DanmakuService, MediaService, WatchHistoryService};
+use crate::service::{DanmakuService, MediaService, MetadataService, WatchHistoryService};
 use crate::task::AppEvent;
 
 #[derive(Clone)]
@@ -287,6 +658,7 @@ pub struct AppContext {
     pub media: MediaService,
     pub watch_history: WatchHistoryService,
     pub danmaku: DanmakuService,
+    pub metadata: MetadataService,
     pub event_receiver: Arc<std::sync::Mutex<Option<mpsc::Receiver<AppEvent>>>>,
 }
 
@@ -297,10 +669,19 @@ impl AppContext {
         let repository = Repository::new(config.snapshot().database.path);
         repository.init()?;
 
+        let danmaku = DanmakuService::new(config.clone(), events.clone())?;
+        let database_path = config.snapshot().database.path;
+
         Ok(Self {
             media: MediaService::new(config.clone(), repository.clone(), events.clone()),
             watch_history: WatchHistoryService::new(repository.clone(), events.clone()),
-            danmaku: DanmakuService::new(config.clone(), events.clone())?,
+            metadata: MetadataService::new(
+                repository.clone(),
+                danmaku.clone(),
+                database_path,
+                events.clone(),
+            )?,
+            danmaku,
             event_receiver: Arc::new(std::sync::Mutex::new(Some(receiver))),
         })
     }
@@ -312,6 +693,7 @@ mod app;
 mod config;
 mod domain;
 mod error;
+mod metadata;
 mod repository;
 mod service;
 mod task;
@@ -342,8 +724,12 @@ use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, OptionalExtension, params};
 
-use crate::domain::{MediaFile, MediaItem, ScanUpsertStatus, WatchProgress};
+use crate::domain::{
+    MediaFile, MediaItem, ScanUpsertStatus, Subject, SubjectImageCache, UiMediaCardData,
+    UiSubjectDetailData, WatchProgress,
+};
 use crate::error::AppResult;
+use crate::metadata::provider::{SubjectDetail, SubjectSearchResult};
 
 #[derive(Debug, Clone)]
 pub struct Repository {
@@ -383,6 +769,87 @@ impl Repository {
                 updated_at INTEGER NOT NULL,
                 FOREIGN KEY(media_id) REFERENCES media_items(id) ON DELETE CASCADE
             );
+
+            CREATE TABLE IF NOT EXISTS subjects (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                provider TEXT NOT NULL,
+                provider_subject_id TEXT NOT NULL,
+                title TEXT NOT NULL,
+                title_cn TEXT,
+                summary TEXT,
+                air_date TEXT,
+                rating REAL,
+                rank INTEGER,
+                image_large TEXT,
+                image_common TEXT,
+                tags TEXT,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                UNIQUE(provider, provider_subject_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS media_subject_links (
+                media_id INTEGER NOT NULL,
+                subject_id INTEGER NOT NULL,
+                match_source TEXT NOT NULL,
+                confidence REAL,
+                confirmed INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY(media_id, subject_id),
+                FOREIGN KEY(media_id) REFERENCES media_items(id) ON DELETE CASCADE,
+                FOREIGN KEY(subject_id) REFERENCES subjects(id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_media_subject_links_media
+                ON media_subject_links(media_id);
+
+            CREATE TABLE IF NOT EXISTS subject_image_cache (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                subject_id INTEGER NOT NULL,
+                image_kind TEXT NOT NULL,
+                source_url TEXT NOT NULL,
+                local_path TEXT NOT NULL,
+                content_hash TEXT,
+                width INTEGER,
+                height INTEGER,
+                downloaded_at INTEGER NOT NULL,
+                last_accessed_at INTEGER NOT NULL,
+                UNIQUE(subject_id, image_kind),
+                FOREIGN KEY(subject_id) REFERENCES subjects(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS episodes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                subject_id INTEGER NOT NULL,
+                provider_episode_id TEXT,
+                sort_number REAL,
+                title TEXT,
+                title_cn TEXT,
+                air_date TEXT,
+                FOREIGN KEY(subject_id) REFERENCES subjects(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS media_episode_links (
+                media_id INTEGER NOT NULL,
+                episode_id INTEGER,
+                episode_title TEXT,
+                episode_number REAL,
+                match_source TEXT,
+                confidence REAL,
+                FOREIGN KEY(media_id) REFERENCES media_items(id) ON DELETE CASCADE,
+                FOREIGN KEY(episode_id) REFERENCES episodes(id) ON DELETE SET NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS metadata_jobs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_type TEXT NOT NULL,
+                target_id INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                error TEXT,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
             "#,
         )?;
         Ok(())
@@ -399,6 +866,448 @@ impl Repository {
         let mut stmt = conn.prepare(sql)?;
         let rows = stmt.query_map([], map_media_item)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn get_media(&self, media_id: i64) -> AppResult<Option<MediaItem>> {
+        let conn = self.connect()?;
+        conn.query_row(
+            "SELECT id, path, file_name, file_size, modified_at, file_hash, deleted_at FROM media_items WHERE id = ?1",
+            params![media_id],
+            map_media_item,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn list_media_cards(&self) -> AppResult<Vec<UiMediaCardData>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT
+                m.id,
+                COALESCE(s.id, 0),
+                COALESCE(NULLIF(s.title_cn, ''), s.title, m.file_name),
+                m.file_name,
+                CASE
+                    WHEN s.id IS NULL THEN '未匹配'
+                    WHEN l.confirmed = 0 THEN '待确认'
+                    ELSE '已匹配'
+                END,
+                CASE
+                    WHEN s.id IS NULL THEN 'unmatched'
+                    WHEN l.confirmed = 0 THEN 'tentative'
+                    ELSE 'matched'
+                END,
+                COALESCE(CAST((wp.position_ms * 100) / NULLIF(wp.duration_ms, 0) AS INTEGER), 0),
+                COALESCE(mel.episode_title, ''),
+                COALESCE(pic.local_path, '')
+            FROM media_items m
+            LEFT JOIN (
+                SELECT media_id, subject_id, confirmed, MAX(updated_at)
+                FROM media_subject_links
+                GROUP BY media_id
+            ) l ON l.media_id = m.id
+            LEFT JOIN subjects s ON s.id = l.subject_id
+            LEFT JOIN watch_progress wp ON wp.media_id = m.id
+            LEFT JOIN media_episode_links mel ON mel.media_id = m.id
+            LEFT JOIN subject_image_cache pic
+                ON pic.subject_id = s.id AND pic.image_kind = 'poster'
+            WHERE m.deleted_at IS NULL
+            ORDER BY title COLLATE NOCASE
+            "#,
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let poster_path: String = row.get(8)?;
+            Ok(UiMediaCardData {
+                media_id: row.get(0)?,
+                subject_id: row.get(1)?,
+                title: row.get(2)?,
+                subtitle: row.get(3)?,
+                status_text: row.get(4)?,
+                match_status: row.get(5)?,
+                progress_percent: row.get::<_, i64>(6)? as i32,
+                episode_text: row.get(7)?,
+                has_cached_poster: !poster_path.is_empty(),
+                poster_path,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn library_counts(&self) -> AppResult<(usize, usize, usize)> {
+        let conn = self.connect()?;
+        let indexed = conn.query_row(
+            "SELECT COUNT(*) FROM media_items WHERE deleted_at IS NULL",
+            [],
+            |row| row.get::<_, i64>(0),
+        )? as usize;
+        let matched = conn.query_row(
+            r#"
+            SELECT COUNT(DISTINCT media_id)
+            FROM media_subject_links l
+            JOIN media_items m ON m.id = l.media_id
+            WHERE m.deleted_at IS NULL
+            "#,
+            [],
+            |row| row.get::<_, i64>(0),
+        )? as usize;
+        Ok((indexed, matched, indexed.saturating_sub(matched)))
+    }
+
+    pub fn unmatched_media(&self) -> AppResult<Vec<MediaItem>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT m.id, m.path, m.file_name, m.file_size, m.modified_at, m.file_hash, m.deleted_at
+            FROM media_items m
+            LEFT JOIN media_subject_links l ON l.media_id = m.id
+            WHERE m.deleted_at IS NULL AND l.media_id IS NULL
+            ORDER BY m.file_name COLLATE NOCASE
+            "#,
+        )?;
+        let rows = stmt.query_map([], map_media_item)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn upsert_subject_from_search(
+        &self,
+        subject: &SubjectSearchResult,
+        now: i64,
+    ) -> AppResult<i64> {
+        let conn = self.connect()?;
+        conn.execute(
+            r#"
+            INSERT INTO subjects
+                (provider, provider_subject_id, title, title_cn, summary, air_date, rating, rank,
+                 image_large, image_common, tags, created_at, updated_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL, ?11, ?11)
+            ON CONFLICT(provider, provider_subject_id) DO UPDATE SET
+                title = excluded.title,
+                title_cn = excluded.title_cn,
+                summary = COALESCE(excluded.summary, subjects.summary),
+                air_date = COALESCE(excluded.air_date, subjects.air_date),
+                rating = COALESCE(excluded.rating, subjects.rating),
+                rank = COALESCE(excluded.rank, subjects.rank),
+                image_large = COALESCE(excluded.image_large, subjects.image_large),
+                image_common = COALESCE(excluded.image_common, subjects.image_common),
+                updated_at = excluded.updated_at
+            "#,
+            params![
+                subject.provider,
+                subject.provider_subject_id,
+                subject.title,
+                subject.title_cn,
+                subject.summary,
+                subject.air_date,
+                subject.rating,
+                subject.rank,
+                subject.image_large,
+                subject.image_common,
+                now
+            ],
+        )?;
+        self.find_subject_id(&subject.provider, &subject.provider_subject_id)
+    }
+
+    pub fn upsert_subject_detail(&self, detail: &SubjectDetail, now: i64) -> AppResult<i64> {
+        let conn = self.connect()?;
+        let tags = serde_json::to_string(&detail.tags).unwrap_or_else(|_| "[]".to_string());
+        conn.execute(
+            r#"
+            INSERT INTO subjects
+                (provider, provider_subject_id, title, title_cn, summary, air_date, rating, rank,
+                 image_large, image_common, tags, created_at, updated_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12)
+            ON CONFLICT(provider, provider_subject_id) DO UPDATE SET
+                title = excluded.title,
+                title_cn = excluded.title_cn,
+                summary = excluded.summary,
+                air_date = excluded.air_date,
+                rating = excluded.rating,
+                rank = excluded.rank,
+                image_large = excluded.image_large,
+                image_common = excluded.image_common,
+                tags = excluded.tags,
+                updated_at = excluded.updated_at
+            "#,
+            params![
+                detail.provider,
+                detail.provider_subject_id,
+                detail.title,
+                detail.title_cn,
+                detail.summary,
+                detail.air_date,
+                detail.rating,
+                detail.rank,
+                detail.images.large,
+                detail.images.common,
+                tags,
+                now
+            ],
+        )?;
+        self.find_subject_id(&detail.provider, &detail.provider_subject_id)
+    }
+
+    pub fn link_media_subject(
+        &self,
+        media_id: i64,
+        subject_id: i64,
+        match_source: &str,
+        confidence: f64,
+        confirmed: bool,
+        now: i64,
+    ) -> AppResult<()> {
+        let conn = self.connect()?;
+        conn.execute(
+            r#"
+            INSERT INTO media_subject_links
+                (media_id, subject_id, match_source, confidence, confirmed, created_at, updated_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)
+            ON CONFLICT(media_id, subject_id) DO UPDATE SET
+                match_source = excluded.match_source,
+                confidence = excluded.confidence,
+                confirmed = excluded.confirmed,
+                updated_at = excluded.updated_at
+            "#,
+            params![
+                media_id,
+                subject_id,
+                match_source,
+                confidence,
+                if confirmed { 1 } else { 0 },
+                now
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn confirm_media_subject(&self, media_id: i64, subject_id: i64, now: i64) -> AppResult<()> {
+        let conn = self.connect()?;
+        conn.execute(
+            r#"
+            UPDATE media_subject_links
+            SET confirmed = 1, updated_at = ?3
+            WHERE media_id = ?1 AND subject_id = ?2
+            "#,
+            params![media_id, subject_id, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_subject(&self, subject_id: i64) -> AppResult<Option<Subject>> {
+        let conn = self.connect()?;
+        conn.query_row(
+            r#"
+            SELECT id, provider, provider_subject_id, title, title_cn, summary, air_date,
+                   rating, rank, image_large, image_common
+            FROM subjects WHERE id = ?1
+            "#,
+            params![subject_id],
+            |row| {
+                Ok(Subject {
+                    id: row.get(0)?,
+                    provider: row.get(1)?,
+                    provider_subject_id: row.get(2)?,
+                    title: row.get(3)?,
+                    title_cn: row.get(4)?,
+                    summary: row.get(5)?,
+                    air_date: row.get(6)?,
+                    rating: row.get(7)?,
+                    rank: row.get(8)?,
+                    image_large: row.get(9)?,
+                    image_common: row.get(10)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn subject_for_media(&self, media_id: i64) -> AppResult<Option<Subject>> {
+        let conn = self.connect()?;
+        conn.query_row(
+            r#"
+            SELECT s.id, s.provider, s.provider_subject_id, s.title, s.title_cn, s.summary,
+                   s.air_date, s.rating, s.rank, s.image_large, s.image_common
+            FROM media_subject_links l
+            JOIN subjects s ON s.id = l.subject_id
+            WHERE l.media_id = ?1
+            ORDER BY l.confirmed DESC, l.updated_at DESC
+            LIMIT 1
+            "#,
+            params![media_id],
+            |row| {
+                Ok(Subject {
+                    id: row.get(0)?,
+                    provider: row.get(1)?,
+                    provider_subject_id: row.get(2)?,
+                    title: row.get(3)?,
+                    title_cn: row.get(4)?,
+                    summary: row.get(5)?,
+                    air_date: row.get(6)?,
+                    rating: row.get(7)?,
+                    rank: row.get(8)?,
+                    image_large: row.get(9)?,
+                    image_common: row.get(10)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn upsert_image_cache(
+        &self,
+        subject_id: i64,
+        image_kind: &str,
+        source_url: &str,
+        local_path: &Path,
+        now: i64,
+    ) -> AppResult<()> {
+        let conn = self.connect()?;
+        conn.execute(
+            r#"
+            INSERT INTO subject_image_cache
+                (subject_id, image_kind, source_url, local_path, downloaded_at, last_accessed_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?5)
+            ON CONFLICT(subject_id, image_kind) DO UPDATE SET
+                source_url = excluded.source_url,
+                local_path = excluded.local_path,
+                downloaded_at = excluded.downloaded_at,
+                last_accessed_at = excluded.last_accessed_at
+            "#,
+            params![
+                subject_id,
+                image_kind,
+                source_url,
+                local_path.to_string_lossy(),
+                now
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_image_cache(
+        &self,
+        subject_id: i64,
+        image_kind: &str,
+    ) -> AppResult<Option<SubjectImageCache>> {
+        let conn = self.connect()?;
+        conn.query_row(
+            r#"
+            SELECT subject_id, image_kind, source_url, local_path
+            FROM subject_image_cache
+            WHERE subject_id = ?1 AND image_kind = ?2
+            "#,
+            params![subject_id, image_kind],
+            |row| {
+                Ok(SubjectImageCache {
+                    subject_id: row.get(0)?,
+                    image_kind: row.get(1)?,
+                    source_url: row.get(2)?,
+                    local_path: PathBuf::from(row.get::<_, String>(3)?),
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn subject_detail_for_media(&self, media_id: i64) -> AppResult<UiSubjectDetailData> {
+        let media = self
+            .get_media(media_id)?
+            .ok_or(crate::error::AppError::MediaNotFound)?;
+        let subject = self.subject_for_media(media_id)?;
+        let files = vec![format!(
+            "{}  ({} MB, modified_at={})",
+            media.path.display(),
+            media.file_size / 1024 / 1024,
+            media.modified_at
+        )];
+
+        if let Some(subject) = subject {
+            let confirmed = self.media_subject_confirmed(media_id, subject.id)?;
+            let poster = self
+                .get_image_cache(subject.id, "poster")?
+                .map(|cache| cache.local_path.display().to_string())
+                .unwrap_or_default();
+            let hero = self
+                .get_image_cache(subject.id, "hero")?
+                .map(|cache| cache.local_path.display().to_string())
+                .unwrap_or_default();
+            let poster_cached = !poster.is_empty();
+            let hero_cached = !hero.is_empty();
+            Ok(UiSubjectDetailData {
+                media_id,
+                subject_id: subject.id,
+                title: subject.title,
+                title_cn: subject.title_cn.unwrap_or_default(),
+                summary: subject
+                    .summary
+                    .unwrap_or_else(|| "No summary cached yet.".to_string()),
+                air_date: subject.air_date.unwrap_or_else(|| "-".to_string()),
+                rating_text: subject
+                    .rating
+                    .map(|rating| format!("{rating:.1}"))
+                    .unwrap_or_else(|| "-".to_string()),
+                rank_text: subject
+                    .rank
+                    .map(|rank| format!("#{rank}"))
+                    .unwrap_or_else(|| "-".to_string()),
+                poster_path: poster,
+                hero_path: hero,
+                match_status: if confirmed { "已匹配" } else { "待确认" }.to_string(),
+                cache_status: format!(
+                    "poster: {}, hero: {}",
+                    if poster_cached {
+                        "cached"
+                    } else {
+                        "not cached"
+                    },
+                    if hero_cached { "cached" } else { "not cached" }
+                ),
+                files,
+            })
+        } else {
+            Ok(UiSubjectDetailData {
+                media_id,
+                subject_id: 0,
+                title: media.file_name.clone(),
+                title_cn: String::new(),
+                summary: "未匹配。可以在这里搜索 Bangumi 候选并绑定。".to_string(),
+                air_date: "-".to_string(),
+                rating_text: "-".to_string(),
+                rank_text: "-".to_string(),
+                poster_path: String::new(),
+                hero_path: String::new(),
+                match_status: "未匹配".to_string(),
+                cache_status: "poster: not cached, hero: not cached".to_string(),
+                files,
+            })
+        }
+    }
+
+    fn find_subject_id(&self, provider: &str, provider_subject_id: &str) -> AppResult<i64> {
+        let conn = self.connect()?;
+        conn.query_row(
+            "SELECT id FROM subjects WHERE provider = ?1 AND provider_subject_id = ?2",
+            params![provider, provider_subject_id],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
+    }
+
+    fn media_subject_confirmed(&self, media_id: i64, subject_id: i64) -> AppResult<bool> {
+        let conn = self.connect()?;
+        let confirmed = conn
+            .query_row(
+                "SELECT confirmed FROM media_subject_links WHERE media_id = ?1 AND subject_id = ?2",
+                params![media_id, subject_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .unwrap_or_default();
+        Ok(confirmed != 0)
     }
 
     pub fn needs_hash_update(
@@ -679,230 +1588,322 @@ mod tests {
 <file path="ui/main.slint">
 import { Button, LineEdit, ListView, TextEdit, VerticalBox, HorizontalBox } from "std-widgets.slint";
 
+export struct UiMediaCard {
+    media_id: int,
+    subject_id: int,
+    title: string,
+    subtitle: string,
+    status_text: string,
+    match_status: string,
+    progress_percent: int,
+    episode_text: string,
+    poster_path: string,
+    has_cached_poster: bool,
+}
+
+export struct UiSubjectDetail {
+    media_id: int,
+    subject_id: int,
+    title: string,
+    title_cn: string,
+    summary: string,
+    air_date: string,
+    rating_text: string,
+    rank_text: string,
+    poster_path: string,
+    hero_path: string,
+    match_status: string,
+    cache_status: string,
+}
+
+export struct UiLogLine {
+    level: string,
+    message: string,
+    timestamp: string,
+}
+
+component LogList inherits ListView {
+    in property <[UiLogLine]> lines;
+    height: 610px;
+    for line in root.lines : Text {
+        text: "[" + line.timestamp + "] " + line.level + "  " + line.message;
+        color: line.level == "error" ? #a32323 : #2f3a48;
+    }
+}
+
 export component MainWindow inherits Window {
-    width: 1000px;
-    height: 720px;
+    width: 1180px;
+    height: 760px;
     title: "Slint Bangumi";
 
-    in-out property <int> active_tab: 0;
+    in-out property <int> active_page: 0;
     in-out property <string> media_path_input;
-    in property <[string]> media_items;
-    in-out property <string> selected_info;
-    in-out property <string> logs;
+    in-out property <string> library_search;
+    in property <[UiMediaCard]> media_cards;
+    in property <[UiMediaCard]> match_queue;
+    in property <UiSubjectDetail> subject_detail;
+    in property <[string]> detail_files;
+    in property <[UiLogLine]> log_lines;
     in-out property <string> scan_progress;
+    in-out property <string> metadata_status;
     in-out property <string> settings_summary;
+    in-out property <string> home_summary;
 
     callback add_media_path(string);
     callback scan_library();
-    callback select_media(int);
+    callback select_media_id(int);
     callback play_selected_media();
     callback save_progress();
     callback clear_progress();
     callback load_danmaku();
+    callback match_selected_metadata();
+    callback match_all_metadata();
+    callback refresh_subject_images();
+    callback confirm_selected_match();
 
-    VerticalBox {
-        padding: 12px;
-        spacing: 8px;
+    HorizontalBox {
+        padding: 0px;
+        spacing: 0px;
 
-        HorizontalBox {
-            spacing: 8px;
-            Button {
-                text: root.active_tab == 0 ? "Home *" : "Home";
-                clicked => { root.active_tab = 0; }
-            }
-            Button {
-                text: root.active_tab == 1 ? "Media Library *" : "Media Library";
-                clicked => { root.active_tab = 1; }
-            }
-            Button {
-                text: root.active_tab == 2 ? "Settings *" : "Settings";
-                clicked => { root.active_tab = 2; }
+        Rectangle {
+            width: 170px;
+            background: #20242b;
+
+            VerticalBox {
+                padding: 12px;
+                spacing: 8px;
+
+                Text {
+                    text: "Slint Bangumi";
+                    color: #f5f7fa;
+                    font-size: 18px;
+                    font-weight: 700;
+                }
+
+                Button { text: root.active_page == 0 ? "Home *" : "Home"; clicked => { root.active_page = 0; } }
+                Button { text: root.active_page == 1 ? "Library *" : "Library"; clicked => { root.active_page = 1; } }
+                Button { text: root.active_page == 2 ? "Subject *" : "Subject"; clicked => { root.active_page = 2; } }
+                Button { text: root.active_page == 3 ? "Metadata *" : "Metadata"; clicked => { root.active_page = 3; } }
+                Button { text: root.active_page == 4 ? "Settings *" : "Settings"; clicked => { root.active_page = 4; } }
+                Button { text: root.active_page == 5 ? "Activity *" : "Activity"; clicked => { root.active_page = 5; } }
             }
         }
 
-        if root.active_tab == 0 : VerticalBox {
-            spacing: 8px;
+        Rectangle {
+            background: #f5f6f8;
 
-            Text {
-                text: "Home";
-                font-size: 20px;
-                font-weight: 700;
-            }
+            VerticalBox {
+                padding: 14px;
+                spacing: 10px;
 
-            Text {
-                text: "Scan progress: " + root.scan_progress;
-            }
+                if root.active_page == 0 : VerticalBox {
+                    spacing: 10px;
 
-            HorizontalBox {
-                spacing: 8px;
-                Button {
-                    text: "Scan Library";
-                    clicked => { root.scan_library(); }
+                    Text { text: "Home"; font-size: 22px; font-weight: 700; color: #1c2430; }
+                    Text { text: root.home_summary; color: #2f3a48; }
+                    Text { text: "Scan: " + root.scan_progress + "    Metadata: " + root.metadata_status; color: #4a5564; }
+
+                    HorizontalBox {
+                        spacing: 8px;
+                        Button { text: "Scan Library"; clicked => { root.scan_library(); } }
+                        Button { text: "Match Metadata"; clicked => { root.match_all_metadata(); } }
+                        Button { text: "Open Library"; clicked => { root.active_page = 1; } }
+                    }
+
+                    Text { text: "Recent activity"; font-weight: 700; color: #1c2430; }
+                    LogList { lines: root.log_lines; }
                 }
-                Button {
-                    text: "Open Media Library";
-                    clicked => { root.active_tab = 1; }
-                }
-                Button {
-                    text: "Open Settings";
-                    clicked => { root.active_tab = 2; }
-                }
-            }
 
-            Text { text: "Runtime log"; font-weight: 700; }
-            TextEdit {
-                height: 520px;
-                text: root.logs;
-                read-only: true;
-            }
-        }
+                if root.active_page == 1 : VerticalBox {
+                    spacing: 8px;
 
-        if root.active_tab == 1 : VerticalBox {
-            spacing: 8px;
+                    Text { text: "My Library / 媒体库"; font-size: 22px; font-weight: 700; color: #1c2430; }
+                    Text { text: root.home_summary + "    Scan: " + root.scan_progress; color: #4a5564; }
 
-            Text {
-                text: "Media Library";
-                font-size: 20px;
-                font-weight: 700;
-            }
+                    HorizontalBox {
+                        spacing: 8px;
+                        LineEdit { text <=> root.library_search; placeholder-text: "Search title or filename"; }
+                        Button { text: "Title"; }
+                        Button { text: "Date"; }
+                        Button { text: "Status"; }
+                        Button { text: "All"; }
+                        Button { text: "Matched"; }
+                        Button { text: "Unmatched"; }
+                        Button { text: "Grid/List"; }
+                    }
 
-            HorizontalBox {
-                spacing: 8px;
-                LineEdit {
-                    text <=> root.media_path_input;
-                    placeholder-text: "Local media folder path";
-                }
-                Button {
-                    text: "Add Folder";
-                    clicked => { root.add_media_path(root.media_path_input); }
-                }
-                Button {
-                    text: "Scan";
-                    clicked => { root.scan_library(); }
-                }
-            }
-
-            HorizontalBox {
-                spacing: 12px;
-
-                VerticalBox {
-                    Text { text: "Videos"; font-weight: 700; }
                     ListView {
-                        height: 420px;
-                        for item[index] in root.media_items : Button {
-                            text: item;
-                            clicked => { root.select_media(index); }
+                        height: 575px;
+                        for card in root.media_cards : Button {
+                            text: (card.has_cached_poster ? "[poster cached] " : "[poster placeholder] ")
+                                  + card.title + "\n"
+                                  + card.subtitle + "    " + card.status_text
+                                  + "    ep: " + (card.episode_text == "" ? "-" : card.episode_text)
+                                  + "    progress: " + card.progress_percent + "%";
+                            clicked => {
+                                root.select_media_id(card.media_id);
+                                root.active_page = 2;
+                            }
                         }
                     }
                 }
 
-                VerticalBox {
-                    Text { text: "Selected video"; font-weight: 700; }
-                    TextEdit {
-                        height: 280px;
-                        text: root.selected_info;
-                        read-only: true;
+                if root.active_page == 2 : VerticalBox {
+                    spacing: 8px;
+
+                    Rectangle {
+                        height: 92px;
+                        background: root.subject_detail.hero_path == "" ? #d7dde6 : #c6d8ed;
+                        Text {
+                            x: 14px;
+                            y: 14px;
+                            text: root.subject_detail.hero_path == "" ? "hero placeholder" : "hero cached: " + root.subject_detail.hero_path;
+                            color: #1c2430;
+                        }
                     }
+
+                    HorizontalBox {
+                        spacing: 14px;
+
+                        Rectangle {
+                            width: 150px;
+                            height: 220px;
+                            background: root.subject_detail.poster_path == "" ? #d8dce3 : #bfd1e5;
+                            Text {
+                                x: 10px;
+                                y: 10px;
+                                width: 130px;
+                                text: root.subject_detail.poster_path == "" ? "poster placeholder" : "poster cached";
+                                color: #1c2430;
+                            }
+                        }
+
+                        VerticalBox {
+                            spacing: 6px;
+                            Text { text: root.subject_detail.title; font-size: 22px; font-weight: 700; color: #1c2430; }
+                            Text { text: root.subject_detail.title_cn; color: #4a5564; }
+                            Text { text: "Air date: " + root.subject_detail.air_date + "    Rating: " + root.subject_detail.rating_text + "    Rank: " + root.subject_detail.rank_text; color: #4a5564; }
+                            Text { text: "Match: " + root.subject_detail.match_status + "    Cache: " + root.subject_detail.cache_status; color: #4a5564; }
+                            TextEdit { height: 145px; text: root.subject_detail.summary; read-only: true; }
+                        }
+                    }
+
                     HorizontalBox {
                         spacing: 8px;
-                        Button {
-                            text: "Play";
-                            clicked => { root.play_selected_media(); }
+                        Button { text: "Play"; clicked => { root.play_selected_media(); } }
+                        Button { text: "Load Danmaku"; clicked => { root.load_danmaku(); } }
+                        Button { text: "Rematch"; clicked => { root.match_selected_metadata(); } }
+                        Button { text: "Confirm Match"; clicked => { root.confirm_selected_match(); } }
+                        Button { text: "Cache Images"; clicked => { root.refresh_subject_images(); } }
+                        Button { text: "Save Test Progress"; clicked => { root.save_progress(); } }
+                        Button { text: "Clear Progress"; clicked => { root.clear_progress(); } }
+                    }
+
+                    HorizontalBox {
+                        spacing: 12px;
+                        VerticalBox {
+                            Text { text: "Local files"; font-weight: 700; color: #1c2430; }
+                            ListView {
+                                height: 190px;
+                                for file in root.detail_files : Text { text: file; color: #2f3a48; }
+                            }
                         }
-                        Button {
-                            text: "Load Danmaku";
-                            clicked => { root.load_danmaku(); }
+                        VerticalBox {
+                            Text { text: "Episodes / Candidates"; font-weight: 700; color: #1c2430; }
+                            Text { text: root.subject_detail.subject_id == 0 ? "未匹配：使用 Rematch 搜索 Bangumi，并将第一个候选保存为待确认。" : "分集列表和候选切换接口已预留。"; color: #4a5564; }
                         }
                     }
+                }
+
+                if root.active_page == 3 : VerticalBox {
+                    spacing: 8px;
+                    Text { text: "Metadata / Match Queue"; font-size: 22px; font-weight: 700; color: #1c2430; }
+                    Text { text: root.metadata_status; color: #4a5564; }
                     HorizontalBox {
                         spacing: 8px;
-                        Button {
-                            text: "Save Test Progress";
-                            clicked => { root.save_progress(); }
-                        }
-                        Button {
-                            text: "Clear Progress";
-                            clicked => { root.clear_progress(); }
+                        Button { text: "Match All"; clicked => { root.match_all_metadata(); } }
+                        Button { text: "Retry Failed"; clicked => { root.match_all_metadata(); } }
+                        Button { text: "Clear Completed Jobs"; }
+                    }
+                    Text { text: "Unmatched / tentative queue"; font-weight: 700; color: #1c2430; }
+                    ListView {
+                        height: 560px;
+                        for card in root.match_queue : Button {
+                            text: card.title + "\n" + card.subtitle + "    " + card.status_text;
+                            clicked => {
+                                root.select_media_id(card.media_id);
+                                root.active_page = 2;
+                            }
                         }
                     }
                 }
-            }
 
-            Text { text: "Scan progress: " + root.scan_progress; }
-        }
-
-        if root.active_tab == 2 : VerticalBox {
-            spacing: 8px;
-
-            Text {
-                text: "Settings";
-                font-size: 20px;
-                font-weight: 700;
-            }
-
-            Text { text: "Media paths"; font-weight: 700; }
-            HorizontalBox {
-                spacing: 8px;
-                LineEdit {
-                    text <=> root.media_path_input;
-                    placeholder-text: "Add local media folder";
+                if root.active_page == 4 : VerticalBox {
+                    spacing: 8px;
+                    Text { text: "Settings"; font-size: 22px; font-weight: 700; color: #1c2430; }
+                    HorizontalBox {
+                        spacing: 8px;
+                        LineEdit { text <=> root.media_path_input; placeholder-text: "Add local media folder"; }
+                        Button { text: "Add Path"; clicked => { root.add_media_path(root.media_path_input); } }
+                    }
+                    TextEdit { height: 340px; text: root.settings_summary; read-only: true; }
+                    HorizontalBox {
+                        spacing: 8px;
+                        Button { text: "Scan Library"; clicked => { root.scan_library(); } }
+                        Button { text: "Clear Image Cache"; }
+                    }
+                    Text { text: "Scan settings and cache size calculation are placeholders in this skeleton."; color: #4a5564; }
                 }
-                Button {
-                    text: "Add";
-                    clicked => { root.add_media_path(root.media_path_input); }
+
+                if root.active_page == 5 : VerticalBox {
+                    spacing: 8px;
+                    Text { text: "Activity"; font-size: 22px; font-weight: 700; color: #1c2430; }
+                    LogList { lines: root.log_lines; }
                 }
-            }
-
-            Text { text: "Current configuration"; font-weight: 700; }
-            TextEdit {
-                height: 220px;
-                text: root.settings_summary;
-                read-only: true;
-            }
-
-            Text { text: "Runtime log"; font-weight: 700; }
-            TextEdit {
-                height: 300px;
-                text: root.logs;
-                read-only: true;
             }
         }
     }
 }
 </file>
 
-<file path="config.toml">
-media_libraries = ["/mnt/media/entertainment/bangumi/[Nekomoe kissaten&VCB-Studio] THE IDOLM@STER CINDERELLA GIRLS U149 [Ma10p_1080p]"]
-
-[database]
-path = "data/slint-bangumi.sqlite3"
-
-[dandanplay]
-app_id = "xjhfp7iqns"
-app_secret = "6JAiLeVgrk2ifsMmqAJygjwSAHQQB6h4"
-api_key = ""
-
-[logging]
-level = "info"
+<file path=".gitignore">
+/target
+/config.toml
+/data/
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
 </file>
 
 <file path="src/ui/bridge.rs">
+use std::collections::VecDeque;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
 use slint::{ModelRc, SharedString, VecModel, Weak};
 
-use crate::MainWindow;
 use crate::app::AppContext;
-use crate::domain::MediaItem;
+use crate::domain::{MediaItem, UiMediaCardData, UiSubjectDetailData};
 use crate::error::{AppError, AppResult};
 use crate::task::AppEvent;
+use crate::{MainWindow, UiLogLine, UiMediaCard, UiSubjectDetail};
+
+const MAX_LOG_LINES: usize = 200;
 
 #[derive(Default)]
 struct UiState {
     media: Vec<MediaItem>,
-    selected_index: Option<usize>,
+    cards: Vec<UiMediaCardData>,
+    selected_media_id: Option<i64>,
+    logs: VecDeque<LogLineData>,
+}
+
+#[derive(Debug, Clone)]
+struct LogLineData {
+    level: String,
+    message: String,
+    timestamp: String,
 }
 
 #[derive(Clone)]
@@ -911,17 +1912,25 @@ pub struct BridgeState {
 }
 
 pub fn bind(window: Weak<MainWindow>, context: AppContext) -> AppResult<BridgeState> {
+    let media = context.media.list_media()?;
+    let cards = context.media.list_media_cards()?;
     let state = Arc::new(Mutex::new(UiState {
-        media: context.media.list_media()?,
-        selected_index: None,
+        media,
+        cards,
+        selected_media_id: None,
+        logs: VecDeque::new(),
     }));
 
     if let Some(window) = window.upgrade() {
-        let media = state.lock().expect("ui state mutex poisoned").media.clone();
-        set_media_items(&window, &media);
-        window.set_logs("ready\n".into());
-        window.set_scan_progress("idle".into());
-        window.set_settings_summary(context.media.settings_summary(media.len()).into());
+        refresh_window_models(
+            &window,
+            &context,
+            &BridgeState {
+                inner: state.clone(),
+            },
+        );
+        set_empty_detail(&window);
+        push_log(&window, &state, "info", "ready");
     }
 
     bind_add_path(window.clone(), context.clone(), state.clone());
@@ -930,7 +1939,8 @@ pub fn bind(window: Weak<MainWindow>, context: AppContext) -> AppResult<BridgeSt
     bind_play_selected_media(window.clone(), context.clone(), state.clone());
     bind_save_progress(window.clone(), context.clone(), state.clone());
     bind_clear_progress(window.clone(), context.clone(), state.clone());
-    bind_load_danmaku(window, context, state.clone());
+    bind_load_danmaku(window.clone(), context.clone(), state.clone());
+    bind_metadata_actions(window, context, state.clone());
 
     Ok(BridgeState { inner: state })
 }
@@ -971,7 +1981,7 @@ fn bind_add_path(window: Weak<MainWindow>, context: AppContext, state: Arc<Mutex
         .on_add_media_path(move |path| {
             let path = path.trim().to_string();
             if path.is_empty() {
-                append_log(&weak, "media path is empty");
+                append_log(&weak, &state, "warn", "media path is empty");
                 return;
             }
 
@@ -979,38 +1989,23 @@ fn bind_add_path(window: Weak<MainWindow>, context: AppContext, state: Arc<Mutex
                 Ok(paths) => {
                     append_log(
                         &weak,
+                        &state,
+                        "info",
                         &format!("added media path; total paths: {}", paths.len()),
                     );
                     if let Some(window) = weak.upgrade() {
-                        let media_count =
-                            state.lock().expect("ui state mutex poisoned").media.len();
-                        window.set_settings_summary(
-                            context.media.settings_summary(media_count).into(),
+                        refresh_window_models(
+                            &window,
+                            &context,
+                            &BridgeState {
+                                inner: state.clone(),
+                            },
                         );
                     }
                 }
-                Err(error) => append_log(&weak, &format!("add path failed: {error}")),
-            }
-        });
-}
-
-fn bind_play_selected_media(
-    window: Weak<MainWindow>,
-    context: AppContext,
-    state: Arc<Mutex<UiState>>,
-) {
-    let weak = window.clone();
-    window
-        .upgrade()
-        .expect("window dropped before callback binding")
-        .on_play_selected_media(move || {
-            let Some(media) = selected_media(&state) else {
-                append_log(&weak, "select a media item before playing");
-                return;
-            };
-
-            if let Err(error) = context.media.open_media(&media) {
-                append_log(&weak, &format!("play failed: {error}"));
+                Err(error) => {
+                    append_log(&weak, &state, "error", &format!("add path failed: {error}"))
+                }
             }
         });
 }
@@ -1029,32 +2024,68 @@ fn bind_select_media(window: Weak<MainWindow>, context: AppContext, state: Arc<M
     window
         .upgrade()
         .expect("window dropped before callback binding")
-        .on_select_media(move |index| {
-            let selected = {
+        .on_select_media_id(move |media_id| {
+            let media_id = media_id as i64;
+            {
                 let mut state = state.lock().expect("ui state mutex poisoned");
-                let index = index as usize;
-                state.selected_index = Some(index);
-                state.media.get(index).cloned()
+                state.selected_media_id = Some(media_id);
+            }
+
+            if let Some(window) = weak.upgrade() {
+                match context.metadata.subject_detail_for_media(media_id) {
+                    Ok(detail) => set_subject_detail(&window, detail),
+                    Err(error) => append_log_to_window(
+                        &window,
+                        &state,
+                        "error",
+                        &format!("load detail failed: {error}"),
+                    ),
+                }
+            }
+
+            match context.watch_history.load(media_id) {
+                Ok(Some(progress)) => append_log(
+                    &weak,
+                    &state,
+                    "info",
+                    &format!(
+                        "loaded progress: media #{} {} / {} ms",
+                        progress.media_id, progress.position_ms, progress.duration_ms
+                    ),
+                ),
+                Ok(None) => append_log(
+                    &weak,
+                    &state,
+                    "info",
+                    "no watch progress for selected media",
+                ),
+                Err(error) => append_log(
+                    &weak,
+                    &state,
+                    "error",
+                    &format!("load progress failed: {error}"),
+                ),
+            }
+        });
+}
+
+fn bind_play_selected_media(
+    window: Weak<MainWindow>,
+    context: AppContext,
+    state: Arc<Mutex<UiState>>,
+) {
+    let weak = window.clone();
+    window
+        .upgrade()
+        .expect("window dropped before callback binding")
+        .on_play_selected_media(move || {
+            let Some(media) = selected_media(&state) else {
+                append_log(&weak, &state, "warn", "select a media item before playing");
+                return;
             };
 
-            match selected {
-                Some(media) => {
-                    if let Some(window) = weak.upgrade() {
-                        window.set_selected_info(media_info(&media).into());
-                    }
-                    match context.watch_history.load(media.id) {
-                        Ok(Some(progress)) => append_log(
-                            &weak,
-                            &format!(
-                                "loaded progress: media #{} {} / {} ms",
-                                progress.media_id, progress.position_ms, progress.duration_ms
-                            ),
-                        ),
-                        Ok(None) => append_log(&weak, "no watch progress for selected media"),
-                        Err(error) => append_log(&weak, &format!("load progress failed: {error}")),
-                    }
-                }
-                None => append_log(&weak, "invalid media selection"),
+            if let Err(error) = context.media.open_media(&media) {
+                append_log(&weak, &state, "error", &format!("play failed: {error}"));
             }
         });
 }
@@ -1069,12 +2100,19 @@ fn bind_save_progress(window: Weak<MainWindow>, context: AppContext, state: Arc<
             match media_id.and_then(|id| context.watch_history.save_test_progress(id).ok()) {
                 Some(progress) => append_log(
                     &weak,
+                    &state,
+                    "info",
                     &format!(
                         "test progress saved at {} ms, updated_at={}",
                         progress.position_ms, progress.updated_at
                     ),
                 ),
-                None => append_log(&weak, "select a media item before saving progress"),
+                None => append_log(
+                    &weak,
+                    &state,
+                    "warn",
+                    "select a media item before saving progress",
+                ),
             }
         });
 }
@@ -1086,13 +2124,23 @@ fn bind_clear_progress(window: Weak<MainWindow>, context: AppContext, state: Arc
         .expect("window dropped before callback binding")
         .on_clear_progress(move || {
             let Some(media_id) = selected_media_id(&state) else {
-                append_log(&weak, "select a media item before clearing progress");
+                append_log(
+                    &weak,
+                    &state,
+                    "warn",
+                    "select a media item before clearing progress",
+                );
                 return;
             };
 
             match context.watch_history.clear(media_id) {
-                Ok(()) => append_log(&weak, "progress cleared"),
-                Err(error) => append_log(&weak, &format!("clear progress failed: {error}")),
+                Ok(()) => append_log(&weak, &state, "info", "progress cleared"),
+                Err(error) => append_log(
+                    &weak,
+                    &state,
+                    "error",
+                    &format!("clear progress failed: {error}"),
+                ),
             }
         });
 }
@@ -1104,7 +2152,12 @@ fn bind_load_danmaku(window: Weak<MainWindow>, context: AppContext, state: Arc<M
         .expect("window dropped before callback binding")
         .on_load_danmaku(move || {
             let Some(media) = selected_media(&state) else {
-                append_log(&weak, "select a media item before loading danmaku");
+                append_log(
+                    &weak,
+                    &state,
+                    "warn",
+                    "select a media item before loading danmaku",
+                );
                 return;
             };
 
@@ -1115,20 +2168,136 @@ fn bind_load_danmaku(window: Weak<MainWindow>, context: AppContext, state: Arc<M
         });
 }
 
+fn bind_metadata_actions(
+    window: Weak<MainWindow>,
+    context: AppContext,
+    state: Arc<Mutex<UiState>>,
+) {
+    let weak = window.clone();
+    let context_for_match = context.clone();
+    let state_for_match = state.clone();
+    window
+        .upgrade()
+        .expect("window dropped before callback binding")
+        .on_match_selected_metadata(move || {
+            let Some(media_id) = selected_media_id(&state_for_match) else {
+                append_log(
+                    &weak,
+                    &state_for_match,
+                    "warn",
+                    "select a media item before matching",
+                );
+                return;
+            };
+            context_for_match.metadata.start_match_media(media_id);
+        });
+
+    let context_for_all = context.clone();
+    window
+        .upgrade()
+        .expect("window dropped before callback binding")
+        .on_match_all_metadata(move || {
+            context_for_all.metadata.start_match_all_unmatched();
+        });
+
+    let weak = window.clone();
+    let context_for_images = context.clone();
+    let state_for_images = state.clone();
+    window
+        .upgrade()
+        .expect("window dropped before callback binding")
+        .on_refresh_subject_images(move || {
+            let Some(media_id) = selected_media_id(&state_for_images) else {
+                append_log(
+                    &weak,
+                    &state_for_images,
+                    "warn",
+                    "select a subject before caching images",
+                );
+                return;
+            };
+            match context_for_images
+                .metadata
+                .subject_detail_for_media(media_id)
+            {
+                Ok(detail) if detail.subject_id > 0 => context_for_images
+                    .metadata
+                    .start_download_subject_images(detail.subject_id),
+                Ok(_) => append_log(&weak, &state_for_images, "warn", "media is not matched yet"),
+                Err(error) => append_log(
+                    &weak,
+                    &state_for_images,
+                    "error",
+                    &format!("cache images failed: {error}"),
+                ),
+            }
+        });
+
+    let weak = window.clone();
+    let context_for_confirm = context;
+    let state_for_confirm = state;
+    window
+        .upgrade()
+        .expect("window dropped before callback binding")
+        .on_confirm_selected_match(move || {
+            let Some(media_id) = selected_media_id(&state_for_confirm) else {
+                append_log(
+                    &weak,
+                    &state_for_confirm,
+                    "warn",
+                    "select a media item before confirming",
+                );
+                return;
+            };
+            match context_for_confirm
+                .metadata
+                .subject_detail_for_media(media_id)
+            {
+                Ok(detail) if detail.subject_id > 0 => match context_for_confirm
+                    .metadata
+                    .confirm_media_subject(media_id, detail.subject_id)
+                {
+                    Ok(()) => append_log(&weak, &state_for_confirm, "info", "match confirmed"),
+                    Err(error) => append_log(
+                        &weak,
+                        &state_for_confirm,
+                        "error",
+                        &format!("confirm failed: {error}"),
+                    ),
+                },
+                Ok(_) => append_log(
+                    &weak,
+                    &state_for_confirm,
+                    "warn",
+                    "no tentative match to confirm",
+                ),
+                Err(error) => append_log(
+                    &weak,
+                    &state_for_confirm,
+                    "error",
+                    &format!("confirm failed: {error}"),
+                ),
+            }
+        });
+}
+
 fn apply_event(window: &MainWindow, context: &AppContext, state: &BridgeState, event: AppEvent) {
-    match event {
-        AppEvent::Log(message) => append_log_to_window(window, &message),
+    context.metadata.finish_for_event(&event);
+    match &event {
+        AppEvent::Log(message) => push_log(window, &state.inner, "info", message),
         AppEvent::ScanStarted => {
             window.set_scan_progress("scan started".into());
-            append_log_to_window(window, "scan started");
+            push_log(window, &state.inner, "info", "scan started");
         }
         AppEvent::ScanProgress { scanned, indexed } => {
             window.set_scan_progress(format!("scanned {scanned}, indexed {indexed}").into());
         }
         AppEvent::ScanFinished { summary, media } => {
-            replace_media_state(state, media.clone());
-            set_media_items(window, &media);
-            window.set_settings_summary(context.media.settings_summary(media.len()).into());
+            {
+                let mut state = state.inner.lock().expect("ui state mutex poisoned");
+                state.media = media.clone();
+                state.selected_media_id = None;
+            }
             window.set_scan_progress(
                 format!(
                     "done: scanned={}, added={}, modified={}, restored={}, deleted={}",
@@ -1140,85 +2309,286 @@ fn apply_event(window: &MainWindow, context: &AppContext, state: &BridgeState, e
                 )
                 .into(),
             );
-            append_log_to_window(window, "scan finished");
+            refresh_window_models(window, context, state);
+            push_log(window, &state.inner, "info", "scan finished");
         }
         AppEvent::ScanFailed(error) => {
             window.set_scan_progress("scan failed".into());
-            append_log_to_window(window, &format!("scan failed: {error}"));
+            push_log(
+                window,
+                &state.inner,
+                "error",
+                &format!("scan failed: {error}"),
+            );
         }
-        AppEvent::DanmakuMatched(result) => append_log_to_window(
+        AppEvent::DanmakuMatched(result) => push_log(
             window,
+            &state.inner,
+            "info",
             &format!(
-                "danmaku event: {} matched {} comments, title={}, episode={}",
+                "danmaku: {} matched {} comments, title={}, episode={}",
                 result.provider,
                 result.comment_count,
                 result.title,
                 result.episode.as_deref().unwrap_or("(none)")
             ),
         ),
+        AppEvent::MetadataMatchStarted { media_id } => {
+            window.set_metadata_status(format!("matching media #{media_id}").into());
+            push_log(
+                window,
+                &state.inner,
+                "info",
+                &format!("metadata match started for #{media_id}"),
+            );
+        }
+        AppEvent::MetadataMatchProgress { processed, total } => {
+            window.set_metadata_status(format!("metadata queue {processed}/{total}").into());
+        }
+        AppEvent::MetadataMatchFinished {
+            media_id,
+            subject_id,
+            title,
+        } => {
+            window.set_metadata_status("idle".into());
+            refresh_window_models(window, context, state);
+            refresh_selected_detail(window, context, state);
+            let message = match (subject_id, title) {
+                (Some(id), Some(title)) => {
+                    format!("media #{media_id} matched subject #{id}: {title}")
+                }
+                _ => format!("media #{media_id} has no Bangumi match"),
+            };
+            push_log(window, &state.inner, "info", &message);
+        }
+        AppEvent::SubjectUpdated { subject_id } => {
+            refresh_window_models(window, context, state);
+            refresh_selected_detail(window, context, state);
+            push_log(
+                window,
+                &state.inner,
+                "info",
+                &format!("subject #{subject_id} updated"),
+            );
+        }
+        AppEvent::ImageCached {
+            subject_id,
+            image_kind,
+        } => {
+            refresh_window_models(window, context, state);
+            refresh_selected_detail(window, context, state);
+            push_log(
+                window,
+                &state.inner,
+                "info",
+                &format!("cached {image_kind} for subject #{subject_id}"),
+            );
+        }
+        AppEvent::MetadataFailed { target_id, error } => {
+            window.set_metadata_status("failed".into());
+            push_log(
+                window,
+                &state.inner,
+                "error",
+                &format!("metadata failed for #{target_id}: {error}"),
+            );
+        }
     }
 }
 
-fn replace_media_state(state: &BridgeState, media: Vec<MediaItem>) {
-    let mut state = state.inner.lock().expect("ui state mutex poisoned");
-    state.media = media;
-    state.selected_index = None;
+fn refresh_window_models(window: &MainWindow, context: &AppContext, state: &BridgeState) {
+    let cards = match context.media.list_media_cards() {
+        Ok(cards) => cards,
+        Err(error) => {
+            push_log(
+                window,
+                &state.inner,
+                "error",
+                &format!("refresh media failed: {error}"),
+            );
+            Vec::new()
+        }
+    };
+    let media = context.media.list_media().unwrap_or_default();
+    {
+        let mut state = state.inner.lock().expect("ui state mutex poisoned");
+        state.media = media;
+        state.cards = cards.clone();
+    }
+
+    set_media_cards(window, &cards);
+    let queue = cards
+        .iter()
+        .filter(|card| card.match_status != "matched")
+        .cloned()
+        .collect::<Vec<_>>();
+    set_match_queue(window, &queue);
+    set_home_and_settings(window, context);
 }
 
-fn set_media_items(window: &MainWindow, media: &[MediaItem]) {
-    let labels = media
+fn set_home_and_settings(window: &MainWindow, context: &AppContext) {
+    let (indexed, matched, unmatched) = context.media.library_counts().unwrap_or_default();
+    window.set_home_summary(
+        format!("indexed media: {indexed}    matched subjects: {matched}    unmatched media: {unmatched}").into(),
+    );
+    window.set_settings_summary(context.media.settings_summary(indexed).into());
+}
+
+fn set_media_cards(window: &MainWindow, cards: &[UiMediaCardData]) {
+    window.set_media_cards(ModelRc::from(Rc::new(VecModel::from(
+        cards.iter().map(to_slint_card).collect::<Vec<_>>(),
+    ))));
+}
+
+fn set_match_queue(window: &MainWindow, cards: &[UiMediaCardData]) {
+    window.set_match_queue(ModelRc::from(Rc::new(VecModel::from(
+        cards.iter().map(to_slint_card).collect::<Vec<_>>(),
+    ))));
+}
+
+fn to_slint_card(card: &UiMediaCardData) -> UiMediaCard {
+    UiMediaCard {
+        media_id: card.media_id as i32,
+        subject_id: card.subject_id as i32,
+        title: card.title.as_str().into(),
+        subtitle: card.subtitle.as_str().into(),
+        status_text: card.status_text.as_str().into(),
+        match_status: card.match_status.as_str().into(),
+        progress_percent: card.progress_percent,
+        episode_text: card.episode_text.as_str().into(),
+        poster_path: card.poster_path.as_str().into(),
+        has_cached_poster: card.has_cached_poster,
+    }
+}
+
+fn set_subject_detail(window: &MainWindow, detail: UiSubjectDetailData) {
+    let files = detail
+        .files
         .iter()
-        .map(|item| SharedString::from(item.display_label()))
+        .map(|file| SharedString::from(file.as_str()))
         .collect::<Vec<_>>();
-    window.set_media_items(ModelRc::from(Rc::new(VecModel::from(labels))));
+    window.set_detail_files(ModelRc::from(Rc::new(VecModel::from(files))));
+    window.set_subject_detail(UiSubjectDetail {
+        media_id: detail.media_id as i32,
+        subject_id: detail.subject_id as i32,
+        title: detail.title.as_str().into(),
+        title_cn: detail.title_cn.as_str().into(),
+        summary: detail.summary.as_str().into(),
+        air_date: detail.air_date.as_str().into(),
+        rating_text: detail.rating_text.as_str().into(),
+        rank_text: detail.rank_text.as_str().into(),
+        poster_path: detail.poster_path.as_str().into(),
+        hero_path: detail.hero_path.as_str().into(),
+        match_status: detail.match_status.as_str().into(),
+        cache_status: detail.cache_status.as_str().into(),
+    });
+}
+
+fn set_empty_detail(window: &MainWindow) {
+    set_subject_detail(
+        window,
+        UiSubjectDetailData {
+            media_id: 0,
+            subject_id: 0,
+            title: "Select a media item".to_string(),
+            title_cn: String::new(),
+            summary: "No media selected.".to_string(),
+            air_date: "-".to_string(),
+            rating_text: "-".to_string(),
+            rank_text: "-".to_string(),
+            poster_path: String::new(),
+            hero_path: String::new(),
+            match_status: "idle".to_string(),
+            cache_status: "poster: not cached, hero: not cached".to_string(),
+            files: Vec::new(),
+        },
+    );
+}
+
+fn refresh_selected_detail(window: &MainWindow, context: &AppContext, state: &BridgeState) {
+    let media_id = state
+        .inner
+        .lock()
+        .expect("ui state mutex poisoned")
+        .selected_media_id;
+    if let Some(media_id) = media_id {
+        match context.metadata.subject_detail_for_media(media_id) {
+            Ok(detail) => set_subject_detail(window, detail),
+            Err(error) => push_log(
+                window,
+                &state.inner,
+                "error",
+                &format!("refresh detail failed: {error}"),
+            ),
+        }
+    }
 }
 
 fn selected_media_id(state: &Arc<Mutex<UiState>>) -> Option<i64> {
-    selected_media(state).map(|media| media.id)
+    state
+        .lock()
+        .expect("ui state mutex poisoned")
+        .selected_media_id
 }
 
 fn selected_media(state: &Arc<Mutex<UiState>>) -> Option<MediaItem> {
     let state = state.lock().expect("ui state mutex poisoned");
+    let selected = state.selected_media_id?;
     state
-        .selected_index
-        .and_then(|index| state.media.get(index).cloned())
+        .media
+        .iter()
+        .find(|media| media.id == selected)
+        .cloned()
 }
 
-fn append_log(window: &Weak<MainWindow>, message: &str) {
+fn append_log(window: &Weak<MainWindow>, state: &Arc<Mutex<UiState>>, level: &str, message: &str) {
     if let Some(window) = window.upgrade() {
-        append_log_to_window(&window, message);
+        append_log_to_window(&window, state, level, message);
     }
 }
 
-fn append_log_to_window(window: &MainWindow, message: &str) {
-    const MAX_LOG_BYTES: usize = 24 * 1024;
+fn append_log_to_window(
+    window: &MainWindow,
+    state: &Arc<Mutex<UiState>>,
+    level: &str,
+    message: &str,
+) {
+    push_log(window, state, level, message);
+}
 
-    let mut logs = window.get_logs().to_string();
-    logs.push_str(message);
-    logs.push('\n');
-    if logs.len() > MAX_LOG_BYTES {
-        let mut keep_from = logs.len() - MAX_LOG_BYTES;
-        while !logs.is_char_boundary(keep_from) {
-            keep_from += 1;
+fn push_log(window: &MainWindow, state: &Arc<Mutex<UiState>>, level: &str, message: &str) {
+    let logs = {
+        let mut state = state.lock().expect("ui state mutex poisoned");
+        if state.logs.len() == MAX_LOG_LINES {
+            state.logs.pop_front();
         }
-        let keep_from = logs[keep_from..]
-            .find('\n')
-            .map(|offset| keep_from + offset + 1)
-            .unwrap_or(keep_from);
-        logs.replace_range(..keep_from, "");
-    }
-    window.set_logs(logs.into());
+        state.logs.push_back(LogLineData {
+            level: level.to_string(),
+            message: message.to_string(),
+            timestamp: log_timestamp(),
+        });
+        state.logs.iter().cloned().collect::<Vec<_>>()
+    };
+
+    window.set_log_lines(ModelRc::from(Rc::new(VecModel::from(
+        logs.iter()
+            .map(|line| UiLogLine {
+                level: line.level.as_str().into(),
+                message: line.message.as_str().into(),
+                timestamp: line.timestamp.as_str().into(),
+            })
+            .collect::<Vec<_>>(),
+    ))));
 }
 
-fn media_info(media: &MediaItem) -> String {
+fn log_timestamp() -> String {
+    let now = crate::task::unix_timestamp_ms();
+    let seconds = (now / 1000) % 86_400;
     format!(
-        "id: {}\nfile: {}\npath: {}\nsize: {} bytes\nmodified_at: {}\nhash: {}",
-        media.id,
-        media.file_name,
-        media.path.display(),
-        media.file_size,
-        media.modified_at,
-        media.file_hash.as_deref().unwrap_or("(not computed)")
+        "{:02}:{:02}:{:02}",
+        seconds / 3600,
+        (seconds % 3600) / 60,
+        seconds % 60
     )
 }
 </file>
@@ -1266,7 +2636,7 @@ pub fn io_error(path: impl Into<PathBuf>, source: std::io::Error) -> AppError {
 <file path="src/service.rs">
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
@@ -1276,8 +2646,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::config::{ConfigStore, DandanplayConfig};
-use crate::domain::{DanmakuMatch, MediaItem, WatchProgress};
+use crate::domain::{DanmakuMatch, MediaItem, UiMediaCardData, UiSubjectDetailData, WatchProgress};
 use crate::error::{AppError, AppResult};
+use crate::metadata::bangumi::BangumiProvider;
+use crate::metadata::cache::ImageCache;
 use crate::repository::Repository;
 use crate::task::{self, AppEvent};
 
@@ -1311,6 +2683,14 @@ impl MediaService {
         self.repository.list_media(false)
     }
 
+    pub fn list_media_cards(&self) -> AppResult<Vec<UiMediaCardData>> {
+        self.repository.list_media_cards()
+    }
+
+    pub fn library_counts(&self) -> AppResult<(usize, usize, usize)> {
+        self.repository.library_counts()
+    }
+
     pub fn settings_summary(&self, indexed_media_count: usize) -> String {
         let config = self.config.snapshot();
         let dandanplay_status =
@@ -1331,8 +2711,9 @@ impl MediaService {
         };
 
         format!(
-            "database: {}\nindexed media: {}\ndandanplay: {}\nmedia libraries:\n{}",
+            "database: {}\ncache: {}\nindexed media: {}\ndandanplay: {}\nbangumi: public API\nmedia libraries:\n{}",
             config.database.path.display(),
+            image_cache_root(&config.database.path).display(),
             indexed_media_count,
             dandanplay_status,
             media_libraries
@@ -1365,6 +2746,163 @@ impl MediaService {
     fn send_log(&self, message: String) {
         let _ = self.events.send(AppEvent::Log(message));
     }
+}
+
+#[derive(Clone)]
+pub struct MetadataService {
+    repository: Repository,
+    danmaku: DanmakuService,
+    provider: BangumiProvider,
+    image_cache: ImageCache,
+    events: mpsc::Sender<AppEvent>,
+    running: Arc<Mutex<std::collections::HashSet<String>>>,
+}
+
+impl MetadataService {
+    pub fn new(
+        repository: Repository,
+        danmaku: DanmakuService,
+        database_path: PathBuf,
+        events: mpsc::Sender<AppEvent>,
+    ) -> AppResult<Self> {
+        Ok(Self {
+            repository,
+            danmaku,
+            provider: BangumiProvider::new()?,
+            image_cache: ImageCache::new(image_cache_root(&database_path))?,
+            events,
+            running: Arc::new(Mutex::new(std::collections::HashSet::new())),
+        })
+    }
+
+    pub fn subject_detail_for_media(&self, media_id: i64) -> AppResult<UiSubjectDetailData> {
+        self.repository.subject_detail_for_media(media_id)
+    }
+
+    pub fn start_match_media(&self, media_id: i64) {
+        let key = format!("match:{media_id}");
+        if !self.try_start(&key) {
+            let _ = self.events.send(AppEvent::Log(format!(
+                "metadata match already running for #{media_id}"
+            )));
+            return;
+        }
+
+        match self.repository.get_media(media_id) {
+            Ok(Some(media)) => {
+                let repository = self.repository.clone();
+                let provider = self.provider.clone();
+                let image_cache = self.image_cache.clone();
+                let events = self.events.clone();
+                let danmaku = self.danmaku.clone();
+                std::thread::spawn(move || {
+                    let danmaku_hint = danmaku.match_dandanplay(&media).ok();
+                    task::spawn_match_metadata(
+                        repository,
+                        provider,
+                        image_cache,
+                        media,
+                        danmaku_hint,
+                        events,
+                    );
+                });
+            }
+            Ok(None) => {
+                self.finish(&key);
+                let _ = self.events.send(AppEvent::MetadataFailed {
+                    target_id: media_id,
+                    error: "media not found".to_string(),
+                });
+            }
+            Err(error) => {
+                self.finish(&key);
+                let _ = self.events.send(AppEvent::MetadataFailed {
+                    target_id: media_id,
+                    error: error.to_string(),
+                });
+            }
+        }
+    }
+
+    pub fn start_match_all_unmatched(&self) {
+        let key = "match-all".to_string();
+        if !self.try_start(&key) {
+            let _ = self.events.send(AppEvent::Log(
+                "metadata match-all already running".to_string(),
+            ));
+            return;
+        }
+
+        task::spawn_match_all_unmatched(
+            self.repository.clone(),
+            self.provider.clone(),
+            self.image_cache.clone(),
+            self.events.clone(),
+        );
+    }
+
+    pub fn start_download_subject_images(&self, subject_id: i64) {
+        let key = format!("images:{subject_id}");
+        if !self.try_start(&key) {
+            return;
+        }
+        task::spawn_download_subject_images(
+            self.repository.clone(),
+            self.provider.clone(),
+            self.image_cache.clone(),
+            subject_id,
+            self.events.clone(),
+        );
+    }
+
+    pub fn confirm_media_subject(&self, media_id: i64, subject_id: i64) -> AppResult<()> {
+        self.repository
+            .confirm_media_subject(media_id, subject_id, task::unix_timestamp_ms())?;
+        let _ = self.events.send(AppEvent::SubjectUpdated { subject_id });
+        Ok(())
+    }
+
+    pub fn finish_for_event(&self, event: &AppEvent) {
+        match event {
+            AppEvent::MetadataMatchFinished { media_id, .. } => {
+                self.finish(&format!("match:{media_id}"))
+            }
+            AppEvent::MetadataFailed { target_id: 0, .. } => self.finish("match-all"),
+            AppEvent::MetadataFailed {
+                target_id: media_id,
+                ..
+            } => self.finish(&format!("match:{media_id}")),
+            AppEvent::MetadataMatchProgress { processed, total } if processed == total => {
+                self.finish("match-all")
+            }
+            AppEvent::SubjectUpdated { subject_id } | AppEvent::ImageCached { subject_id, .. } => {
+                self.finish(&format!("images:{subject_id}"))
+            }
+            _ => {}
+        }
+    }
+
+    fn try_start(&self, key: &str) -> bool {
+        self.running
+            .lock()
+            .expect("metadata running mutex poisoned")
+            .insert(key.to_string())
+    }
+
+    fn finish(&self, key: &str) {
+        self.running
+            .lock()
+            .expect("metadata running mutex poisoned")
+            .remove(key);
+    }
+}
+
+fn image_cache_root(database_path: &std::path::Path) -> PathBuf {
+    database_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("data"))
+        .join("cache")
+        .join("images")
 }
 
 fn open_with_default_player(path: &PathBuf) -> AppResult<()> {
@@ -1713,6 +3251,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use walkdir::WalkDir;
 
 use crate::domain::{DanmakuMatch, MediaFile, MediaItem, ScanSummary, ScanUpsertStatus};
+use crate::metadata::cache::ImageCache;
+use crate::metadata::provider::{MetadataProvider, SubjectSearchResult};
 use crate::repository::Repository;
 
 #[derive(Debug, Clone)]
@@ -1729,6 +3269,29 @@ pub enum AppEvent {
     },
     ScanFailed(String),
     DanmakuMatched(DanmakuMatch),
+    MetadataMatchStarted {
+        media_id: i64,
+    },
+    MetadataMatchProgress {
+        processed: usize,
+        total: usize,
+    },
+    MetadataMatchFinished {
+        media_id: i64,
+        subject_id: Option<i64>,
+        title: Option<String>,
+    },
+    SubjectUpdated {
+        subject_id: i64,
+    },
+    ImageCached {
+        subject_id: i64,
+        image_kind: String,
+    },
+    MetadataFailed {
+        target_id: i64,
+        error: String,
+    },
 }
 
 pub fn spawn_media_scan(
@@ -1906,6 +3469,211 @@ pub fn unix_timestamp_ms() -> i64 {
         .map(|duration| duration.as_millis() as i64)
         .unwrap_or_default()
 }
+
+pub fn spawn_match_metadata<P>(
+    repository: Repository,
+    provider: P,
+    image_cache: ImageCache,
+    media: MediaItem,
+    danmaku_hint: Option<DanmakuMatch>,
+    events: mpsc::Sender<AppEvent>,
+) where
+    P: MetadataProvider + Send + 'static,
+{
+    thread::spawn(move || {
+        let _ = events.send(AppEvent::MetadataMatchStarted { media_id: media.id });
+        match match_one_media(&repository, &provider, &image_cache, &media, danmaku_hint) {
+            Ok((subject_id, title)) => {
+                let _ = events.send(AppEvent::MetadataMatchFinished {
+                    media_id: media.id,
+                    subject_id,
+                    title,
+                });
+            }
+            Err(error) => {
+                let _ = events.send(AppEvent::MetadataFailed {
+                    target_id: media.id,
+                    error: error.to_string(),
+                });
+            }
+        }
+    });
+}
+
+pub fn spawn_match_all_unmatched<P>(
+    repository: Repository,
+    provider: P,
+    image_cache: ImageCache,
+    events: mpsc::Sender<AppEvent>,
+) where
+    P: MetadataProvider + Clone + Send + 'static,
+{
+    thread::spawn(move || {
+        let media = match repository.unmatched_media() {
+            Ok(media) => media,
+            Err(error) => {
+                let _ = events.send(AppEvent::MetadataFailed {
+                    target_id: 0,
+                    error: error.to_string(),
+                });
+                return;
+            }
+        };
+
+        let total = media.len();
+        for (index, item) in media.into_iter().enumerate() {
+            let _ = events.send(AppEvent::MetadataMatchProgress {
+                processed: index,
+                total,
+            });
+            match match_one_media(&repository, &provider, &image_cache, &item, None) {
+                Ok((subject_id, title)) => {
+                    let _ = events.send(AppEvent::MetadataMatchFinished {
+                        media_id: item.id,
+                        subject_id,
+                        title,
+                    });
+                }
+                Err(error) => {
+                    let _ = events.send(AppEvent::MetadataFailed {
+                        target_id: item.id,
+                        error: error.to_string(),
+                    });
+                }
+            }
+        }
+        let _ = events.send(AppEvent::MetadataMatchProgress {
+            processed: total,
+            total,
+        });
+    });
+}
+
+pub fn spawn_download_subject_images<P>(
+    repository: Repository,
+    provider: P,
+    image_cache: ImageCache,
+    subject_id: i64,
+    events: mpsc::Sender<AppEvent>,
+) where
+    P: MetadataProvider + Send + 'static,
+{
+    thread::spawn(move || {
+        let result = (|| {
+            let subject = repository
+                .get_subject(subject_id)?
+                .ok_or_else(|| crate::error::AppError::Api("subject not found".to_string()))?;
+            let images = provider.get_subject_images(&subject.provider_subject_id)?;
+            let cached = cache_subject_images(
+                &repository,
+                &image_cache,
+                subject_id,
+                &subject.provider,
+                [
+                    ("poster", images.common.or(subject.image_common)),
+                    ("hero", images.large.or(subject.image_large)),
+                ],
+            )?;
+            for image_kind in cached {
+                let _ = events.send(AppEvent::ImageCached {
+                    subject_id,
+                    image_kind,
+                });
+            }
+            Ok::<_, crate::error::AppError>(())
+        })();
+
+        match result {
+            Ok(()) => {
+                let _ = events.send(AppEvent::SubjectUpdated { subject_id });
+            }
+            Err(error) => {
+                let _ = events.send(AppEvent::MetadataFailed {
+                    target_id: subject_id,
+                    error: error.to_string(),
+                });
+            }
+        }
+    });
+}
+
+fn match_one_media<P>(
+    repository: &Repository,
+    provider: &P,
+    image_cache: &ImageCache,
+    media: &MediaItem,
+    danmaku_hint: Option<DanmakuMatch>,
+) -> crate::error::AppResult<(Option<i64>, Option<String>)>
+where
+    P: MetadataProvider,
+{
+    let keyword = crate::metadata::matcher::keyword_for_media(media, danmaku_hint.as_ref());
+    let candidates = provider.search_subjects(&keyword)?;
+    let Some(candidate) = candidates.first() else {
+        return Ok((None, None));
+    };
+
+    let now = unix_timestamp_ms();
+    let subject_id = repository.upsert_subject_from_search(candidate, now)?;
+    repository.link_media_subject(media.id, subject_id, "bangumi_search", 0.6, false, now)?;
+    if let Ok(detail) = provider.get_subject(&candidate.provider_subject_id) {
+        let detail_subject_id = repository.upsert_subject_detail(&detail, unix_timestamp_ms())?;
+        cache_subject_images(
+            repository,
+            image_cache,
+            detail_subject_id,
+            &detail.provider,
+            [
+                ("poster", detail.images.common.clone()),
+                ("hero", detail.images.large.clone()),
+            ],
+        )?;
+        return Ok((Some(detail_subject_id), Some(display_title(candidate))));
+    }
+
+    cache_subject_images(
+        repository,
+        image_cache,
+        subject_id,
+        &candidate.provider,
+        [
+            ("poster", candidate.image_common.clone()),
+            ("hero", candidate.image_large.clone()),
+        ],
+    )?;
+    Ok((Some(subject_id), Some(display_title(candidate))))
+}
+
+fn cache_subject_images<'a>(
+    repository: &Repository,
+    image_cache: &ImageCache,
+    subject_id: i64,
+    provider: &str,
+    images: impl IntoIterator<Item = (&'a str, Option<String>)>,
+) -> crate::error::AppResult<Vec<String>> {
+    let mut cached = Vec::new();
+    for (kind, url) in images {
+        let Some(url) = url.filter(|url| !url.trim().is_empty()) else {
+            continue;
+        };
+        if repository.get_image_cache(subject_id, kind)?.is_some() {
+            continue;
+        }
+        let path = image_cache.download_subject_image(provider, subject_id, kind, &url)?;
+        repository.upsert_image_cache(subject_id, kind, &url, &path, unix_timestamp_ms())?;
+        cached.push(kind.to_string());
+    }
+    Ok(cached)
+}
+
+fn display_title(candidate: &SubjectSearchResult) -> String {
+    candidate
+        .title_cn
+        .as_ref()
+        .filter(|title| !title.is_empty())
+        .unwrap_or(&candidate.title)
+        .to_string()
+}
 </file>
 
 <file path="Cargo.toml">
@@ -1920,6 +3688,7 @@ md5 = "0.7"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 sha2 = "0.10"
 slint = "1"
 thiserror = "2"
