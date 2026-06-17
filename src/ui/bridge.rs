@@ -48,7 +48,7 @@ pub fn bind(window: Weak<MainWindow>, context: AppContext) -> AppResult<BridgeSt
         selected_candidate_id: None,
         library_search: String::new(),
         library_filter: "all".to_string(),
-        library_sort: "title".to_string(),
+        library_sort: "date".to_string(),
         logs: VecDeque::new(),
     }));
 
@@ -63,8 +63,8 @@ pub fn bind(window: Weak<MainWindow>, context: AppContext) -> AppResult<BridgeSt
         set_empty_detail(&window);
         window.set_metadata_status("idle".into());
         window.set_library_filter("all".into());
-        window.set_library_sort("title".into());
-        window.set_library_view_grid(false);
+        window.set_library_sort("date".into());
+        window.set_library_view_grid(true);
         push_log(&window, &state, "info", "ready");
     }
 
@@ -804,7 +804,19 @@ fn visible_library_cards(cards: &[UiMediaCardData], state: &BridgeState) -> Vec<
         .collect::<Vec<_>>();
 
     match sort.as_str() {
-        "date" => visible.sort_by(|left, right| right.media_id.cmp(&left.media_id)),
+        "date" => visible.sort_by_key(|card| std::cmp::Reverse(card.media_id)),
+        "progress" => visible.sort_by_key(|card| {
+            (
+                std::cmp::Reverse(card.progress_percent),
+                card.title.to_ascii_lowercase(),
+            )
+        }),
+        "match" => visible.sort_by_key(|card| {
+            (
+                match_rank(&card.match_status),
+                card.title.to_ascii_lowercase(),
+            )
+        }),
         _ => visible.sort_by(|left, right| {
             left.title
                 .to_ascii_lowercase()
@@ -813,6 +825,16 @@ fn visible_library_cards(cards: &[UiMediaCardData], state: &BridgeState) -> Vec<
     }
 
     visible
+}
+
+fn match_rank(status: &str) -> i32 {
+    match status {
+        "matched" => 0,
+        "tentative" => 1,
+        "unmatched" => 2,
+        "failed" => 3,
+        _ => 4,
+    }
 }
 
 fn set_home_and_settings(window: &MainWindow, context: &AppContext) {
