@@ -1,3 +1,4 @@
+use crate::domain::SubjectEpisode;
 use crate::error::AppResult;
 
 #[derive(Debug, Clone)]
@@ -38,4 +39,5 @@ pub trait MetadataProvider {
     fn search_subjects(&self, keyword: &str) -> AppResult<Vec<SubjectSearchResult>>;
     fn get_subject(&self, provider_subject_id: &str) -> AppResult<SubjectDetail>;
     fn get_subject_images(&self, provider_subject_id: &str) -> AppResult<SubjectImages>;
+    fn get_episodes(&self, provider_subject_id: &str) -> AppResult<Vec<SubjectEpisode>>;
 }

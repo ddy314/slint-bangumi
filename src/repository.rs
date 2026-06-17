@@ -3,8 +3,8 @@ use std::path::{Path, PathBuf};
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::domain::{
-    MediaFile, MediaItem, ScanUpsertStatus, Subject, SubjectImageCache, UiMediaCardData,
-    UiSubjectDetailData, WatchProgress,
+    MediaFile, MediaItem, MetadataCandidate, ScanUpsertStatus, Subject, SubjectEpisode,
+    SubjectImageCache, UiCandidateData, UiMediaCardData, UiSubjectDetailData, WatchProgress,
 };
 use crate::error::AppResult;
 use crate::metadata::provider::{SubjectDetail, SubjectSearchResult};
@@ -32,6 +32,7 @@ impl Repository {
                 file_size INTEGER NOT NULL,
                 modified_at INTEGER NOT NULL,
                 file_hash TEXT,
+                match_ignored INTEGER NOT NULL DEFAULT 0,
                 deleted_at INTEGER,
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL
@@ -128,7 +129,41 @@ impl Repository {
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS metadata_candidates (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                media_id INTEGER NOT NULL,
+                provider TEXT NOT NULL,
+                provider_subject_id TEXT NOT NULL,
+                title TEXT NOT NULL,
+                title_cn TEXT,
+                summary TEXT,
+                air_date TEXT,
+                rating REAL,
+                rank INTEGER,
+                image_large TEXT,
+                image_common TEXT,
+                confidence REAL,
+                source TEXT NOT NULL,
+                selected INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                UNIQUE(media_id, provider, provider_subject_id),
+                FOREIGN KEY(media_id) REFERENCES media_items(id) ON DELETE CASCADE
+            );
+
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_episodes_subject_provider
+                ON episodes(subject_id, provider_episode_id);
+
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_media_episode_links_media
+                ON media_episode_links(media_id);
             "#,
+        )?;
+        add_column_if_missing(
+            &conn,
+            "media_items",
+            "match_ignored",
+            "INTEGER NOT NULL DEFAULT 0",
         )?;
         Ok(())
     }
@@ -136,9 +171,9 @@ impl Repository {
     pub fn list_media(&self, include_deleted: bool) -> AppResult<Vec<MediaItem>> {
         let conn = self.connect()?;
         let sql = if include_deleted {
-            "SELECT id, path, file_name, file_size, modified_at, file_hash, deleted_at FROM media_items ORDER BY file_name COLLATE NOCASE"
+            "SELECT id, path, file_name, file_size, modified_at, file_hash, match_ignored, deleted_at FROM media_items ORDER BY file_name COLLATE NOCASE"
         } else {
-            "SELECT id, path, file_name, file_size, modified_at, file_hash, deleted_at FROM media_items WHERE deleted_at IS NULL ORDER BY file_name COLLATE NOCASE"
+            "SELECT id, path, file_name, file_size, modified_at, file_hash, match_ignored, deleted_at FROM media_items WHERE deleted_at IS NULL ORDER BY file_name COLLATE NOCASE"
         };
 
         let mut stmt = conn.prepare(sql)?;
@@ -149,7 +184,7 @@ impl Repository {
     pub fn get_media(&self, media_id: i64) -> AppResult<Option<MediaItem>> {
         let conn = self.connect()?;
         conn.query_row(
-            "SELECT id, path, file_name, file_size, modified_at, file_hash, deleted_at FROM media_items WHERE id = ?1",
+            "SELECT id, path, file_name, file_size, modified_at, file_hash, match_ignored, deleted_at FROM media_items WHERE id = ?1",
             params![media_id],
             map_media_item,
         )
@@ -167,11 +202,15 @@ impl Repository {
                 COALESCE(NULLIF(s.title_cn, ''), s.title, m.file_name),
                 m.file_name,
                 CASE
+                    WHEN m.match_ignored = 1 THEN '已忽略'
+                    WHEN s.id IS NULL AND c.id IS NOT NULL THEN '待确认'
                     WHEN s.id IS NULL THEN '未匹配'
                     WHEN l.confirmed = 0 THEN '待确认'
                     ELSE '已匹配'
                 END,
                 CASE
+                    WHEN m.match_ignored = 1 THEN 'ignored'
+                    WHEN s.id IS NULL AND c.id IS NOT NULL THEN 'tentative'
                     WHEN s.id IS NULL THEN 'unmatched'
                     WHEN l.confirmed = 0 THEN 'tentative'
                     ELSE 'matched'
@@ -190,6 +229,12 @@ impl Repository {
             LEFT JOIN media_episode_links mel ON mel.media_id = m.id
             LEFT JOIN subject_image_cache pic
                 ON pic.subject_id = s.id AND pic.image_kind = 'poster'
+            LEFT JOIN (
+                SELECT media_id, MAX(id) AS id
+                FROM metadata_candidates
+                WHERE selected = 1
+                GROUP BY media_id
+            ) c ON c.media_id = m.id
             WHERE m.deleted_at IS NULL
             ORDER BY title COLLATE NOCASE
             "#,
@@ -232,14 +277,30 @@ impl Repository {
         Ok((indexed, matched, indexed.saturating_sub(matched)))
     }
 
+    pub fn tentative_count(&self) -> AppResult<usize> {
+        let conn = self.connect()?;
+        let count = conn.query_row(
+            r#"
+            SELECT COUNT(DISTINCT c.media_id)
+            FROM metadata_candidates c
+            LEFT JOIN media_subject_links l ON l.media_id = c.media_id
+            JOIN media_items m ON m.id = c.media_id
+            WHERE c.selected = 1 AND l.media_id IS NULL AND m.deleted_at IS NULL AND m.match_ignored = 0
+            "#,
+            [],
+            |row| row.get::<_, i64>(0),
+        )? as usize;
+        Ok(count)
+    }
+
     pub fn unmatched_media(&self) -> AppResult<Vec<MediaItem>> {
         let conn = self.connect()?;
         let mut stmt = conn.prepare(
             r#"
-            SELECT m.id, m.path, m.file_name, m.file_size, m.modified_at, m.file_hash, m.deleted_at
+            SELECT m.id, m.path, m.file_name, m.file_size, m.modified_at, m.file_hash, m.match_ignored, m.deleted_at
             FROM media_items m
             LEFT JOIN media_subject_links l ON l.media_id = m.id
-            WHERE m.deleted_at IS NULL AND l.media_id IS NULL
+            WHERE m.deleted_at IS NULL AND m.match_ignored = 0 AND l.media_id IS NULL
             ORDER BY m.file_name COLLATE NOCASE
             "#,
         )?;
@@ -287,6 +348,145 @@ impl Repository {
         self.find_subject_id(&subject.provider, &subject.provider_subject_id)
     }
 
+    pub fn upsert_metadata_candidates(
+        &self,
+        media_id: i64,
+        candidates: &[SubjectSearchResult],
+        source: &str,
+        now: i64,
+    ) -> AppResult<Vec<MetadataCandidate>> {
+        let conn = self.connect()?;
+        for (index, candidate) in candidates.iter().enumerate() {
+            let confidence = if index == 0 { 0.72 } else { 0.42 };
+            let selected = if index == 0 { 1 } else { 0 };
+            conn.execute(
+                r#"
+                INSERT INTO metadata_candidates
+                    (media_id, provider, provider_subject_id, title, title_cn, summary, air_date,
+                     rating, rank, image_large, image_common, confidence, source, selected,
+                     created_at, updated_at)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?15)
+                ON CONFLICT(media_id, provider, provider_subject_id) DO UPDATE SET
+                    title = excluded.title,
+                    title_cn = excluded.title_cn,
+                    summary = excluded.summary,
+                    air_date = excluded.air_date,
+                    rating = excluded.rating,
+                    rank = excluded.rank,
+                    image_large = excluded.image_large,
+                    image_common = excluded.image_common,
+                    confidence = excluded.confidence,
+                    source = excluded.source,
+                    selected = excluded.selected,
+                    updated_at = excluded.updated_at
+                "#,
+                params![
+                    media_id,
+                    candidate.provider,
+                    candidate.provider_subject_id,
+                    candidate.title,
+                    candidate.title_cn,
+                    candidate.summary,
+                    candidate.air_date,
+                    candidate.rating,
+                    candidate.rank,
+                    candidate.image_large,
+                    candidate.image_common,
+                    confidence,
+                    source,
+                    selected,
+                    now
+                ],
+            )?;
+        }
+        self.list_candidates_for_media(media_id)
+    }
+
+    pub fn list_candidates_for_media(&self, media_id: i64) -> AppResult<Vec<MetadataCandidate>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, media_id, provider, provider_subject_id, title, title_cn, summary,
+                   air_date, rating, rank, image_large, image_common, confidence, source, selected
+            FROM metadata_candidates
+            WHERE media_id = ?1
+            ORDER BY selected DESC, confidence DESC, updated_at DESC
+            "#,
+        )?;
+        let rows = stmt.query_map(params![media_id], map_candidate)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn selected_candidate_for_media(
+        &self,
+        media_id: i64,
+    ) -> AppResult<Option<MetadataCandidate>> {
+        let conn = self.connect()?;
+        conn.query_row(
+            r#"
+            SELECT id, media_id, provider, provider_subject_id, title, title_cn, summary,
+                   air_date, rating, rank, image_large, image_common, confidence, source, selected
+            FROM metadata_candidates
+            WHERE media_id = ?1 AND selected = 1
+            ORDER BY confidence DESC, updated_at DESC
+            LIMIT 1
+            "#,
+            params![media_id],
+            map_candidate,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn get_candidate(&self, candidate_id: i64) -> AppResult<Option<MetadataCandidate>> {
+        let conn = self.connect()?;
+        conn.query_row(
+            r#"
+            SELECT id, media_id, provider, provider_subject_id, title, title_cn, summary,
+                   air_date, rating, rank, image_large, image_common, confidence, source, selected
+            FROM metadata_candidates
+            WHERE id = ?1
+            "#,
+            params![candidate_id],
+            map_candidate,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn select_candidate(&self, media_id: i64, candidate_id: i64, now: i64) -> AppResult<()> {
+        let conn = self.connect()?;
+        conn.execute(
+            "UPDATE metadata_candidates SET selected = 0, updated_at = ?2 WHERE media_id = ?1",
+            params![media_id, now],
+        )?;
+        conn.execute(
+            "UPDATE metadata_candidates SET selected = 1, updated_at = ?3 WHERE media_id = ?1 AND id = ?2",
+            params![media_id, candidate_id, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn upsert_subject_from_candidate(
+        &self,
+        candidate: &MetadataCandidate,
+        now: i64,
+    ) -> AppResult<i64> {
+        let search = SubjectSearchResult {
+            provider: candidate.provider.clone(),
+            provider_subject_id: candidate.provider_subject_id.clone(),
+            title: candidate.title.clone(),
+            title_cn: candidate.title_cn.clone(),
+            summary: candidate.summary.clone(),
+            air_date: candidate.air_date.clone(),
+            rating: candidate.rating,
+            rank: candidate.rank,
+            image_large: candidate.image_large.clone(),
+            image_common: candidate.image_common.clone(),
+        };
+        self.upsert_subject_from_search(&search, now)
+    }
+
     pub fn upsert_subject_detail(&self, detail: &SubjectDetail, now: i64) -> AppResult<i64> {
         let conn = self.connect()?;
         let tags = serde_json::to_string(&detail.tags).unwrap_or_else(|_| "[]".to_string());
@@ -326,6 +526,101 @@ impl Repository {
         self.find_subject_id(&detail.provider, &detail.provider_subject_id)
     }
 
+    pub fn upsert_subject_episodes(
+        &self,
+        subject_id: i64,
+        episodes: &[SubjectEpisode],
+    ) -> AppResult<()> {
+        let conn = self.connect()?;
+        for episode in episodes {
+            conn.execute(
+                r#"
+                INSERT INTO episodes
+                    (subject_id, provider_episode_id, sort_number, title, title_cn, air_date)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                ON CONFLICT(subject_id, provider_episode_id) DO UPDATE SET
+                    sort_number = excluded.sort_number,
+                    title = excluded.title,
+                    title_cn = excluded.title_cn,
+                    air_date = excluded.air_date
+                "#,
+                params![
+                    subject_id,
+                    episode.provider_episode_id,
+                    episode.ep_number.unwrap_or(episode.sort_number),
+                    episode.title,
+                    episode.title_cn,
+                    episode.air_date
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn link_media_episode_by_number(
+        &self,
+        media_id: i64,
+        subject_id: i64,
+        episode_number: Option<f64>,
+        episode_title: Option<&str>,
+        confidence: f64,
+        now: i64,
+    ) -> AppResult<()> {
+        let conn = self.connect()?;
+        let episode = episode_number.and_then(|number| {
+            conn.query_row(
+                r#"
+                    SELECT id, COALESCE(NULLIF(title_cn, ''), title), sort_number
+                    FROM episodes
+                    WHERE subject_id = ?1 AND ABS(sort_number - ?2) < 0.001
+                    ORDER BY id
+                    LIMIT 1
+                    "#,
+                params![subject_id, number],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<f64>>(2)?.unwrap_or(number),
+                    ))
+                },
+            )
+            .optional()
+            .ok()
+            .flatten()
+        });
+
+        let (episode_id, title, number) = match episode {
+            Some((id, title, number)) => (Some(id), Some(title), Some(number)),
+            None => (
+                None,
+                episode_title.map(str::to_string),
+                episode_number.or_else(|| {
+                    infer_episode_number_from_media(media_id, &conn)
+                        .ok()
+                        .flatten()
+                }),
+            ),
+        };
+
+        conn.execute(
+            r#"
+            INSERT INTO media_episode_links
+                (media_id, episode_id, episode_title, episode_number, match_source, confidence)
+            VALUES (?1, ?2, ?3, ?4, 'episode_inference', ?5)
+            ON CONFLICT(media_id) DO UPDATE SET
+                episode_id = excluded.episode_id,
+                episode_title = excluded.episode_title,
+                episode_number = excluded.episode_number,
+                match_source = excluded.match_source,
+                confidence = excluded.confidence
+            "#,
+            params![media_id, episode_id, title, number, confidence],
+        )?;
+        let _ = now;
+        Ok(())
+    }
+
     pub fn link_media_subject(
         &self,
         media_id: i64,
@@ -355,19 +650,6 @@ impl Repository {
                 if confirmed { 1 } else { 0 },
                 now
             ],
-        )?;
-        Ok(())
-    }
-
-    pub fn confirm_media_subject(&self, media_id: i64, subject_id: i64, now: i64) -> AppResult<()> {
-        let conn = self.connect()?;
-        conn.execute(
-            r#"
-            UPDATE media_subject_links
-            SET confirmed = 1, updated_at = ?3
-            WHERE media_id = ?1 AND subject_id = ?2
-            "#,
-            params![media_id, subject_id, now],
         )?;
         Ok(())
     }
@@ -545,6 +827,36 @@ impl Repository {
                     if hero_cached { "cached" } else { "not cached" }
                 ),
                 files,
+                episodes: self.ui_episodes_for_subject(subject.id, media_id)?,
+            })
+        } else if let Some(candidate) = self.selected_candidate_for_media(media_id)? {
+            Ok(UiSubjectDetailData {
+                media_id,
+                subject_id: 0,
+                title: candidate
+                    .title_cn
+                    .clone()
+                    .filter(|title| !title.is_empty())
+                    .unwrap_or(candidate.title),
+                title_cn: candidate.title_cn.unwrap_or_default(),
+                summary: candidate
+                    .summary
+                    .unwrap_or_else(|| "候选已保存，确认后会拉取完整条目信息和图片。".to_string()),
+                air_date: candidate.air_date.unwrap_or_else(|| "-".to_string()),
+                rating_text: candidate
+                    .rating
+                    .map(|rating| format!("{rating:.1}"))
+                    .unwrap_or_else(|| "-".to_string()),
+                rank_text: candidate
+                    .rank
+                    .map(|rank| format!("#{rank}"))
+                    .unwrap_or_else(|| "-".to_string()),
+                poster_path: String::new(),
+                hero_path: String::new(),
+                match_status: "待确认".to_string(),
+                cache_status: "poster: not cached, hero: not cached".to_string(),
+                files,
+                episodes: Vec::new(),
             })
         } else {
             Ok(UiSubjectDetailData {
@@ -561,8 +873,99 @@ impl Repository {
                 match_status: "未匹配".to_string(),
                 cache_status: "poster: not cached, hero: not cached".to_string(),
                 files,
+                episodes: Vec::new(),
             })
         }
+    }
+
+    fn ui_episodes_for_subject(&self, subject_id: i64, media_id: i64) -> AppResult<Vec<String>> {
+        let conn = self.connect()?;
+        let current = conn
+            .query_row(
+                "SELECT episode_id FROM media_episode_links WHERE media_id = ?1",
+                params![media_id],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .optional()?
+            .flatten();
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, sort_number, COALESCE(NULLIF(title_cn, ''), title), air_date
+            FROM episodes
+            WHERE subject_id = ?1
+            ORDER BY sort_number, id
+            LIMIT 200
+            "#,
+        )?;
+        let rows = stmt.query_map(params![subject_id], |row| {
+            let id = row.get::<_, i64>(0)?;
+            let sort = row.get::<_, Option<f64>>(1)?.unwrap_or_default();
+            let title = row
+                .get::<_, Option<String>>(2)?
+                .unwrap_or_else(|| "-".to_string());
+            let air_date = row.get::<_, Option<String>>(3)?.unwrap_or_default();
+            let marker = if Some(id) == current { "Now  " } else { "" };
+            Ok(format!(
+                "{marker}EP{}  {title}  {air_date}",
+                format_episode_number(sort)
+            ))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn ignore_media_match(&self, media_id: i64, now: i64) -> AppResult<()> {
+        let conn = self.connect()?;
+        conn.execute(
+            "UPDATE media_items SET match_ignored = 1, updated_at = ?2 WHERE id = ?1",
+            params![media_id, now],
+        )?;
+        conn.execute(
+            "UPDATE metadata_candidates SET selected = 0, updated_at = ?2 WHERE media_id = ?1",
+            params![media_id, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn clear_media_match_ignore(&self, media_id: i64, now: i64) -> AppResult<()> {
+        let conn = self.connect()?;
+        conn.execute(
+            "UPDATE media_items SET match_ignored = 0, updated_at = ?2 WHERE id = ?1",
+            params![media_id, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn ui_candidates_for_media(&self, media_id: i64) -> AppResult<Vec<UiCandidateData>> {
+        Ok(self
+            .list_candidates_for_media(media_id)?
+            .into_iter()
+            .map(|candidate| UiCandidateData {
+                candidate_id: candidate.id,
+                media_id: candidate.media_id,
+                title: candidate
+                    .title_cn
+                    .clone()
+                    .filter(|title| !title.is_empty())
+                    .unwrap_or_else(|| candidate.title.clone()),
+                subtitle: format!(
+                    "{}  {}  confidence {:.0}%",
+                    candidate.provider,
+                    candidate
+                        .air_date
+                        .clone()
+                        .unwrap_or_else(|| "date unknown".to_string()),
+                    candidate.confidence * 100.0
+                ),
+                summary: candidate
+                    .summary
+                    .unwrap_or_else(|| "No summary in candidate.".to_string()),
+                score_text: candidate
+                    .rating
+                    .map(|rating| format!("{rating:.1}"))
+                    .unwrap_or_else(|| "-".to_string()),
+                selected: candidate.selected,
+            })
+            .collect())
     }
 
     fn find_subject_id(&self, provider: &str, provider_subject_id: &str) -> AppResult<i64> {
@@ -795,7 +1198,90 @@ fn map_media_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<MediaItem> {
         file_size: row.get::<_, i64>(3)? as u64,
         modified_at: row.get(4)?,
         file_hash: row.get(5)?,
-        deleted_at: row.get(6)?,
+        match_ignored: row.get::<_, i64>(6)? != 0,
+        deleted_at: row.get(7)?,
+    })
+}
+
+fn add_column_if_missing(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    definition: &str,
+) -> AppResult<()> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let columns = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    if !columns.iter().any(|existing| existing == column) {
+        conn.execute(
+            &format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"),
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+fn infer_episode_number_from_media(
+    media_id: i64,
+    conn: &Connection,
+) -> rusqlite::Result<Option<f64>> {
+    let file_name = conn.query_row(
+        "SELECT file_name FROM media_items WHERE id = ?1",
+        params![media_id],
+        |row| row.get::<_, String>(0),
+    )?;
+    Ok(infer_episode_number(&file_name))
+}
+
+fn infer_episode_number(file_name: &str) -> Option<f64> {
+    let stem = Path::new(file_name)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or(file_name);
+    let mut best = None;
+    let mut current = String::new();
+    for ch in stem.chars().chain(std::iter::once(' ')) {
+        if ch.is_ascii_digit() {
+            current.push(ch);
+            continue;
+        }
+        if (1..=3).contains(&current.len())
+            && let Ok(value) = current.parse::<i64>()
+            && (1..=999).contains(&value)
+        {
+            best = Some(value as f64);
+        }
+        current.clear();
+    }
+    best
+}
+
+fn format_episode_number(value: f64) -> String {
+    if (value.fract()).abs() < f64::EPSILON {
+        format!("{}", value as i64)
+    } else {
+        format!("{value:.1}")
+    }
+}
+
+fn map_candidate(row: &rusqlite::Row<'_>) -> rusqlite::Result<MetadataCandidate> {
+    Ok(MetadataCandidate {
+        id: row.get(0)?,
+        media_id: row.get(1)?,
+        provider: row.get(2)?,
+        provider_subject_id: row.get(3)?,
+        title: row.get(4)?,
+        title_cn: row.get(5)?,
+        summary: row.get(6)?,
+        air_date: row.get(7)?,
+        rating: row.get(8)?,
+        rank: row.get(9)?,
+        image_large: row.get(10)?,
+        image_common: row.get(11)?,
+        confidence: row.get::<_, Option<f64>>(12)?.unwrap_or_default(),
+        source: row.get(13)?,
+        selected: row.get::<_, i64>(14)? != 0,
     })
 }
 

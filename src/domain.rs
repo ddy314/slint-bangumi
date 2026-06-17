@@ -8,6 +8,7 @@ pub struct MediaItem {
     pub file_size: u64,
     pub modified_at: i64,
     pub file_hash: Option<String>,
+    pub match_ignored: bool,
     pub deleted_at: Option<i64>,
 }
 
@@ -50,8 +51,24 @@ pub struct ScanSummary {
 pub struct DanmakuMatch {
     pub provider: String,
     pub title: String,
+    pub anime_id: Option<i64>,
+    pub episode_id: Option<i64>,
+    pub anime_title: Option<String>,
     pub episode: Option<String>,
     pub comment_count: usize,
+    pub exact: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct SubjectEpisode {
+    pub provider_episode_id: String,
+    pub sort_number: f64,
+    pub ep_number: Option<f64>,
+    pub title: String,
+    pub title_cn: Option<String>,
+    pub air_date: Option<String>,
+    #[allow(dead_code)]
+    pub summary: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -78,6 +95,25 @@ pub struct SubjectImageCache {
     #[allow(dead_code)]
     pub source_url: String,
     pub local_path: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+pub struct MetadataCandidate {
+    pub id: i64,
+    pub media_id: i64,
+    pub provider: String,
+    pub provider_subject_id: String,
+    pub title: String,
+    pub title_cn: Option<String>,
+    pub summary: Option<String>,
+    pub air_date: Option<String>,
+    pub rating: Option<f64>,
+    pub rank: Option<i64>,
+    pub image_large: Option<String>,
+    pub image_common: Option<String>,
+    pub confidence: f64,
+    pub source: String,
+    pub selected: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -109,4 +145,16 @@ pub struct UiSubjectDetailData {
     pub match_status: String,
     pub cache_status: String,
     pub files: Vec<String>,
+    pub episodes: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct UiCandidateData {
+    pub candidate_id: i64,
+    pub media_id: i64,
+    pub title: String,
+    pub subtitle: String,
+    pub summary: String,
+    pub score_text: String,
+    pub selected: bool,
 }

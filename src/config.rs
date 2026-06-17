@@ -11,6 +11,8 @@ pub struct AppConfig {
     pub database: DatabaseConfig,
     pub media_libraries: Vec<PathBuf>,
     pub dandanplay: DandanplayConfig,
+    #[serde(default)]
+    pub bangumi: BangumiConfig,
     pub logging: LoggingConfig,
 }
 
@@ -24,6 +26,31 @@ pub struct DandanplayConfig {
     pub app_id: String,
     pub app_secret: String,
     pub api_key: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BangumiConfig {
+    pub enabled: bool,
+    pub base_url: String,
+    pub access_token: String,
+    pub user_agent: String,
+    pub request_timeout_secs: u64,
+    pub auto_match: bool,
+    pub cache_images: bool,
+}
+
+impl Default for BangumiConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            base_url: "https://api.bgm.tv".to_string(),
+            access_token: String::new(),
+            user_agent: format!("slint-bangumi/{}", env!("CARGO_PKG_VERSION")),
+            request_timeout_secs: 20,
+            auto_match: true,
+            cache_images: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -43,6 +70,7 @@ impl Default for AppConfig {
                 app_secret: String::new(),
                 api_key: String::new(),
             },
+            bangumi: BangumiConfig::default(),
             logging: LoggingConfig {
                 level: "info".to_string(),
             },

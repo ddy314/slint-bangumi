@@ -10,7 +10,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::config::{ConfigStore, DandanplayConfig};
-use crate::domain::{DanmakuMatch, MediaItem, UiMediaCardData, UiSubjectDetailData, WatchProgress};
+use crate::domain::{
+    DanmakuMatch, MediaItem, UiCandidateData, UiMediaCardData, UiSubjectDetailData, WatchProgress,
+};
 use crate::error::{AppError, AppResult};
 use crate::metadata::bangumi::BangumiProvider;
 use crate::metadata::cache::ImageCache;
@@ -74,12 +76,28 @@ impl MediaService {
                 .join("\n")
         };
 
+        let bangumi_auth = if config.bangumi.access_token.trim().is_empty() {
+            "anonymous"
+        } else {
+            "token configured"
+        };
+        let bangumi_enabled = if config.bangumi.enabled {
+            "enabled"
+        } else {
+            "disabled"
+        };
+
         format!(
-            "database: {}\ncache: {}\nindexed media: {}\ndandanplay: {}\nbangumi: public API\nmedia libraries:\n{}",
+            "database: {}\ncache: {}\nindexed media: {}\ndandanplay: {}\nbangumi: {}\nbangumi base_url: {}\nbangumi auth: {}\nbangumi auto_match: {}\nbangumi cache_images: {}\nmedia libraries:\n{}",
             config.database.path.display(),
             image_cache_root(&config.database.path).display(),
             indexed_media_count,
             dandanplay_status,
+            bangumi_enabled,
+            config.bangumi.base_url,
+            bangumi_auth,
+            config.bangumi.auto_match,
+            config.bangumi.cache_images,
             media_libraries
         )
     }
@@ -87,6 +105,12 @@ impl MediaService {
     pub fn open_media(&self, media: &MediaItem) -> AppResult<()> {
         if media.deleted_at.is_some() || !media.path.is_file() {
             return Err(AppError::MediaNotFound);
+        }
+        if media.match_ignored {
+            self.send_log(format!(
+                "opening media with ignored metadata match: {}",
+                media.file_name
+            ));
         }
 
         open_with_default_player(&media.path)?;
@@ -114,9 +138,9 @@ impl MediaService {
 
 #[derive(Clone)]
 pub struct MetadataService {
+    config: Arc<ConfigStore>,
     repository: Repository,
     danmaku: DanmakuService,
-    provider: BangumiProvider,
     image_cache: ImageCache,
     events: mpsc::Sender<AppEvent>,
     running: Arc<Mutex<std::collections::HashSet<String>>>,
@@ -124,15 +148,16 @@ pub struct MetadataService {
 
 impl MetadataService {
     pub fn new(
+        config: Arc<ConfigStore>,
         repository: Repository,
         danmaku: DanmakuService,
         database_path: PathBuf,
         events: mpsc::Sender<AppEvent>,
     ) -> AppResult<Self> {
         Ok(Self {
+            config,
             repository,
             danmaku,
-            provider: BangumiProvider::new()?,
             image_cache: ImageCache::new(image_cache_root(&database_path))?,
             events,
             running: Arc::new(Mutex::new(std::collections::HashSet::new())),
@@ -154,21 +179,19 @@ impl MetadataService {
 
         match self.repository.get_media(media_id) {
             Ok(Some(media)) => {
+                let _ = self
+                    .repository
+                    .clear_media_match_ignore(media_id, task::unix_timestamp_ms());
+                let Some(provider) = self.provider_or_log() else {
+                    self.finish(&key);
+                    return;
+                };
                 let repository = self.repository.clone();
-                let provider = self.provider.clone();
-                let image_cache = self.image_cache.clone();
                 let events = self.events.clone();
                 let danmaku = self.danmaku.clone();
                 std::thread::spawn(move || {
                     let danmaku_hint = danmaku.match_dandanplay(&media).ok();
-                    task::spawn_match_metadata(
-                        repository,
-                        provider,
-                        image_cache,
-                        media,
-                        danmaku_hint,
-                        events,
-                    );
+                    task::spawn_match_metadata(repository, provider, media, danmaku_hint, events);
                 });
             }
             Ok(None) => {
@@ -197,12 +220,12 @@ impl MetadataService {
             return;
         }
 
-        task::spawn_match_all_unmatched(
-            self.repository.clone(),
-            self.provider.clone(),
-            self.image_cache.clone(),
-            self.events.clone(),
-        );
+        let Some(provider) = self.provider_or_log() else {
+            self.finish(&key);
+            return;
+        };
+
+        task::spawn_match_all_unmatched(self.repository.clone(), provider, self.events.clone());
     }
 
     pub fn start_download_subject_images(&self, subject_id: i64) {
@@ -210,20 +233,74 @@ impl MetadataService {
         if !self.try_start(&key) {
             return;
         }
+        let Some(provider) = self.provider_or_log() else {
+            self.finish(&key);
+            return;
+        };
         task::spawn_download_subject_images(
             self.repository.clone(),
-            self.provider.clone(),
+            provider,
             self.image_cache.clone(),
             subject_id,
             self.events.clone(),
         );
     }
 
-    pub fn confirm_media_subject(&self, media_id: i64, subject_id: i64) -> AppResult<()> {
-        self.repository
-            .confirm_media_subject(media_id, subject_id, task::unix_timestamp_ms())?;
+    pub fn confirm_media_candidate(&self, media_id: i64, candidate_id: i64) -> AppResult<()> {
+        let provider = self.provider()?;
+        let subject_id = task::confirm_candidate_and_fetch(
+            self.repository.clone(),
+            provider,
+            self.image_cache.clone(),
+            media_id,
+            candidate_id,
+        )?;
         let _ = self.events.send(AppEvent::SubjectUpdated { subject_id });
         Ok(())
+    }
+
+    pub fn ui_candidates(&self, media_id: i64) -> AppResult<Vec<UiCandidateData>> {
+        self.repository.ui_candidates_for_media(media_id)
+    }
+
+    pub fn select_candidate(&self, media_id: i64, candidate_id: i64) -> AppResult<()> {
+        self.repository
+            .select_candidate(media_id, candidate_id, task::unix_timestamp_ms())
+    }
+
+    pub fn ignore_media_match(&self, media_id: i64) -> AppResult<()> {
+        self.repository
+            .ignore_media_match(media_id, task::unix_timestamp_ms())?;
+        let _ = self.events.send(AppEvent::MetadataStatus(format!(
+            "media #{media_id} ignored for metadata matching"
+        )));
+        Ok(())
+    }
+
+    pub fn tentative_count(&self) -> AppResult<usize> {
+        self.repository.tentative_count()
+    }
+
+    pub fn test_bangumi_connection(&self) {
+        match self
+            .provider()
+            .and_then(|provider| provider.test_connection())
+        {
+            Ok(()) => {
+                let _ = self.events.send(AppEvent::Log(
+                    "bangumi connection ok; public API is reachable".to_string(),
+                ));
+                let _ = self.events.send(AppEvent::MetadataStatus(
+                    "Bangumi connection ok".to_string(),
+                ));
+            }
+            Err(error) => {
+                let _ = self.events.send(AppEvent::MetadataFailed {
+                    target_id: 0,
+                    error: error.to_string(),
+                });
+            }
+        }
     }
 
     pub fn finish_for_event(&self, event: &AppEvent) {
@@ -258,6 +335,24 @@ impl MetadataService {
             .lock()
             .expect("metadata running mutex poisoned")
             .remove(key);
+    }
+
+    fn provider(&self) -> AppResult<BangumiProvider> {
+        let config = self.config.snapshot().bangumi;
+        BangumiProvider::new(config)
+    }
+
+    fn provider_or_log(&self) -> Option<BangumiProvider> {
+        match self.provider() {
+            Ok(provider) => Some(provider),
+            Err(error) => {
+                let _ = self.events.send(AppEvent::MetadataFailed {
+                    target_id: 0,
+                    error: error.to_string(),
+                });
+                None
+            }
+        }
     }
 }
 
@@ -391,8 +486,12 @@ impl DanmakuService {
         Ok(DanmakuMatch {
             provider: "dandanplay".to_string(),
             title: match_title(&match_result).unwrap_or_else(|| media.file_name.clone()),
+            anime_id: Some(match_result.anime_id),
+            episode_id: Some(match_result.episode_id),
+            anime_title: match_result.anime_title.clone(),
             episode: match_result.episode_title,
             comment_count,
+            exact: match_result.is_matched,
         })
     }
 
@@ -443,12 +542,15 @@ impl DanmakuService {
             response.error_message,
         )?;
 
+        let exact = response.is_matched.unwrap_or(false);
         let mut matches = response.matches.unwrap_or_default();
         if matches.is_empty() {
             return Err(AppError::Api("dandanplay returned no matches".to_string()));
         }
 
-        Ok(matches.remove(0))
+        let mut best = matches.remove(0);
+        best.is_matched = exact;
+        Ok(best)
     }
 
     fn fetch_comment_count(&self, episode_id: i64, config: &DandanplayConfig) -> AppResult<usize> {
@@ -520,6 +622,7 @@ struct MatchResponse {
     success: bool,
     error_code: i32,
     error_message: Option<String>,
+    is_matched: Option<bool>,
     matches: Option<Vec<MatchResult>>,
 }
 
@@ -527,8 +630,11 @@ struct MatchResponse {
 #[serde(rename_all = "camelCase")]
 struct MatchResult {
     episode_id: i64,
+    anime_id: i64,
     anime_title: Option<String>,
     episode_title: Option<String>,
+    #[serde(default)]
+    is_matched: bool,
 }
 
 #[derive(Debug, Deserialize)]

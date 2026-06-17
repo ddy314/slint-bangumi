@@ -1,35 +1,55 @@
 use std::time::Duration;
 
 use reqwest::blocking::Client;
+use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
 
+use crate::config::BangumiConfig;
+use crate::domain::SubjectEpisode;
 use crate::error::{AppError, AppResult};
 
 use super::provider::{MetadataProvider, SubjectDetail, SubjectImages, SubjectSearchResult};
 
-const BANGUMI_BASE_URL: &str = "https://api.bgm.tv";
-
 #[derive(Clone)]
 pub struct BangumiProvider {
     client: Client,
+    config: BangumiConfig,
 }
 
 impl BangumiProvider {
-    pub fn new() -> AppResult<Self> {
-        let user_agent = format!(
-            "slint-bangumi/{} (https://github.com/ddy314/slint-bangumi)",
-            env!("CARGO_PKG_VERSION")
-        );
+    pub fn new(config: BangumiConfig) -> AppResult<Self> {
+        let timeout = Duration::from_secs(config.request_timeout_secs.max(1));
         let client = Client::builder()
-            .timeout(Duration::from_secs(20))
-            .user_agent(user_agent)
+            .timeout(timeout)
+            .user_agent(config.user_agent.clone())
+            .default_headers(auth_headers(&config)?)
             .build()?;
-        Ok(Self { client })
+        Ok(Self { client, config })
+    }
+
+    pub fn test_connection(&self) -> AppResult<()> {
+        ensure_enabled(&self.config)?;
+        let response = self
+            .client
+            .get(format!(
+                "{}/v0/subjects/1",
+                self.config.base_url.trim_end_matches('/')
+            ))
+            .send()?;
+        let status = response.status();
+        if status.is_success() {
+            Ok(())
+        } else {
+            Err(AppError::Api(format!(
+                "bangumi connection test rejected: {status}"
+            )))
+        }
     }
 }
 
 impl MetadataProvider for BangumiProvider {
     fn search_subjects(&self, keyword: &str) -> AppResult<Vec<SubjectSearchResult>> {
+        ensure_enabled(&self.config)?;
         let keyword = keyword.trim();
         if keyword.is_empty() {
             return Ok(Vec::new());
@@ -37,7 +57,10 @@ impl MetadataProvider for BangumiProvider {
 
         let response = self
             .client
-            .post(format!("{BANGUMI_BASE_URL}/v0/search/subjects"))
+            .post(format!(
+                "{}/v0/search/subjects",
+                self.config.base_url.trim_end_matches('/')
+            ))
             .json(&SearchRequest {
                 keyword,
                 filter: SearchFilter {
@@ -59,10 +82,12 @@ impl MetadataProvider for BangumiProvider {
     }
 
     fn get_subject(&self, provider_subject_id: &str) -> AppResult<SubjectDetail> {
+        ensure_enabled(&self.config)?;
         let response = self
             .client
             .get(format!(
-                "{BANGUMI_BASE_URL}/v0/subjects/{provider_subject_id}"
+                "{}/v0/subjects/{provider_subject_id}",
+                self.config.base_url.trim_end_matches('/')
             ))
             .send()?;
         let status = response.status();
@@ -75,6 +100,67 @@ impl MetadataProvider for BangumiProvider {
 
     fn get_subject_images(&self, provider_subject_id: &str) -> AppResult<SubjectImages> {
         Ok(self.get_subject(provider_subject_id)?.images)
+    }
+
+    fn get_episodes(&self, provider_subject_id: &str) -> AppResult<Vec<SubjectEpisode>> {
+        ensure_enabled(&self.config)?;
+        let mut offset = 0;
+        let mut episodes = Vec::new();
+        loop {
+            let response = self
+                .client
+                .get(format!(
+                    "{}/v0/episodes",
+                    self.config.base_url.trim_end_matches('/')
+                ))
+                .query(&[
+                    ("subject_id", provider_subject_id),
+                    ("type", "0"),
+                    ("limit", "200"),
+                    ("offset", &offset.to_string()),
+                ])
+                .send()?;
+            let status = response.status();
+            if !status.is_success() {
+                return Err(AppError::Api(format!(
+                    "bangumi episodes rejected: {status}"
+                )));
+            }
+
+            let page = response.json::<EpisodesResponse>()?;
+            let count = page.data.len();
+            episodes.extend(
+                page.data
+                    .into_iter()
+                    .map(BangumiEpisode::into_subject_episode),
+            );
+            offset += count as i64;
+            if count == 0 || offset >= page.total.unwrap_or(offset) {
+                break;
+            }
+        }
+        Ok(episodes)
+    }
+}
+
+fn auth_headers(config: &BangumiConfig) -> AppResult<HeaderMap> {
+    let mut headers = HeaderMap::new();
+    let token = config.access_token.trim();
+    if !token.is_empty() {
+        let value = HeaderValue::from_str(&format!("Bearer {token}"))
+            .map_err(|error| AppError::Config(format!("invalid bangumi access token: {error}")))?;
+        headers.insert(AUTHORIZATION, value);
+    }
+    Ok(headers)
+}
+
+fn ensure_enabled(config: &BangumiConfig) -> AppResult<()> {
+    if config.enabled {
+        Ok(())
+    } else {
+        Err(AppError::Config(
+            "bangumi metadata source is disabled".to_string(),
+        ))
     }
 }
 
@@ -167,6 +253,37 @@ struct BangumiTag {
     name: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct EpisodesResponse {
+    total: Option<i64>,
+    data: Vec<BangumiEpisode>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BangumiEpisode {
+    id: i64,
+    name: String,
+    name_cn: Option<String>,
+    sort: f64,
+    ep: Option<f64>,
+    airdate: Option<String>,
+    desc: Option<String>,
+}
+
+impl BangumiEpisode {
+    fn into_subject_episode(self) -> SubjectEpisode {
+        SubjectEpisode {
+            provider_episode_id: self.id.to_string(),
+            sort_number: self.sort,
+            ep_number: self.ep,
+            title: self.name,
+            title_cn: non_empty(self.name_cn),
+            air_date: non_empty(self.airdate),
+            summary: non_empty(self.desc),
+        }
+    }
+}
+
 fn non_empty(value: Option<String>) -> Option<String> {
     value.and_then(|value| {
         let trimmed = value.trim();
@@ -176,4 +293,22 @@ fn non_empty(value: Option<String>) -> Option<String> {
             Some(trimmed.to_string())
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::config::ConfigStore;
+
+    use super::*;
+
+    #[test]
+    #[ignore = "requires local config.toml and Bangumi network access"]
+    fn connects_with_local_config() {
+        let config = ConfigStore::load_or_create("config.toml")
+            .expect("load config")
+            .snapshot()
+            .bangumi;
+        let provider = BangumiProvider::new(config).expect("create provider");
+        provider.test_connection().expect("connect to Bangumi");
+    }
 }

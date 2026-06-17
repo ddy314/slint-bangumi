@@ -8,5 +8,14 @@ app_id = "xjhfp7iqns"
 app_secret = "6JAiLeVgrk2ifsMmqAJygjwSAHQQB6h4"
 api_key = ""
 
+[bangumi]
+enabled = true
+base_url = "https://api.bgm.tv"
+access_token = "9YafgF3nZhHRS0bExWJARpbA2GlJ431Y3WbNi8tG"
+user_agent = "slint-bangumi/0.1.0"
+request_timeout_secs = 20
+auto_match = true
+cache_images = true
+
 [logging]
 level = "info"

@@ -10,7 +10,21 @@ export struct UiMediaCard {
     progress_percent: int,
     episode_text: string,
     poster_path: string,
+    poster_image: image,
     has_cached_poster: bool,
+}
+
+export struct UiMediaRow {
+    card0: UiMediaCard,
+    card1: UiMediaCard,
+    card2: UiMediaCard,
+    card3: UiMediaCard,
+    card4: UiMediaCard,
+    show0: bool,
+    show1: bool,
+    show2: bool,
+    show3: bool,
+    show4: bool,
 }
 
 export struct UiSubjectDetail {
@@ -24,8 +38,20 @@ export struct UiSubjectDetail {
     rank_text: string,
     poster_path: string,
     hero_path: string,
+    poster_image: image,
+    hero_image: image,
     match_status: string,
     cache_status: string,
+}
+
+export struct UiCandidate {
+    candidate_id: int,
+    media_id: int,
+    title: string,
+    subtitle: string,
+    summary: string,
+    score_text: string,
+    selected: bool,
 }
 
 export struct UiLogLine {
@@ -34,27 +60,301 @@ export struct UiLogLine {
     timestamp: string,
 }
 
-component LogList inherits ListView {
-    in property <[UiLogLine]> lines;
-    height: 610px;
-    for line in root.lines : Text {
-        text: "[" + line.timestamp + "] " + line.level + "  " + line.message;
-        color: line.level == "error" ? #a32323 : #2f3a48;
+component TonalButton inherits Rectangle {
+    in property <string> text;
+    in property <bool> primary;
+    in property <bool> danger;
+    callback clicked();
+
+    height: 40px;
+    width: 154px;
+    border-radius: 20px;
+    background: touch.pressed ? #8f6f45 : touch.has-hover ? (primary ? #e7cda5 : danger ? #573239 : #393632) : (primary ? #d8bb8c : danger ? #44282f : #302d29);
+    border-width: primary ? 0px : 1px;
+    border-color: danger ? #a66a75 : #5a5650;
+
+    touch := TouchArea { clicked => { root.clicked(); } }
+
+    Text {
+        text: root.text;
+        color: root.primary ? #251a0d : root.danger ? #ffd9df : #f0ebe4;
+        font-size: 13px;
+        font-weight: root.primary ? 700 : 600;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+}
+
+component Chip inherits Rectangle {
+    in property <string> text;
+    in property <bool> selected;
+    in property <string> tone;
+    callback clicked();
+
+    height: 32px;
+    min-width: 78px;
+    border-radius: 16px;
+    border-width: root.selected ? 0px : 1px;
+    border-color: #68625b;
+    background: root.selected ? (tone == "green" ? #6d8f72 : tone == "blue" ? #7190b5 : #d2ad78) : (touch.has-hover ? #35322e : #282520);
+
+    touch := TouchArea { clicked => { root.clicked(); } }
+
+    Text {
+        x: 16px;
+        width: parent.width - 32px;
+        text: root.text;
+        color: root.selected ? #181512 : #e7dfd5;
+        font-size: 12px;
+        font-weight: 650;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+}
+
+component NavItem inherits Rectangle {
+    in property <string> label;
+    in property <string> mark;
+    in property <bool> active;
+    callback clicked();
+
+    height: 64px;
+    border-radius: 22px;
+    background: root.active ? #d7bd92 : touch.has-hover ? #38342e : #00000000;
+
+    touch := TouchArea { clicked => { root.clicked(); } }
+
+    Text {
+        y: 8px;
+        width: parent.width;
+        text: root.mark;
+        color: root.active ? #21160b : #eee6dd;
+        font-size: 20px;
+        font-weight: 800;
+        horizontal-alignment: center;
+    }
+
+    Text {
+        y: 36px;
+        width: parent.width;
+        text: root.label;
+        color: root.active ? #21160b : #d8d0c7;
+        font-size: 11px;
+        horizontal-alignment: center;
+    }
+}
+
+component StatusBadge inherits Rectangle {
+    in property <string> text;
+    in property <string> status;
+
+    height: 24px;
+    width: 76px;
+    border-radius: 12px;
+    background: status == "matched" ? #6d8f72 : status == "tentative" ? #d2ad78 : status == "ignored" ? #7f756a : #9f5f67;
+
+    Text {
+        text: root.text;
+        color: #16130f;
+        font-size: 11px;
+        font-weight: 700;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+}
+
+component PosterCard inherits Rectangle {
+    in property <UiMediaCard> card;
+    in property <bool> selected;
+    callback clicked(int);
+
+    width: 176px;
+    height: 332px;
+    border-radius: 18px;
+    background: touch.has-hover ? #302d29 : #26231f;
+    border-width: root.selected ? 2px : touch.has-hover ? 1px : 0px;
+    border-color: root.selected ? #d9bb8d : #7b715f;
+
+    touch := TouchArea { clicked => { root.clicked(root.card.media_id); } }
+
+    Rectangle {
+        x: 10px;
+        y: 10px;
+        width: 156px;
+        height: 234px;
+        border-radius: 14px;
+        background: root.card.has_cached_poster ? #211f1d : #3b4642;
+        Image {
+            width: parent.width;
+            height: parent.height;
+            source: root.card.poster_image;
+            image-fit: cover;
+        }
+        Rectangle {
+            y: parent.height - 44px;
+            width: parent.width;
+            height: 44px;
+            background: touch.has-hover ? #00000088 : #00000000;
+        }
+        if !root.card.has_cached_poster : Text {
+            text: "No Poster";
+            color: #d7cec2;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+            font-weight: 700;
+        }
+        if touch.has-hover : Text {
+            text: "Play";
+            color: #ffffff;
+            font-size: 14px;
+            font-weight: 800;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+        StatusBadge {
+            x: 72px;
+            y: 10px;
+            text: root.card.status_text;
+            status: root.card.match_status;
+        }
+    }
+
+    Text {
+        x: 12px;
+        y: 254px;
+        width: 152px;
+        height: 34px;
+        text: root.card.title;
+        color: #f4eee8;
+        font-size: 14px;
+        font-weight: 750;
+        overflow: elide;
+    }
+
+    Text {
+        x: 12px;
+        y: 290px;
+        width: 152px;
+        height: 18px;
+        text: root.card.subtitle;
+        color: #b9afa5;
+        font-size: 11px;
+        overflow: elide;
+    }
+
+    Rectangle {
+        x: 12px;
+        y: 316px;
+        width: 152px;
+        height: 5px;
+        border-radius: 3px;
+        background: #4a4640;
+        Rectangle {
+            height: 5px;
+            border-radius: 3px;
+            width: parent.width * root.card.progress_percent / 100;
+            background: #d8bb8c;
+        }
+    }
+}
+
+component StatCard inherits Rectangle {
+    in property <string> label;
+    in property <string> value;
+    in property <string> hint;
+
+    height: 92px;
+    border-radius: 18px;
+    background: #282520;
+    border-width: 1px;
+    border-color: #413c35;
+
+    Text { x: 18px; y: 14px; text: root.label; color: #b8afa4; font-size: 12px; }
+    Text { x: 18px; y: 36px; text: root.value; color: #f5eee6; font-size: 24px; font-weight: 800; }
+    Text { x: 18px; y: 68px; text: root.hint; color: #d2ad78; font-size: 11px; }
+}
+
+component ContinueRow inherits Rectangle {
+    in property <UiMediaCard> card;
+    callback clicked(int);
+
+    height: 104px;
+    border-radius: 18px;
+    background: touch.has-hover ? #302d29 : #25231f;
+    border-width: 1px;
+    border-color: #403b34;
+
+    touch := TouchArea { clicked => { root.clicked(root.card.media_id); } }
+
+    Rectangle {
+        x: 14px; y: 12px; width: 58px; height: 80px; border-radius: 10px; background: #3d4644;
+        Image { width: parent.width; height: parent.height; source: root.card.poster_image; image-fit: cover; }
+    }
+    Text { x: 88px; y: 18px; width: parent.width - 230px; text: root.card.title; color: #f4eee8; font-size: 16px; font-weight: 750; overflow: elide; }
+    Text { x: 88px; y: 45px; width: parent.width - 230px; text: root.card.episode_text == "" ? root.card.subtitle : root.card.episode_text; color: #b8afa4; font-size: 12px; overflow: elide; }
+    Rectangle {
+        x: 88px; y: 76px; width: parent.width - 250px; height: 6px; border-radius: 3px; background: #4c4740;
+        Rectangle { height: 6px; border-radius: 3px; width: parent.width * root.card.progress_percent / 100; background: #86a789; }
+    }
+    TonalButton { x: parent.width - 144px; y: 32px; width: 124px; text: "Continue"; primary: true; clicked => { root.clicked(root.card.media_id); } }
+}
+
+component CandidateRow inherits Rectangle {
+    in property <UiCandidate> candidate;
+    callback clicked(int);
+
+    height: 96px;
+    border-radius: 16px;
+    background: candidate.selected ? #3b3428 : touch.has-hover ? #302d29 : #25231f;
+    border-width: candidate.selected ? 2px : 1px;
+    border-color: candidate.selected ? #d8bb8c : #403b34;
+
+    touch := TouchArea { clicked => { root.clicked(root.candidate.candidate_id); } }
+
+    Text { x: 14px; y: 12px; width: parent.width - 28px; text: root.candidate.title; color: #f4eee8; font-size: 14px; font-weight: 750; overflow: elide; }
+    Text { x: 14px; y: 38px; width: parent.width - 28px; text: root.candidate.subtitle + "    score " + root.candidate.score_text; color: #c6bcb0; font-size: 12px; overflow: elide; }
+    Text { x: 14px; y: 64px; width: parent.width - 28px; text: root.candidate.summary; color: #9f968e; font-size: 11px; overflow: elide; }
+}
+
+component SettingsRow inherits Rectangle {
+    in property <string> title;
+    in property <string> subtitle;
+    in property <bool> enabled;
+
+    height: 72px;
+    border-radius: 16px;
+    background: #282520;
+    border-width: 1px;
+    border-color: #403b34;
+
+    Text { x: 18px; y: 14px; width: parent.width - 112px; text: root.title; color: #f0e9df; font-size: 14px; font-weight: 700; overflow: elide; }
+    Text { x: 18px; y: 40px; width: parent.width - 112px; text: root.subtitle; color: #b9afa5; font-size: 12px; overflow: elide; }
+    Rectangle {
+        x: parent.width - 72px; y: 22px; width: 46px; height: 28px; border-radius: 14px;
+        background: root.enabled ? #86a789 : #57504a;
+        Rectangle { x: root.enabled ? 22px : 4px; y: 4px; width: 20px; height: 20px; border-radius: 10px; background: #f7f1e8; }
     }
 }
 
 export component MainWindow inherits Window {
-    width: 1180px;
-    height: 760px;
+    width: 1320px;
+    height: 860px;
     title: "Slint Bangumi";
+    background: #171512;
 
     in-out property <int> active_page: 0;
+    in-out property <bool> detail_open: false;
     in-out property <string> media_path_input;
     in-out property <string> library_search;
     in property <[UiMediaCard]> media_cards;
+    in property <[UiMediaRow]> media_rows;
+    in property <[UiMediaCard]> recent_cards;
     in property <[UiMediaCard]> match_queue;
+    in property <[UiCandidate]> candidates;
     in property <UiSubjectDetail> subject_detail;
+    in property <UiCandidate> candidate_preview;
     in property <[string]> detail_files;
+    in property <[string]> detail_episodes;
     in property <[UiLogLine]> log_lines;
     in-out property <string> scan_progress;
     in-out property <string> metadata_status;
@@ -64,6 +364,7 @@ export component MainWindow inherits Window {
     callback add_media_path(string);
     callback scan_library();
     callback select_media_id(int);
+    callback select_candidate_id(int);
     callback play_selected_media();
     callback save_progress();
     callback clear_progress();
@@ -71,208 +372,342 @@ export component MainWindow inherits Window {
     callback match_selected_metadata();
     callback match_all_metadata();
     callback refresh_subject_images();
-    callback confirm_selected_match();
+    callback confirm_selected_candidate();
+    callback ignore_selected_metadata();
+    callback test_bangumi_connection();
 
     HorizontalBox {
         padding: 0px;
         spacing: 0px;
 
         Rectangle {
-            width: 170px;
-            background: #20242b;
+            width: 96px;
+            background: #201d19dd;
+            border-width: 0px;
 
             VerticalBox {
-                padding: 12px;
-                spacing: 8px;
+                padding-left: 14px;
+                padding-right: 14px;
+                padding-top: 22px;
+                spacing: 14px;
 
-                Text {
-                    text: "Slint Bangumi";
-                    color: #f5f7fa;
-                    font-size: 18px;
-                    font-weight: 700;
+                Rectangle {
+                    height: 52px;
+                    border-radius: 18px;
+                    background: #d8bb8c;
+                    Text { text: "SB"; color: #21160b; font-size: 18px; font-weight: 900; horizontal-alignment: center; vertical-alignment: center; }
                 }
-
-                Button { text: root.active_page == 0 ? "Home *" : "Home"; clicked => { root.active_page = 0; } }
-                Button { text: root.active_page == 1 ? "Library *" : "Library"; clicked => { root.active_page = 1; } }
-                Button { text: root.active_page == 2 ? "Subject *" : "Subject"; clicked => { root.active_page = 2; } }
-                Button { text: root.active_page == 3 ? "Metadata *" : "Metadata"; clicked => { root.active_page = 3; } }
-                Button { text: root.active_page == 4 ? "Settings *" : "Settings"; clicked => { root.active_page = 4; } }
-                Button { text: root.active_page == 5 ? "Activity *" : "Activity"; clicked => { root.active_page = 5; } }
+                NavItem { label: "Home"; mark: "H"; active: root.active_page == 0 && !root.detail_open; clicked => { root.active_page = 0; root.detail_open = false; } }
+                NavItem { label: "Library"; mark: "L"; active: root.active_page == 1 && !root.detail_open; clicked => { root.active_page = 1; root.detail_open = false; } }
+                NavItem { label: "Settings"; mark: "S"; active: root.active_page == 3 && !root.detail_open; clicked => { root.active_page = 3; root.detail_open = false; } }
             }
         }
 
         Rectangle {
-            background: #f5f6f8;
+            background: #171512;
 
-            VerticalBox {
-                padding: 14px;
-                spacing: 10px;
+            if root.detail_open : VerticalBox {
+                padding: 24px;
+                spacing: 18px;
 
-                if root.active_page == 0 : VerticalBox {
-                    spacing: 10px;
+                Rectangle {
+                    height: 292px;
+                    border-radius: 28px;
+                    background: root.subject_detail.hero_path == "" ? #2b3230 : #24211d;
+                    Image { width: parent.width; height: parent.height; source: root.subject_detail.hero_image; image-fit: cover; }
+                    Rectangle { width: parent.width; height: parent.height; background: #120f0ab0; }
 
-                    Text { text: "Home"; font-size: 22px; font-weight: 700; color: #1c2430; }
-                    Text { text: root.home_summary; color: #2f3a48; }
-                    Text { text: "Scan: " + root.scan_progress + "    Metadata: " + root.metadata_status; color: #4a5564; }
-
-                    HorizontalBox {
-                        spacing: 8px;
-                        Button { text: "Scan Library"; clicked => { root.scan_library(); } }
-                        Button { text: "Match Metadata"; clicked => { root.match_all_metadata(); } }
-                        Button { text: "Open Library"; clicked => { root.active_page = 1; } }
-                    }
-
-                    Text { text: "Recent activity"; font-weight: 700; color: #1c2430; }
-                    LogList { lines: root.log_lines; }
+                    TonalButton { x: 24px; y: 22px; width: 142px; text: "Back to Library"; clicked => { root.detail_open = false; root.active_page = 1; } }
+                    TonalButton { x: parent.width - 116px; y: 22px; width: 92px; text: "More"; clicked => { } }
+                    Chip { x: 24px; y: 176px; text: root.subject_detail.match_status; selected: true; tone: root.subject_detail.subject_id > 0 ? "green" : "blue"; }
+                    Text { x: 24px; y: 216px; width: parent.width - 48px; text: root.subject_detail.title; color: #fff7ed; font-size: 34px; font-weight: 850; overflow: elide; }
+                    Text { x: 26px; y: 258px; width: parent.width - 52px; text: root.subject_detail.title_cn; color: #d8cfc4; font-size: 15px; overflow: elide; }
                 }
 
-                if root.active_page == 1 : VerticalBox {
-                    spacing: 8px;
-
-                    Text { text: "My Library / 媒体库"; font-size: 22px; font-weight: 700; color: #1c2430; }
-                    Text { text: root.home_summary + "    Scan: " + root.scan_progress; color: #4a5564; }
-
-                    HorizontalBox {
-                        spacing: 8px;
-                        LineEdit { text <=> root.library_search; placeholder-text: "Search title or filename"; }
-                        Button { text: "Title"; }
-                        Button { text: "Date"; }
-                        Button { text: "Status"; }
-                        Button { text: "All"; }
-                        Button { text: "Matched"; }
-                        Button { text: "Unmatched"; }
-                        Button { text: "Grid/List"; }
-                    }
-
-                    ListView {
-                        height: 575px;
-                        for card in root.media_cards : Button {
-                            text: (card.has_cached_poster ? "[poster cached] " : "[poster placeholder] ")
-                                  + card.title + "\n"
-                                  + card.subtitle + "    " + card.status_text
-                                  + "    ep: " + (card.episode_text == "" ? "-" : card.episode_text)
-                                  + "    progress: " + card.progress_percent + "%";
-                            clicked => {
-                                root.select_media_id(card.media_id);
-                                root.active_page = 2;
-                            }
-                        }
-                    }
-                }
-
-                if root.active_page == 2 : VerticalBox {
-                    spacing: 8px;
+                HorizontalBox {
+                    spacing: 22px;
 
                     Rectangle {
-                        height: 92px;
-                        background: root.subject_detail.hero_path == "" ? #d7dde6 : #c6d8ed;
-                        Text {
-                            x: 14px;
-                            y: 14px;
-                            text: root.subject_detail.hero_path == "" ? "hero placeholder" : "hero cached: " + root.subject_detail.hero_path;
-                            color: #1c2430;
-                        }
+                        width: 202px;
+                        height: 304px;
+                        border-radius: 22px;
+                        background: #343b38;
+                        border-width: 1px;
+                        border-color: #554d43;
+                        Image { width: parent.width; height: parent.height; source: root.subject_detail.poster_image; image-fit: cover; }
+                        if root.subject_detail.poster_path == "" : Text { text: "Poster"; color: #d8d0c7; font-weight: 800; horizontal-alignment: center; vertical-alignment: center; }
                     }
 
-                    HorizontalBox {
+                    VerticalBox {
                         spacing: 14px;
 
-                        Rectangle {
-                            width: 150px;
-                            height: 220px;
-                            background: root.subject_detail.poster_path == "" ? #d8dce3 : #bfd1e5;
-                            Text {
-                                x: 10px;
-                                y: 10px;
-                                width: 130px;
-                                text: root.subject_detail.poster_path == "" ? "poster placeholder" : "poster cached";
-                                color: #1c2430;
+                        HorizontalBox {
+                            spacing: 10px;
+                            Chip { text: root.subject_detail.air_date; selected: false; }
+                            Chip { text: "Rating " + root.subject_detail.rating_text; selected: false; tone: "green"; }
+                            Chip { text: "Rank " + root.subject_detail.rank_text; selected: false; tone: "blue"; }
+                        }
+
+                        TextEdit {
+                            height: 136px;
+                            text: root.subject_detail.summary;
+                            read-only: true;
+                        }
+
+                        HorizontalBox {
+                            spacing: 10px;
+                            TonalButton { text: "Play"; primary: true; clicked => { root.play_selected_media(); } }
+                            TonalButton { text: "Continue"; primary: true; clicked => { root.play_selected_media(); } }
+                            TonalButton { text: "Load Danmaku"; clicked => { root.load_danmaku(); } }
+                            TonalButton { text: "Rematch"; clicked => { root.match_selected_metadata(); root.active_page = 2; } }
+                            TonalButton { text: "Confirm"; clicked => { root.confirm_selected_candidate(); } }
+                            TonalButton { text: "Ignore"; danger: true; clicked => { root.ignore_selected_metadata(); } }
+                        }
+
+                        HorizontalBox {
+                            spacing: 18px;
+                            VerticalBox {
+                                Text { text: "Local Files"; color: #f3ece3; font-size: 18px; font-weight: 800; }
+                                ListView {
+                                    height: 170px;
+                                    for file in root.detail_files : Rectangle {
+                                        height: 42px;
+                                        border-radius: 12px;
+                                        background: #25231f;
+                                        Text { x: 14px; width: parent.width - 100px; text: file; color: #d7cec2; font-size: 12px; overflow: elide; vertical-alignment: center; }
+                                        TonalButton { x: parent.width - 82px; y: 6px; width: 70px; height: 30px; text: "Play"; primary: true; clicked => { root.play_selected_media(); } }
+                                    }
+                                }
                             }
-                        }
-
-                        VerticalBox {
-                            spacing: 6px;
-                            Text { text: root.subject_detail.title; font-size: 22px; font-weight: 700; color: #1c2430; }
-                            Text { text: root.subject_detail.title_cn; color: #4a5564; }
-                            Text { text: "Air date: " + root.subject_detail.air_date + "    Rating: " + root.subject_detail.rating_text + "    Rank: " + root.subject_detail.rank_text; color: #4a5564; }
-                            Text { text: "Match: " + root.subject_detail.match_status + "    Cache: " + root.subject_detail.cache_status; color: #4a5564; }
-                            TextEdit { height: 145px; text: root.subject_detail.summary; read-only: true; }
-                        }
-                    }
-
-                    HorizontalBox {
-                        spacing: 8px;
-                        Button { text: "Play"; clicked => { root.play_selected_media(); } }
-                        Button { text: "Load Danmaku"; clicked => { root.load_danmaku(); } }
-                        Button { text: "Rematch"; clicked => { root.match_selected_metadata(); } }
-                        Button { text: "Confirm Match"; clicked => { root.confirm_selected_match(); } }
-                        Button { text: "Cache Images"; clicked => { root.refresh_subject_images(); } }
-                        Button { text: "Save Test Progress"; clicked => { root.save_progress(); } }
-                        Button { text: "Clear Progress"; clicked => { root.clear_progress(); } }
-                    }
-
-                    HorizontalBox {
-                        spacing: 12px;
-                        VerticalBox {
-                            Text { text: "Local files"; font-weight: 700; color: #1c2430; }
-                            ListView {
-                                height: 190px;
-                                for file in root.detail_files : Text { text: file; color: #2f3a48; }
-                            }
-                        }
-                        VerticalBox {
-                            Text { text: "Episodes / Candidates"; font-weight: 700; color: #1c2430; }
-                            Text { text: root.subject_detail.subject_id == 0 ? "未匹配：使用 Rematch 搜索 Bangumi，并将第一个候选保存为待确认。" : "分集列表和候选切换接口已预留。"; color: #4a5564; }
-                        }
-                    }
-                }
-
-                if root.active_page == 3 : VerticalBox {
-                    spacing: 8px;
-                    Text { text: "Metadata / Match Queue"; font-size: 22px; font-weight: 700; color: #1c2430; }
-                    Text { text: root.metadata_status; color: #4a5564; }
-                    HorizontalBox {
-                        spacing: 8px;
-                        Button { text: "Match All"; clicked => { root.match_all_metadata(); } }
-                        Button { text: "Retry Failed"; clicked => { root.match_all_metadata(); } }
-                        Button { text: "Clear Completed Jobs"; }
-                    }
-                    Text { text: "Unmatched / tentative queue"; font-weight: 700; color: #1c2430; }
-                    ListView {
-                        height: 560px;
-                        for card in root.match_queue : Button {
-                            text: card.title + "\n" + card.subtitle + "    " + card.status_text;
-                            clicked => {
-                                root.select_media_id(card.media_id);
-                                root.active_page = 2;
+                            VerticalBox {
+                                Text { text: "Episodes"; color: #f3ece3; font-size: 18px; font-weight: 800; }
+                                ListView {
+                                    height: 170px;
+                                    for episode in root.detail_episodes : Rectangle {
+                                        height: 38px;
+                                        border-radius: 12px;
+                                        background: #25231f;
+                                        Text { x: 14px; width: parent.width - 28px; text: episode; color: #d7cec2; font-size: 12px; overflow: elide; vertical-alignment: center; }
+                                    }
+                                }
                             }
                         }
                     }
                 }
 
-                if root.active_page == 4 : VerticalBox {
-                    spacing: 8px;
-                    Text { text: "Settings"; font-size: 22px; font-weight: 700; color: #1c2430; }
-                    HorizontalBox {
-                        spacing: 8px;
-                        LineEdit { text <=> root.media_path_input; placeholder-text: "Add local media folder"; }
-                        Button { text: "Add Path"; clicked => { root.add_media_path(root.media_path_input); } }
+                if root.subject_detail.subject_id == 0 : HorizontalBox {
+                    spacing: 16px;
+                    VerticalBox {
+                        Text { text: "Search Bangumi"; color: #f3ece3; font-size: 18px; font-weight: 800; }
+                        LineEdit { height: 40px; text <=> root.library_search; placeholder-text: "Search Bangumi candidates"; }
                     }
-                    TextEdit { height: 340px; text: root.settings_summary; read-only: true; }
-                    HorizontalBox {
-                        spacing: 8px;
-                        Button { text: "Scan Library"; clicked => { root.scan_library(); } }
-                        Button { text: "Clear Image Cache"; }
+                    VerticalBox {
+                        Text { text: "Candidates"; color: #f3ece3; font-size: 18px; font-weight: 800; }
+                        ListView {
+                            height: 180px;
+                            for candidate in root.candidates : CandidateRow { candidate: candidate; clicked(id) => { root.select_candidate_id(id); } }
+                        }
                     }
-                    Text { text: "Scan settings and cache size calculation are placeholders in this skeleton."; color: #4a5564; }
-                }
-
-                if root.active_page == 5 : VerticalBox {
-                    spacing: 8px;
-                    Text { text: "Activity"; font-size: 22px; font-weight: 700; color: #1c2430; }
-                    LogList { lines: root.log_lines; }
                 }
             }
+
+            if !root.detail_open && root.active_page == 0 : VerticalBox {
+                padding: 24px;
+                spacing: 22px;
+
+                Rectangle {
+                    height: 330px;
+                    border-radius: 30px;
+                    background: #2d332f;
+                    Image {
+                        width: parent.width;
+                        height: parent.height;
+                        source: root.recent_cards.length > 0 ? root.recent_cards[0].poster_image : @image-url("");
+                        image-fit: cover;
+                    }
+                    Rectangle { width: parent.width; height: parent.height; background: #17120db8; }
+
+                    HorizontalBox {
+                        x: 28px; y: 28px; spacing: 10px;
+                        Chip { text: "New Episode"; selected: true; tone: "green"; }
+                        Chip { text: "Continue"; selected: true; tone: "blue"; }
+                        Chip { text: "Metadata Ready"; selected: true; }
+                    }
+                    Text { x: 30px; y: 116px; width: parent.width - 420px; text: root.recent_cards.length > 0 ? root.recent_cards[0].title : "Slint Bangumi"; color: #fff8ef; font-size: 42px; font-weight: 850; overflow: elide; }
+                    Text { x: 32px; y: 176px; width: parent.width - 480px; height: 70px; text: "A local anime library focused on fast scanning, reliable metadata matching, cached artwork, and direct playback without a web service layer."; color: #dfd5c9; font-size: 15px; wrap: word-wrap; }
+                    HorizontalBox {
+                        x: 32px; y: 258px; spacing: 12px;
+                        TonalButton { text: "Continue Watching"; primary: true; clicked => { if root.recent_cards.length > 0 { root.select_media_id(root.recent_cards[0].media_id); root.detail_open = true; } } }
+                        TonalButton { text: "Add to Queue"; clicked => { root.active_page = 2; } }
+                        TonalButton { text: "More"; clicked => { root.active_page = 1; } }
+                    }
+                }
+
+                HorizontalBox {
+                    spacing: 18px;
+                    StatCard { label: "Indexed Media"; value: root.home_summary; hint: "local SQLite"; }
+                    StatCard { label: "Scan"; value: root.scan_progress; hint: "background task"; }
+                    StatCard { label: "Metadata"; value: root.metadata_status; hint: "Bangumi + dandanplay"; }
+                }
+
+                HorizontalBox {
+                    spacing: 26px;
+                    VerticalBox {
+                        Text { text: "Recently Added"; color: #f4eee8; font-size: 20px; font-weight: 850; }
+                        HorizontalBox {
+                            spacing: 14px;
+                            for card in root.recent_cards : PosterCard {
+                                card: card;
+                                clicked(id) => { root.select_media_id(id); root.detail_open = true; }
+                            }
+                        }
+                    }
+                }
+
+                VerticalBox {
+                    Text { text: "Continue Watching"; color: #f4eee8; font-size: 20px; font-weight: 850; }
+                    ListView {
+                        height: 136px;
+                        for card in root.recent_cards : ContinueRow {
+                            card: card;
+                            clicked(id) => { root.select_media_id(id); root.detail_open = true; }
+                        }
+                    }
+                }
+            }
+
+            if !root.detail_open && root.active_page == 1 : VerticalBox {
+                padding: 24px;
+                spacing: 18px;
+
+                HorizontalBox {
+                    spacing: 14px;
+                    VerticalBox {
+                        Text { text: "My Library / 媒体库"; color: #f4eee8; font-size: 30px; font-weight: 850; }
+                        Text { text: root.home_summary; color: #b8afa4; font-size: 13px; }
+                    }
+                    TonalButton { text: "Add Folder"; clicked => { root.active_page = 3; } }
+                    TonalButton { text: "Scan"; primary: true; clicked => { root.scan_library(); } }
+                }
+
+                HorizontalBox {
+                    spacing: 10px;
+                    LineEdit { height: 40px; text <=> root.library_search; placeholder-text: "Search title, filename, tag"; }
+                    Chip { text: "All"; selected: true; }
+                    Chip { text: "Watching"; selected: false; }
+                    Chip { text: "Completed"; selected: false; }
+                    Chip { text: "Unmatched"; selected: false; tone: "blue"; }
+                    Chip { text: "Tentative"; selected: false; }
+                    TonalButton { width: 118px; text: "Title"; }
+                    TonalButton { width: 126px; text: "Date Added"; }
+                    TonalButton { width: 126px; text: "Grid/List"; }
+                }
+
+                if root.media_rows.length == 0 : Rectangle {
+                    height: 520px;
+                    border-radius: 24px;
+                    background: #24221f;
+                    Text { y: 190px; width: parent.width; text: "No media indexed"; color: #f4eee8; font-size: 28px; font-weight: 850; horizontal-alignment: center; }
+                    Text { y: 232px; width: parent.width; text: "Add a folder and run Scan to build the local library."; color: #b8afa4; horizontal-alignment: center; }
+                    TonalButton { x: parent.width / 2 - 77px; y: 278px; text: "Add Folder"; primary: true; clicked => { root.active_page = 3; } }
+                }
+
+                if root.media_rows.length > 0 : ListView {
+                    height: 640px;
+                    for row in root.media_rows : HorizontalBox {
+                        height: 350px;
+                        spacing: 16px;
+                        if row.show0 : PosterCard { card: row.card0; clicked(id) => { root.select_media_id(id); root.detail_open = true; } }
+                        if row.show1 : PosterCard { card: row.card1; clicked(id) => { root.select_media_id(id); root.detail_open = true; } }
+                        if row.show2 : PosterCard { card: row.card2; clicked(id) => { root.select_media_id(id); root.detail_open = true; } }
+                        if row.show3 : PosterCard { card: row.card3; clicked(id) => { root.select_media_id(id); root.detail_open = true; } }
+                        if row.show4 : PosterCard { card: row.card4; clicked(id) => { root.select_media_id(id); root.detail_open = true; } }
+                    }
+                }
+            }
+
+            if !root.detail_open && root.active_page == 2 : HorizontalBox {
+                padding: 24px;
+                spacing: 18px;
+
+                VerticalBox {
+                    Text { text: "Match Queue"; color: #f4eee8; font-size: 28px; font-weight: 850; }
+                    HorizontalBox { spacing: 10px; TonalButton { text: "Match Selected"; primary: true; clicked => { root.match_selected_metadata(); } } TonalButton { text: "Match All"; clicked => { root.match_all_metadata(); } } TonalButton { text: "Ignore"; danger: true; clicked => { root.ignore_selected_metadata(); } } }
+                    ListView {
+                        width: 360px;
+                        height: 720px;
+                        for card in root.match_queue : ContinueRow {
+                            card: card;
+                            clicked(id) => { root.select_media_id(id); }
+                        }
+                    }
+                }
+
+                VerticalBox {
+                    Text { text: "Bangumi Candidates"; color: #f4eee8; font-size: 22px; font-weight: 850; }
+                    ListView {
+                        width: 430px;
+                        height: 720px;
+                        for candidate in root.candidates : CandidateRow {
+                            candidate: candidate;
+                            clicked(id) => { root.select_candidate_id(id); }
+                        }
+                    }
+                }
+
+                VerticalBox {
+                    Text { text: "Preview"; color: #f4eee8; font-size: 22px; font-weight: 850; }
+                    Rectangle {
+                        height: 520px;
+                        border-radius: 22px;
+                        background: #25231f;
+                        Text { x: 22px; y: 22px; width: parent.width - 44px; text: root.candidate_preview.title; color: #f8f1e7; font-size: 22px; font-weight: 850; overflow: elide; }
+                        Text { x: 22px; y: 58px; width: parent.width - 44px; text: root.candidate_preview.subtitle + "    score " + root.candidate_preview.score_text; color: #c7bdb1; font-size: 13px; overflow: elide; }
+                        TextEdit { x: 18px; y: 92px; width: parent.width - 36px; height: 340px; text: root.candidate_preview.summary; read-only: true; }
+                        HorizontalBox { x: 18px; y: 454px; spacing: 10px; TonalButton { text: "Confirm"; primary: true; clicked => { root.confirm_selected_candidate(); } } TonalButton { text: "Cache Images"; clicked => { root.refresh_subject_images(); } } }
+                    }
+                }
+            }
+
+            if !root.detail_open && root.active_page == 3 : HorizontalBox {
+                padding: 24px;
+                spacing: 20px;
+
+                VerticalBox {
+                    width: 220px;
+                    Text { text: "Settings"; color: #f4eee8; font-size: 30px; font-weight: 850; }
+                    Chip { text: "Media Libraries"; selected: true; }
+                    Chip { text: "Match"; selected: false; }
+                    Chip { text: "API"; selected: false; }
+                    Chip { text: "About"; selected: false; }
+                    Rectangle { height: 100px; }
+                    Text { text: "Theme swatches"; color: #b8afa4; font-size: 12px; }
+                    HorizontalBox {
+                        spacing: 8px;
+                        Rectangle { width: 44px; height: 44px; border-radius: 14px; background: #f4eee8; }
+                        Rectangle { width: 44px; height: 44px; border-radius: 14px; background: #83796d; }
+                        Rectangle { width: 44px; height: 44px; border-radius: 14px; background: #171512; border-width: 1px; border-color: #5a534a; }
+                    }
+                }
+
+                VerticalBox {
+                    spacing: 14px;
+                    Text { text: "Media Libraries"; color: #f4eee8; font-size: 24px; font-weight: 850; }
+                    HorizontalBox {
+                        spacing: 10px;
+                        LineEdit { height: 42px; text <=> root.media_path_input; placeholder-text: "Add local media folder"; }
+                        TonalButton { text: "Add Folder"; primary: true; clicked => { root.add_media_path(root.media_path_input); } }
+                        TonalButton { text: "Scan Now"; clicked => { root.scan_library(); } }
+                    }
+                    SettingsRow { title: "Auto scan on launch"; subtitle: "Index first, then match metadata in the background."; enabled: true; }
+                    SettingsRow { title: "Bangumi metadata"; subtitle: "Token is stored locally and never displayed in logs."; enabled: true; }
+                    SettingsRow { title: "Cache poster and hero images"; subtitle: "One subject stores one poster and one hero image."; enabled: true; }
+                    SettingsRow { title: "Dandanplay file recognition"; subtitle: "Uses hash and filename when credentials are configured."; enabled: true; }
+                    HorizontalBox { spacing: 10px; TonalButton { text: "Test Bangumi"; clicked => { root.test_bangumi_connection(); } } TonalButton { text: "Match All"; clicked => { root.match_all_metadata(); } } }
+                    TextEdit { height: 250px; text: root.settings_summary; read-only: true; }
+                }
+            }
+
         }
     }
 }

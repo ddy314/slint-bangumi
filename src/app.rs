@@ -29,6 +29,7 @@ impl AppContext {
             media: MediaService::new(config.clone(), repository.clone(), events.clone()),
             watch_history: WatchHistoryService::new(repository.clone(), events.clone()),
             metadata: MetadataService::new(
+                config.clone(),
                 repository.clone(),
                 danmaku.clone(),
                 database_path,
