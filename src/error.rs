@@ -17,10 +17,10 @@ pub enum AppError {
     },
     #[error("http error: {0}")]
     Http(#[from] reqwest::Error),
+    #[error("json error: {0}")]
+    Json(#[from] serde_json::Error),
     #[error("api error: {0}")]
     Api(String),
-    #[error("ui error: {0}")]
-    Ui(#[from] slint::PlatformError),
     #[error("media path is not a directory: {0}")]
     InvalidMediaDirectory(PathBuf),
     #[error("selected media item was not found")]

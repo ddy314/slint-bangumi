@@ -1,7 +1,7 @@
 media_libraries = []
 
 [database]
-path = "data/slint-bangumi.sqlite3"
+path = "data/nexplay.sqlite3"
 
 [dandanplay]
 app_id = ""
@@ -12,7 +12,7 @@ api_key = ""
 enabled = true
 base_url = "https://api.bgm.tv"
 access_token = ""
-user_agent = "slint-bangumi/0.1.0"
+user_agent = "NexPlay/0.1.0"
 request_timeout_secs = 20
 auto_match = true
 cache_images = true

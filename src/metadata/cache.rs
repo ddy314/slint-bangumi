@@ -16,7 +16,7 @@ impl ImageCache {
     pub fn new(root: PathBuf) -> AppResult<Self> {
         let client = Client::builder()
             .timeout(Duration::from_secs(30))
-            .user_agent(concat!("slint-bangumi/", env!("CARGO_PKG_VERSION")))
+            .user_agent(concat!("NexPlay/", env!("CARGO_PKG_VERSION")))
             .build()?;
         Ok(Self { root, client })
     }

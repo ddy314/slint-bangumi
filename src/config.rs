@@ -45,7 +45,7 @@ impl Default for BangumiConfig {
             enabled: true,
             base_url: "https://api.bgm.tv".to_string(),
             access_token: String::new(),
-            user_agent: format!("slint-bangumi/{}", env!("CARGO_PKG_VERSION")),
+            user_agent: format!("NexPlay/{}", env!("CARGO_PKG_VERSION")),
             request_timeout_secs: 20,
             auto_match: true,
             cache_images: true,
@@ -62,7 +62,7 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             database: DatabaseConfig {
-                path: PathBuf::from("data/slint-bangumi.sqlite3"),
+                path: PathBuf::from("data/nexplay.sqlite3"),
             },
             media_libraries: Vec::new(),
             dandanplay: DandanplayConfig {

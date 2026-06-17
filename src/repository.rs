@@ -4,8 +4,8 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::domain::{
     DanmakuMatch, MediaFile, MediaItem, MetadataCandidate, ScanUpsertStatus, Subject,
-    SubjectEpisode, SubjectImageCache, UiCandidateData, UiMediaCardData, UiSubjectDetailData,
-    WatchProgress,
+    SubjectEpisode, SubjectImageCache, UiCandidateData, UiMediaCardData, UiSeriesCardData,
+    UiSubjectDetailData, WatchProgress,
 };
 use crate::error::AppResult;
 use crate::metadata::provider::{SubjectDetail, SubjectSearchResult};
@@ -172,6 +172,17 @@ impl Repository {
                 updated_at INTEGER NOT NULL,
                 FOREIGN KEY(media_id) REFERENCES media_items(id) ON DELETE CASCADE
             );
+
+            CREATE TABLE IF NOT EXISTS external_subject_mappings (
+                provider TEXT NOT NULL,
+                external_id TEXT NOT NULL,
+                subject_id INTEGER NOT NULL,
+                title TEXT,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY(provider, external_id),
+                FOREIGN KEY(subject_id) REFERENCES subjects(id) ON DELETE CASCADE
+            );
             "#,
         )?;
         add_column_if_missing(
@@ -181,6 +192,63 @@ impl Repository {
             "INTEGER NOT NULL DEFAULT 0",
         )?;
         Ok(())
+    }
+
+    pub fn list_series_cards(&self) -> AppResult<Vec<UiSeriesCardData>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT
+                s.id,
+                s.title,
+                COALESCE(s.title_cn, ''),
+                COALESCE(s.summary, ''),
+                COALESCE(s.air_date, ''),
+                s.rating,
+                s.rank,
+                COALESCE(s.tags, '[]'),
+                COALESCE(poster.local_path, ''),
+                COALESCE(hero.local_path, ''),
+                COUNT(DISTINCT m.id),
+                COUNT(DISTINCT e.id),
+                COUNT(DISTINCT mel.episode_id),
+                COALESCE(SUM(m.file_size), 0),
+                COALESCE(MAX(m.file_name), '')
+            FROM subjects s
+            JOIN media_subject_links l ON l.subject_id = s.id
+            JOIN media_items m ON m.id = l.media_id AND m.deleted_at IS NULL
+            LEFT JOIN episodes e ON e.subject_id = s.id
+            LEFT JOIN media_episode_links mel ON mel.media_id = m.id
+            LEFT JOIN subject_image_cache poster
+                ON poster.subject_id = s.id AND poster.image_kind = 'poster'
+            LEFT JOIN subject_image_cache hero
+                ON hero.subject_id = s.id AND hero.image_kind = 'hero'
+            GROUP BY s.id
+            ORDER BY COALESCE(NULLIF(s.title_cn, ''), s.title) COLLATE NOCASE
+            "#,
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let tags_json: String = row.get(7)?;
+            let tags = serde_json::from_str::<Vec<String>>(&tags_json).unwrap_or_default();
+            Ok(UiSeriesCardData {
+                subject_id: row.get(0)?,
+                title: row.get(1)?,
+                title_cn: row.get(2)?,
+                summary: row.get(3)?,
+                air_date: row.get(4)?,
+                rating: row.get(5)?,
+                rank: row.get(6)?,
+                tags,
+                poster_path: row.get(8)?,
+                hero_path: row.get(9)?,
+                file_count: row.get::<_, i64>(10)? as usize,
+                episode_count: row.get::<_, i64>(11)? as usize,
+                linked_episode_count: row.get::<_, i64>(12)? as usize,
+                total_size: row.get::<_, i64>(13)? as u64,
+                latest_file_name: row.get(14)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
     pub fn list_media(&self, include_deleted: bool) -> AppResult<Vec<MediaItem>> {
@@ -762,6 +830,45 @@ impl Repository {
                 local_path.to_string_lossy(),
                 now
             ],
+        )?;
+        Ok(())
+    }
+
+    pub fn external_subject_mapping(
+        &self,
+        provider: &str,
+        external_id: &str,
+    ) -> AppResult<Option<i64>> {
+        let conn = self.connect()?;
+        conn.query_row(
+            "SELECT subject_id FROM external_subject_mappings WHERE provider = ?1 AND external_id = ?2",
+            params![provider, external_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn upsert_external_subject_mapping(
+        &self,
+        provider: &str,
+        external_id: &str,
+        subject_id: i64,
+        title: Option<&str>,
+        now: i64,
+    ) -> AppResult<()> {
+        let conn = self.connect()?;
+        conn.execute(
+            r#"
+            INSERT INTO external_subject_mappings
+                (provider, external_id, subject_id, title, created_at, updated_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?5)
+            ON CONFLICT(provider, external_id) DO UPDATE SET
+                subject_id = excluded.subject_id,
+                title = excluded.title,
+                updated_at = excluded.updated_at
+            "#,
+            params![provider, external_id, subject_id, title, now],
         )?;
         Ok(())
     }
@@ -1379,7 +1486,7 @@ mod tests {
     #[test]
     fn upserts_media_and_persists_watch_progress() {
         let db_path =
-            std::env::temp_dir().join(format!("slint-bangumi-test-{}.sqlite3", std::process::id()));
+            std::env::temp_dir().join(format!("nexplay-test-{}.sqlite3", std::process::id()));
         let _ = fs::remove_file(&db_path);
 
         let repository = Repository::new(db_path.clone());

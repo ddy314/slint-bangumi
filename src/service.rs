@@ -16,6 +16,7 @@ use crate::domain::{
 use crate::error::{AppError, AppResult};
 use crate::metadata::bangumi::BangumiProvider;
 use crate::metadata::cache::ImageCache;
+use crate::metadata::provider::{MetadataProvider, SubjectDetail};
 use crate::repository::Repository;
 use crate::task::{self, AppEvent};
 
@@ -26,7 +27,7 @@ pub struct MediaService {
     events: mpsc::Sender<AppEvent>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize)]
 pub struct SettingsFlags {
     pub bangumi_enabled: bool,
     pub bangumi_auto_match: bool,
@@ -59,6 +60,10 @@ impl MediaService {
 
     pub fn list_media_cards(&self) -> AppResult<Vec<UiMediaCardData>> {
         self.repository.list_media_cards()
+    }
+
+    pub fn list_series_cards(&self) -> AppResult<Vec<crate::domain::UiSeriesCardData>> {
+        self.repository.list_series_cards()
     }
 
     pub fn library_counts(&self) -> AppResult<(usize, usize, usize)> {
@@ -148,6 +153,19 @@ impl MediaService {
         }
 
         task::spawn_media_scan(self.repository.clone(), roots, self.events.clone());
+    }
+
+    pub fn scan_now(&self) -> AppResult<crate::domain::ScanSummary> {
+        let roots = self.config.snapshot().media_libraries;
+        if roots.is_empty() {
+            self.send_log("no media library paths configured".to_string());
+            return Ok(crate::domain::ScanSummary::default());
+        }
+
+        let (summary, _) =
+            task::scan_media_blocking(self.repository.clone(), &roots, &self.events)
+                .map_err(AppError::Api)?;
+        Ok(summary)
     }
 
     fn send_log(&self, message: String) {
@@ -377,6 +395,136 @@ impl MetadataService {
         self.repository.tentative_count()
     }
 
+    pub fn scrape_library_blocking(&self) -> AppResult<usize> {
+        let media = self.repository.unmatched_media()?;
+        if media.is_empty() {
+            return Ok(0);
+        }
+
+        let provider = self.provider()?;
+        let mut groups = std::collections::BTreeMap::<i64, Vec<(MediaItem, DanmakuMatch)>>::new();
+        let mut scraped = 0;
+
+        for item in media {
+            match self.danmaku.cached_or_match_dandanplay(&item) {
+                Ok(Some(match_result)) if match_result.exact => {
+                    if let Some(anime_id) = match_result.anime_id {
+                        groups
+                            .entry(anime_id)
+                            .or_default()
+                            .push((item, match_result));
+                    }
+                }
+                Ok(Some(_)) | Ok(None) => {
+                    return Err(AppError::Api(format!(
+                        "dandanplay did not exact-match media #{} ({})",
+                        item.id, item.file_name
+                    )));
+                }
+                Err(error) => {
+                    return Err(AppError::Api(format!(
+                        "dandanplay match failed for {}: {error}",
+                        item.file_name
+                    )));
+                }
+            }
+        }
+
+        for (anime_id, items) in groups {
+            let subject_id = self.resolve_bangumi_subject_for_dandanplay_group(
+                &provider,
+                anime_id,
+                &items,
+            )?;
+            for (media, danmaku) in items {
+                let now = task::unix_timestamp_ms();
+                self.repository.link_media_subject(
+                    media.id,
+                    subject_id,
+                    "dandanplay_anime_mapping",
+                    if danmaku.exact { 0.98 } else { 0.78 },
+                    true,
+                    now,
+                )?;
+                self.repository.link_media_episode_by_number(
+                    media.id,
+                    subject_id,
+                    episode_number_from_danmaku(&danmaku),
+                    danmaku.episode.as_deref(),
+                    if danmaku.exact { 0.98 } else { 0.78 },
+                    now,
+                )?;
+                scraped += 1;
+            }
+        }
+
+        Ok(scraped)
+    }
+
+    fn resolve_bangumi_subject_for_dandanplay_group(
+        &self,
+        provider: &BangumiProvider,
+        anime_id: i64,
+        items: &[(MediaItem, DanmakuMatch)],
+    ) -> AppResult<i64> {
+        let external_id = anime_id.to_string();
+        if let Some(subject_id) = self
+            .repository
+            .external_subject_mapping("dandanplay", &external_id)?
+        {
+            return Ok(subject_id);
+        }
+
+        let keyword = items
+            .iter()
+            .find_map(|(_, danmaku)| danmaku.anime_title.as_deref())
+            .or_else(|| items.first().map(|(_, danmaku)| danmaku.title.as_str()))
+            .unwrap_or("");
+        let candidates = provider.search_subjects(keyword)?;
+        let Some(candidate) = choose_bangumi_candidate(keyword, &candidates) else {
+            return Err(AppError::Api(format!(
+                "bangumi subject not found for dandanplay anime #{anime_id}: {keyword}"
+            )));
+        };
+
+        let detail = provider.get_subject(&candidate.provider_subject_id)?;
+        let subject_id = self.upsert_subject_detail_with_children(provider, &detail)?;
+        self.repository.upsert_external_subject_mapping(
+            "dandanplay",
+            &external_id,
+            subject_id,
+            detail.title_cn.as_deref().or(Some(detail.title.as_str())),
+            task::unix_timestamp_ms(),
+        )?;
+        Ok(subject_id)
+    }
+
+    fn upsert_subject_detail_with_children(
+        &self,
+        provider: &BangumiProvider,
+        detail: &SubjectDetail,
+    ) -> AppResult<i64> {
+        let subject_id = self
+            .repository
+            .upsert_subject_detail(detail, task::unix_timestamp_ms())?;
+        if let Ok(episodes) = provider.get_episodes(&detail.provider_subject_id) {
+            self.repository
+                .upsert_subject_episodes(subject_id, &episodes)?;
+        }
+        cache_subject_images_once(
+            &self.repository,
+            &self.image_cache,
+            subject_id,
+            &detail.provider,
+            [
+                ("poster", detail.images.common.clone()),
+                ("thumb", detail.images.common.clone()),
+                ("hero", detail.images.large.clone()),
+            ],
+        )?;
+        Ok(subject_id)
+    }
+
     pub fn test_bangumi_connection(&self) {
         match self
             .provider()
@@ -463,6 +611,75 @@ fn image_cache_root(database_path: &std::path::Path) -> PathBuf {
         .unwrap_or_else(|| std::path::Path::new("data"))
         .join("cache")
         .join("images")
+}
+
+fn choose_bangumi_candidate<'a>(
+    keyword: &str,
+    candidates: &'a [crate::metadata::provider::SubjectSearchResult],
+) -> Option<&'a crate::metadata::provider::SubjectSearchResult> {
+    let normalized_keyword = normalize_title(keyword);
+    candidates
+        .iter()
+        .find(|candidate| {
+            candidate
+                .title_cn
+                .as_deref()
+                .map(normalize_title)
+                .as_deref()
+                == Some(normalized_keyword.as_str())
+                || normalize_title(&candidate.title) == normalized_keyword
+        })
+        .or_else(|| candidates.first())
+}
+
+fn normalize_title(value: &str) -> String {
+    value
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect::<String>()
+        .to_ascii_lowercase()
+}
+
+fn episode_number_from_danmaku(danmaku: &DanmakuMatch) -> Option<f64> {
+    danmaku
+        .episode
+        .as_deref()
+        .and_then(extract_episode_number)
+        .or_else(|| danmaku.episode_id.map(|id| (id % 1000) as f64).filter(|v| *v > 0.0))
+}
+
+fn extract_episode_number(value: &str) -> Option<f64> {
+    let mut digits = String::new();
+    let mut started = false;
+    for ch in value.chars() {
+        if ch.is_ascii_digit() || (started && ch == '.') {
+            started = true;
+            digits.push(ch);
+        } else if started {
+            break;
+        }
+    }
+    digits.parse().ok()
+}
+
+fn cache_subject_images_once<'a>(
+    repository: &Repository,
+    image_cache: &ImageCache,
+    subject_id: i64,
+    provider: &str,
+    images: impl IntoIterator<Item = (&'a str, Option<String>)>,
+) -> AppResult<()> {
+    for (kind, url) in images {
+        let Some(url) = url.filter(|url| !url.trim().is_empty()) else {
+            continue;
+        };
+        if repository.get_image_cache(subject_id, kind)?.is_some() {
+            continue;
+        }
+        let path = image_cache.download_subject_image(provider, subject_id, kind, &url)?;
+        repository.upsert_image_cache(subject_id, kind, &url, &path, task::unix_timestamp_ms())?;
+    }
+    Ok(())
 }
 
 fn open_with_default_player(path: &PathBuf) -> AppResult<()> {
@@ -552,7 +769,7 @@ impl DanmakuService {
     ) -> AppResult<Self> {
         let client = Client::builder()
             .timeout(Duration::from_secs(20))
-            .user_agent(concat!("slint-bangumi/", env!("CARGO_PKG_VERSION")))
+            .user_agent(concat!("NexPlay/", env!("CARGO_PKG_VERSION")))
             .build()?;
         Ok(Self {
             config,

@@ -74,7 +74,7 @@ pub fn spawn_media_scan(
             roots.len()
         )));
 
-        match scan_media(repository.clone(), &roots, &events) {
+        match scan_media_blocking(repository.clone(), &roots, &events) {
             Ok((summary, media)) => {
                 let _ = events.send(AppEvent::ScanFinished { summary, media });
             }
@@ -85,7 +85,7 @@ pub fn spawn_media_scan(
     });
 }
 
-fn scan_media(
+pub fn scan_media_blocking(
     repository: Repository,
     roots: &[PathBuf],
     events: &mpsc::Sender<AppEvent>,
@@ -256,7 +256,7 @@ mod tests {
         }
 
         let db_path = std::env::temp_dir().join(format!(
-            "slint-bangumi-real-scan-{}.sqlite3",
+            "nexplay-real-scan-{}.sqlite3",
             std::process::id()
         ));
         let _ = fs::remove_file(&db_path);
@@ -265,7 +265,7 @@ mod tests {
         let (events, _receiver) = mpsc::channel();
 
         let (summary, media) =
-            scan_media(repository, &[root], &events).expect("scan real media sample");
+            scan_media_blocking(repository, &[root], &events).expect("scan real media sample");
         assert!(summary.scanned_files > 0);
         assert_eq!(summary.scanned_files, media.len());
 

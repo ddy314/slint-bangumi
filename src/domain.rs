@@ -1,5 +1,7 @@
 use std::path::PathBuf;
 
+use serde::Serialize;
+
 #[derive(Debug, Clone)]
 pub struct MediaItem {
     pub id: i64,
@@ -37,7 +39,7 @@ pub enum ScanUpsertStatus {
     Unchanged,
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, Serialize)]
 pub struct ScanSummary {
     pub scanned_files: usize,
     pub added: usize,
@@ -116,7 +118,7 @@ pub struct MetadataCandidate {
     pub selected: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct UiMediaCardData {
     pub media_id: i64,
     pub subject_id: i64,
@@ -130,7 +132,26 @@ pub struct UiMediaCardData {
     pub has_cached_poster: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
+pub struct UiSeriesCardData {
+    pub subject_id: i64,
+    pub title: String,
+    pub title_cn: String,
+    pub summary: String,
+    pub air_date: String,
+    pub rating: Option<f64>,
+    pub rank: Option<i64>,
+    pub tags: Vec<String>,
+    pub poster_path: String,
+    pub hero_path: String,
+    pub file_count: usize,
+    pub episode_count: usize,
+    pub linked_episode_count: usize,
+    pub total_size: u64,
+    pub latest_file_name: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct UiSubjectDetailData {
     pub media_id: i64,
     pub subject_id: i64,
@@ -148,7 +169,7 @@ pub struct UiSubjectDetailData {
     pub episodes: Vec<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct UiCandidateData {
     pub candidate_id: i64,
     pub media_id: i64,
