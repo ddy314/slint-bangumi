@@ -439,15 +439,17 @@ impl MetadataService {
                 processed: index,
                 total,
             });
-            if crate::metadata::matcher::is_supplemental_video(&item.file_name) {
-                let _ = self.events.send(AppEvent::Log(format!(
-                    "skip supplemental video for automatic episode binding: #{} {}",
-                    item.id, item.file_name
-                )));
-                continue;
-            }
             match self.danmaku.cached_or_match_dandanplay(&item) {
                 Ok(Some(match_result)) if match_result.exact => {
+                    if crate::metadata::matcher::is_supplemental_video(&item.file_name)
+                        && !is_exact_dandanplay_feature(&match_result)
+                    {
+                        let _ = self.events.send(AppEvent::Log(format!(
+                            "skip supplemental video for automatic episode binding: #{} {}",
+                            item.id, item.file_name
+                        )));
+                        continue;
+                    }
                     if let Some(anime_id) = match_result.anime_id {
                         groups
                             .entry(anime_id)
@@ -569,14 +571,21 @@ impl MetadataService {
             .find_map(|(_, danmaku)| danmaku.anime_title.as_deref())
             .or_else(|| items.first().map(|(_, danmaku)| danmaku.title.as_str()))
             .unwrap_or("");
-        let candidates = provider.search_subjects(keyword)?;
-        let Some(candidate) = choose_bangumi_candidate(keyword, &candidates) else {
+        let mut selected = None;
+        for variant in search_keyword_variants(keyword) {
+            let candidates = provider.search_subjects(&variant)?;
+            if let Some(candidate) = choose_bangumi_candidate(&variant, &candidates) {
+                selected = Some(candidate.provider_subject_id.clone());
+                break;
+            }
+        }
+        let Some(provider_subject_id) = selected else {
             return Err(AppError::Api(format!(
                 "bangumi subject not found for dandanplay anime #{anime_id}: {keyword}"
             )));
         };
 
-        let detail = provider.get_subject(&candidate.provider_subject_id)?;
+        let detail = provider.get_subject(&provider_subject_id)?;
         let resolution = self.upsert_subject_detail_with_children(provider, &detail)?;
         self.repository.upsert_external_subject_mapping(
             "dandanplay",
@@ -773,6 +782,22 @@ fn should_resolve_dandanplay_items_individually(
             .any(|episode| !strip_episode_prefix(episode).trim().is_empty())
 }
 
+fn is_exact_dandanplay_feature(danmaku: &DanmakuMatch) -> bool {
+    if danmaku.anime_id.is_none() || danmaku.episode_id.is_none() {
+        return false;
+    }
+    let text = format!(
+        "{} {} {}",
+        danmaku.anime_title.as_deref().unwrap_or_default(),
+        danmaku.episode.as_deref().unwrap_or_default(),
+        danmaku.title
+    )
+    .to_ascii_lowercase();
+    !["menu", "pv", "cm", "ncop", "nced", "creditless", "textless"]
+        .iter()
+        .any(|marker| text.contains(marker))
+}
+
 fn keyword_variants_for_dandanplay_item(danmaku: &DanmakuMatch) -> Option<Vec<String>> {
     let anime_title = danmaku
         .anime_title
@@ -788,7 +813,7 @@ fn keyword_variants_for_dandanplay_item(danmaku: &DanmakuMatch) -> Option<Vec<St
         .map(|title| title.split_whitespace().collect::<Vec<_>>().join(" "))
         .filter(|title| !title.is_empty())?;
     let primary = format!("{anime_title} {episode_title}");
-    let mut variants = vec![primary.clone()];
+    let mut variants = search_keyword_variants(&primary);
     if primary.contains("空之境界") {
         variants.push(primary.replace("空之境界", "空の境界"));
     }
@@ -801,6 +826,21 @@ fn keyword_variants_for_dandanplay_item(danmaku: &DanmakuMatch) -> Option<Vec<St
     }
     variants.dedup();
     Some(variants)
+}
+
+fn search_keyword_variants(keyword: &str) -> Vec<String> {
+    let mut variants = vec![keyword.trim().to_string()];
+    let plain = keyword
+        .replace(['/', '／', '-', '_'], " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if !plain.is_empty() {
+        variants.push(plain);
+    }
+    variants.retain(|variant| !variant.trim().is_empty());
+    variants.dedup();
+    variants
 }
 
 fn strip_episode_prefix(value: &str) -> String {
