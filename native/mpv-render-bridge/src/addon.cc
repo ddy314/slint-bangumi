@@ -77,9 +77,13 @@ bool EnsurePlayer(std::string& error) {
   mpv_set_option_string(player->handle, "idle", "yes");
   mpv_set_option_string(player->handle, "keep-open", "yes");
   mpv_set_option_string(player->handle, "sub-auto", "fuzzy");
+  mpv_set_option_string(player->handle, "sub-ass", "yes");
+  mpv_set_option_string(player->handle, "embeddedfonts", "yes");
+  mpv_set_option_string(player->handle, "sub-scale-by-window", "yes");
   mpv_set_option_string(player->handle, "audio-display", "no");
   mpv_set_option_string(player->handle, "input-default-bindings", "yes");
   mpv_set_option_string(player->handle, "video-timing-offset", "0");
+  mpv_set_option_string(player->handle, "hr-seek", "yes");
 
   int code = mpv_initialize(player->handle);
   if (code < 0) {
@@ -130,6 +134,10 @@ bool SetPropertyString(NativePlayer& player, const char* property, const std::st
 
 bool GetPropertyDouble(NativePlayer& player, const char* property, double& value) {
   return mpv_get_property(player.handle, property, MPV_FORMAT_DOUBLE, &value) >= 0;
+}
+
+bool GetPropertyInt64(NativePlayer& player, const char* property, int64_t& value) {
+  return mpv_get_property(player.handle, property, MPV_FORMAT_INT64, &value) >= 0;
 }
 
 bool GetPropertyFlag(NativePlayer& player, const char* property, bool& value) {
@@ -245,6 +253,9 @@ napi_value PlayerState(napi_env env) {
   double duration = 0;
   double position = 0;
   double volume = 0;
+  double fps = 0;
+  int64_t video_width = 0;
+  int64_t video_height = 0;
   bool paused = false;
   if (GetPropertyDouble(*g_player, "duration", duration)) {
     SetNumber(env, result, "duration", duration);
@@ -257,6 +268,15 @@ napi_value PlayerState(napi_env env) {
   }
   if (GetPropertyDouble(*g_player, "volume", volume)) {
     SetNumber(env, result, "volume", volume);
+  }
+  if (GetPropertyDouble(*g_player, "estimated-vf-fps", fps) && fps > 0) {
+    SetNumber(env, result, "fps", fps);
+  }
+  if (GetPropertyInt64(*g_player, "width", video_width) && video_width > 0) {
+    SetNumber(env, result, "videoWidth", static_cast<double>(video_width));
+  }
+  if (GetPropertyInt64(*g_player, "height", video_height) && video_height > 0) {
+    SetNumber(env, result, "videoHeight", static_cast<double>(video_height));
   }
   return result;
 }
@@ -279,6 +299,10 @@ bool GetBoolArg(napi_env env, napi_value value, bool fallback) {
   bool result = fallback;
   napi_get_value_bool(env, value, &result);
   return result;
+}
+
+void FinalizeFrameBuffer(napi_env, void* data, void*) {
+  delete[] static_cast<uint8_t*>(data);
 }
 
 napi_value GetBuildInfo(napi_env env, napi_callback_info) {
@@ -431,8 +455,8 @@ napi_value RenderFrame(napi_env env, napi_callback_info info) {
     return ErrorObject(env, "renderFrame", "width and height are required");
   }
 
-  const int width = std::clamp(static_cast<int>(GetNumberArg(env, args[0], 640)), 2, 1920);
-  const int height = std::clamp(static_cast<int>(GetNumberArg(env, args[1], 360)), 2, 1080);
+  const int width = std::clamp(static_cast<int>(GetNumberArg(env, args[0], 640)), 2, 3840);
+  const int height = std::clamp(static_cast<int>(GetNumberArg(env, args[1], 360)), 2, 2160);
 
   std::string error;
   if (!EnsurePlayer(error)) {
@@ -443,7 +467,9 @@ napi_value RenderFrame(napi_env env, napi_callback_info info) {
   }
   mpv_render_context_update(g_player->render_context);
 
-  std::vector<uint8_t> pixels(static_cast<size_t>(width) * static_cast<size_t>(height) * 4);
+  const size_t pixel_count = static_cast<size_t>(width) * static_cast<size_t>(height);
+  const size_t byte_count = pixel_count * 4;
+  auto* pixels = new uint8_t[byte_count];
   const int size[] = {width, height};
   size_t stride = static_cast<size_t>(width) * 4;
   char format[] = "rgb0";
@@ -451,16 +477,17 @@ napi_value RenderFrame(napi_env env, napi_callback_info info) {
     {MPV_RENDER_PARAM_SW_SIZE, const_cast<int*>(size)},
     {MPV_RENDER_PARAM_SW_FORMAT, format},
     {MPV_RENDER_PARAM_SW_STRIDE, &stride},
-    {MPV_RENDER_PARAM_SW_POINTER, pixels.data()},
+    {MPV_RENDER_PARAM_SW_POINTER, pixels},
     {MPV_RENDER_PARAM_INVALID, nullptr},
   };
   const int code = mpv_render_context_render(g_player->render_context, params);
   if (code < 0) {
+    delete[] pixels;
     return ErrorObject(env, "mpv_render_context_render", MpvError(code));
   }
   mpv_render_context_report_swap(g_player->render_context);
 
-  for (size_t index = 3; index < pixels.size(); index += 4) {
+  for (size_t index = 3; index < byte_count; index += 4) {
     pixels[index] = 255;
   }
 
@@ -471,9 +498,8 @@ napi_value RenderFrame(napi_env env, napi_callback_info info) {
   SetNumber(env, result, "height", height);
   SetNumber(env, result, "stride", static_cast<double>(stride));
 
-  void* buffer_data = nullptr;
   napi_value buffer;
-  napi_create_buffer_copy(env, pixels.size(), pixels.data(), &buffer_data, &buffer);
+  napi_create_external_buffer(env, byte_count, pixels, FinalizeFrameBuffer, nullptr, &buffer);
   napi_set_named_property(env, result, "pixels", buffer);
   return result;
 }

@@ -105,6 +105,9 @@ pub struct PlayerState {
     position: Option<f64>,
     paused: Option<bool>,
     volume: Option<f64>,
+    fps: Option<f64>,
+    video_width: Option<i64>,
+    video_height: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -206,7 +209,11 @@ impl LibMpvPlayer {
             player.set_option("input-vo-keyboard", "yes")?;
             player.set_option("osc", "yes")?;
             player.set_option("sub-auto", "fuzzy")?;
+            player.set_option("sub-ass", "yes")?;
+            player.set_option("embeddedfonts", "yes")?;
+            player.set_option("sub-scale-by-window", "yes")?;
             player.set_option("audio-display", "no")?;
+            player.set_option("hr-seek", "yes")?;
             check_mpv(mpv_initialize(handle))?;
             Ok(player)
         }
@@ -288,6 +295,9 @@ impl LibMpvPlayer {
             position: self.get_double_property("time-pos"),
             paused: self.get_flag_property("pause"),
             volume: self.get_double_property("volume"),
+            fps: self.get_double_property("estimated-vf-fps"),
+            video_width: self.get_int_property("width"),
+            video_height: self.get_int_property("height"),
             ..PlayerState::default()
         };
         let mut result = MpvNode {
@@ -339,6 +349,20 @@ impl LibMpvPlayer {
             )
         };
         (code >= 0).then_some(value != 0)
+    }
+
+    fn get_int_property(&self, name: &str) -> Option<i64> {
+        let name = CString::new(name).ok()?;
+        let mut value: i64 = 0;
+        let code = unsafe {
+            mpv_get_property(
+                self.handle,
+                name.as_ptr(),
+                MPV_FORMAT_INT64,
+                &mut value as *mut i64 as *mut c_void,
+            )
+        };
+        (code >= 0).then_some(value)
     }
 }
 

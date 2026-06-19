@@ -34,6 +34,9 @@ export function PlayerPage({
   const episodes = useMemo(() => makePlaybackEpisodes(subject), [subject]);
   const stageSurfaceRef = useRef<HTMLDivElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const forceNextFrameRef = useRef(false);
+  const seekInFlightRef = useRef(false);
+  const scrubPositionRef = useRef<number | null>(null);
   const [currentKey, setCurrentKey] = useState(initialEpisode.key);
   const [source, setSource] = useState<MediaSource | null>(null);
   const [mpvState, setMpvState] = useState<MpvState | null>(null);
@@ -70,10 +73,16 @@ export function PlayerPage({
   const position = mpvState?.position ?? 0;
   const displayedPosition = scrubPosition ?? position;
   const volume = Math.round(mpvState?.volume ?? 100);
+  const playbackFps = normalizePlaybackFps(mpvState?.fps);
+  const sourceFrameSize = normalizeFrameSize(mpvState?.videoWidth, mpvState?.videoHeight);
 
   useEffect(() => {
     setCurrentKey(initialEpisode.key);
   }, [initialEpisode.key, subject.id]);
+
+  useEffect(() => {
+    scrubPositionRef.current = scrubPosition;
+  }, [scrubPosition]);
 
   useEffect(() => {
     let cancelled = false;
@@ -160,9 +169,20 @@ export function PlayerPage({
     let animationFrame = 0;
     let pausedTimer = 0;
     let lastStateRefresh = 0;
+    let lastFrameRequest = 0;
 
     async function drawFrame(timestamp: number) {
       if (disposed) return;
+      const targetFrameInterval = 1000 / playbackFps;
+      if (scrubPositionRef.current !== null && frameReady) {
+        animationFrame = requestAnimationFrame(drawFrame);
+        return;
+      }
+      if (!forceNextFrameRef.current && frameReady && !paused && timestamp - lastFrameRequest < targetFrameInterval) {
+        animationFrame = requestAnimationFrame(drawFrame);
+        return;
+      }
+
       const surface = stageSurfaceRef.current;
       const canvas = canvasRef.current;
       const context = canvas?.getContext("2d", { alpha: false });
@@ -172,9 +192,11 @@ export function PlayerPage({
       }
 
       const rect = surface.getBoundingClientRect();
-      const pixelRatio = Math.min(window.devicePixelRatio || 1, 1.25);
-      const frameWidth = Math.max(2, Math.min(960, Math.round(rect.width * pixelRatio)));
-      const frameHeight = Math.max(2, Math.min(540, Math.round(rect.height * pixelRatio)));
+      const estimatedFrameSize = estimateFrameSize(rect.width, rect.height);
+      const frameWidth = sourceFrameSize?.width ?? estimatedFrameSize.width;
+      const frameHeight = sourceFrameSize?.height ?? estimatedFrameSize.height;
+      lastFrameRequest = timestamp;
+      forceNextFrameRef.current = false;
 
       try {
         const frame = await renderFrame(frameWidth, frameHeight);
@@ -232,7 +254,7 @@ export function PlayerPage({
       cancelAnimationFrame(animationFrame);
       window.clearTimeout(pausedTimer);
     };
-  }, [frameReady, loadingSource, paused, playbackError, renderBridgeReady, source, currentEpisode.mediaId]);
+  }, [frameReady, loadingSource, paused, playbackError, playbackFps, renderBridgeReady, source, sourceFrameSize?.height, sourceFrameSize?.width, currentEpisode.mediaId]);
 
   useEffect(() => {
     return () => {
@@ -277,18 +299,24 @@ export function PlayerPage({
 
   const commitSeek = useCallback(async (value: number) => {
     if (!window.nexplay || !Number.isFinite(value)) return;
+    if (seekInFlightRef.current) return;
     const nextPosition = Math.max(0, Math.min(duration || value, value));
+    seekInFlightRef.current = true;
+    setScrubPosition(null);
+    setMpvState((current) => current ? { ...current, position: nextPosition } : current);
     try {
       const nextState = await window.nexplay.mpvSeek(nextPosition);
       setMpvState((current) => ({
         ...nextState,
         source: current?.source ?? source ?? undefined,
       }));
-      setScrubPosition(null);
+      forceNextFrameRef.current = true;
+      setFrameError(null);
     } catch (caught) {
       const message = caught instanceof Error ? caught.message : String(caught);
       onSnack(`跳转失败：${message}`, "danger");
-      setScrubPosition(null);
+    } finally {
+      seekInFlightRef.current = false;
     }
   }, [duration, onSnack, source]);
 
@@ -669,6 +697,32 @@ function formatTime(value: number) {
     return `${hours}:${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
   }
   return `${minutes}:${String(seconds).padStart(2, "0")}`;
+}
+
+function normalizePlaybackFps(value: number | undefined) {
+  if (!value || !Number.isFinite(value) || value < 10) {
+    return 30;
+  }
+  return Math.max(24, Math.min(60, Math.round(value)));
+}
+
+function normalizeFrameSize(width: number | undefined, height: number | undefined) {
+  if (!width || !height || !Number.isFinite(width) || !Number.isFinite(height)) {
+    return null;
+  }
+  return {
+    width: Math.max(2, Math.min(3840, Math.round(width))),
+    height: Math.max(2, Math.min(2160, Math.round(height))),
+  };
+}
+
+function estimateFrameSize(width: number, height: number) {
+  const pixelRatio = Math.min(window.devicePixelRatio || 1, 1.5);
+  const scale = Math.max(0.1, Math.min(pixelRatio, 1920 / Math.max(1, width), 1080 / Math.max(1, height)));
+  return {
+    width: Math.max(2, Math.round(width * scale)),
+    height: Math.max(2, Math.round(height * scale)),
+  };
 }
 
 function TrackSelect({

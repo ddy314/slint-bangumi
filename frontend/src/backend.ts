@@ -74,6 +74,9 @@ export type MpvState = {
   position?: number;
   paused?: boolean;
   volume?: number;
+  fps?: number;
+  videoWidth?: number;
+  videoHeight?: number;
   source?: MediaSource;
 };
 
