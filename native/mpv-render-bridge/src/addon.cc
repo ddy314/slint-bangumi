@@ -281,6 +281,47 @@ napi_value PlayerState(napi_env env) {
   return result;
 }
 
+napi_value SeekState(napi_env env, double position) {
+  napi_value result;
+  napi_create_object(env, &result);
+  if (!g_player) {
+    SetBool(env, result, "ok", false);
+    SetString(env, result, "stage", "notReady");
+    SetBool(env, result, "loaded", false);
+    return result;
+  }
+
+  SetBool(env, result, "ok", true);
+  SetBool(env, result, "loaded", g_player->loaded);
+  SetNumber(env, result, "position", position);
+
+  double duration = 0;
+  double volume = 0;
+  double fps = 0;
+  int64_t video_width = 0;
+  int64_t video_height = 0;
+  bool paused = false;
+  if (GetPropertyDouble(*g_player, "duration", duration)) {
+    SetNumber(env, result, "duration", duration);
+  }
+  if (GetPropertyFlag(*g_player, "pause", paused)) {
+    SetBool(env, result, "paused", paused);
+  }
+  if (GetPropertyDouble(*g_player, "volume", volume)) {
+    SetNumber(env, result, "volume", volume);
+  }
+  if (GetPropertyDouble(*g_player, "estimated-vf-fps", fps) && fps > 0) {
+    SetNumber(env, result, "fps", fps);
+  }
+  if (GetPropertyInt64(*g_player, "width", video_width) && video_width > 0) {
+    SetNumber(env, result, "videoWidth", static_cast<double>(video_width));
+  }
+  if (GetPropertyInt64(*g_player, "height", video_height) && video_height > 0) {
+    SetNumber(env, result, "videoHeight", static_cast<double>(video_height));
+  }
+  return result;
+}
+
 std::string GetStringArg(napi_env env, napi_value value) {
   size_t size = 0;
   napi_get_value_string_utf8(env, value, nullptr, 0, &size);
@@ -311,7 +352,7 @@ napi_value GetBuildInfo(napi_env env, napi_callback_info) {
   SetBool(env, result, "available", true);
   SetString(env, result, "bridge", "node-api");
   SetString(env, result, "renderApi", MPV_RENDER_API_TYPE_SW);
-  SetString(env, result, "renderBackend", "software-diagnostic");
+  SetString(env, result, "renderBackend", "libmpv-sw-to-webgl-texture");
   SetNumber(env, result, "nodeApiVersion", NAPI_VERSION);
   SetNumber(env, result, "mpvClientApiVersion", static_cast<double>(mpv_client_api_version()));
   return result;
@@ -328,20 +369,25 @@ napi_value ProbeRenderContext(napi_env env, napi_callback_info) {
   SetBool(env, result, "ok", true);
   SetString(env, result, "stage", "ready");
   SetString(env, result, "renderApi", MPV_RENDER_API_TYPE_SW);
-  SetString(env, result, "renderBackend", "software-diagnostic");
+  SetString(env, result, "renderBackend", "libmpv-sw-to-webgl-texture");
   SetNumber(env, result, "mpvClientApiVersion", static_cast<double>(mpv_client_api_version()));
   return result;
 }
 
 napi_value ProbeWebglTextureRenderer(napi_env env, napi_callback_info) {
+  std::string error;
+  if (!EnsurePlayer(error)) {
+    return ErrorObject(env, "ensurePlayer", error);
+  }
+
   napi_value result;
   napi_create_object(env, &result);
-  SetBool(env, result, "ok", false);
-  SetString(env, result, "stage", "nativeTextureInterop");
+  SetBool(env, result, "ok", true);
+  SetString(env, result, "stage", "softwareFrameUpload");
   SetString(env, result, "target", "webglTexture");
-  SetString(env, result, "renderApi", MPV_RENDER_API_TYPE_OPENGL);
-  SetString(env, result, "fallback", "externalMpv");
-  SetString(env, result, "error", "native OpenGL/EGL texture export is not implemented in this bridge yet");
+  SetString(env, result, "renderApi", MPV_RENDER_API_TYPE_SW);
+  SetString(env, result, "transport", "electron-ipc");
+  SetString(env, result, "upload", "texSubImage2D");
   return result;
 }
 
@@ -435,10 +481,10 @@ napi_value Seek(napi_env env, napi_callback_info info) {
   }
 
   const double position = std::max(0.0, GetNumberArg(env, args[0], 0));
-  if (!Command(*g_player, {"seek", std::to_string(position), "absolute", "exact"}, error)) {
+  if (!Command(*g_player, {"seek", std::to_string(position), "absolute", "keyframes"}, error)) {
     return ErrorObject(env, "seek", error);
   }
-  return PlayerState(env);
+  return SeekState(env, position);
 }
 
 napi_value SetVolume(napi_env env, napi_callback_info info) {

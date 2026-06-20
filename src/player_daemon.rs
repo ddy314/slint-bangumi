@@ -163,7 +163,7 @@ fn handle_request(player: &mut LibMpvPlayer, request: PlayerRequest) -> PlayerRe
             player.set_track(kind, id).and_then(|_| player.state())
         }
         PlayerCommand::SetPause { paused } => player.set_pause(paused).and_then(|_| player.state()),
-        PlayerCommand::Seek { position } => player.seek(position).and_then(|_| player.state()),
+        PlayerCommand::Seek { position } => player.seek(position).map(|_| player.seek_state(position)),
         PlayerCommand::SetVolume { volume } => {
             player.set_volume(volume).and_then(|_| player.state())
         }
@@ -248,7 +248,20 @@ impl LibMpvPlayer {
     }
 
     fn seek(&self, position: f64) -> Result<(), String> {
-        self.command(&["seek", &position.max(0.0).to_string(), "absolute", "exact"])
+        self.command(&["seek", &position.max(0.0).to_string(), "absolute", "keyframes"])
+    }
+
+    fn seek_state(&self, position: f64) -> PlayerState {
+        PlayerState {
+            duration: self.get_double_property("duration"),
+            position: Some(position.max(0.0)),
+            paused: self.get_flag_property("pause"),
+            volume: self.get_double_property("volume"),
+            fps: self.get_double_property("estimated-vf-fps"),
+            video_width: self.get_int_property("width"),
+            video_height: self.get_int_property("height"),
+            ..PlayerState::default()
+        }
     }
 
     fn set_volume(&self, volume: f64) -> Result<(), String> {

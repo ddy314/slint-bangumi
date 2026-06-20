@@ -67,6 +67,8 @@ export type MpvTextureProbe = {
   stage?: string;
   target?: string;
   renderApi?: string;
+  transport?: string;
+  upload?: string;
   fallback?: string;
   error?: string;
 };

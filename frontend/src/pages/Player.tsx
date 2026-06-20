@@ -17,8 +17,11 @@ import {
 import { makePlaybackEpisodes, type PlaybackEpisode, type Subject } from "../data";
 import { Poster } from "../MediaCard";
 import { appleSpringSoft } from "../motion";
+import { MpvWebglSurface } from "../MpvWebglSurface";
 import { cn } from "../utils/cn";
 import type { MediaSource, MpvRenderInfo, MpvState } from "../backend";
+
+const SEEK_COMMIT_DELAY_MS = 80;
 
 export function PlayerPage({
   subject,
@@ -33,7 +36,10 @@ export function PlayerPage({
 }) {
   const episodes = useMemo(() => makePlaybackEpisodes(subject), [subject]);
   const seekInFlightRef = useRef(false);
-  const scrubPositionRef = useRef<number | null>(null);
+  const pendingSeekPositionRef = useRef<number | null>(null);
+  const latestSeekPositionRef = useRef<number | null>(null);
+  const seekCommitTimerRef = useRef<number | null>(null);
+  const seekingRef = useRef(false);
   const [currentKey, setCurrentKey] = useState(initialEpisode.key);
   const [source, setSource] = useState<MediaSource | null>(null);
   const [mpvState, setMpvState] = useState<MpvState | null>(null);
@@ -43,6 +49,7 @@ export function PlayerPage({
   const [playbackError, setPlaybackError] = useState<string | null>(null);
   const [renderInfo, setRenderInfo] = useState<MpvRenderInfo | null>(null);
   const [paused, setPaused] = useState(false);
+  const [seeking, setSeeking] = useState(false);
   const [scrubPosition, setScrubPosition] = useState<number | null>(null);
   const heroAsset = subject.hero || subject.poster;
   const heroSrc = heroAsset ? window.nexplay?.resolveAssetUrl(heroAsset) ?? heroAsset : "";
@@ -75,10 +82,6 @@ export function PlayerPage({
   useEffect(() => {
     setCurrentKey(initialEpisode.key);
   }, [initialEpisode.key, subject.id]);
-
-  useEffect(() => {
-    scrubPositionRef.current = scrubPosition;
-  }, [scrubPosition]);
 
   useEffect(() => {
     let cancelled = false;
@@ -163,6 +166,9 @@ export function PlayerPage({
         if (!disposed && nextState) {
           setMpvState((current) => ({
             ...nextState,
+            position: seekingRef.current
+              ? latestSeekPositionRef.current ?? current?.position ?? nextState.position
+              : nextState.position,
             source: current?.source ?? source ?? undefined,
             renderMode: current?.renderMode,
             textureProbe: current?.textureProbe,
@@ -188,6 +194,9 @@ export function PlayerPage({
 
   useEffect(() => {
     return () => {
+      if (seekCommitTimerRef.current !== null) {
+        window.clearTimeout(seekCommitTimerRef.current);
+      }
       void window.nexplay?.mpvStop();
     };
   }, []);
@@ -208,6 +217,8 @@ export function PlayerPage({
       setMpvState((current) => ({
         ...nextState,
         source: current?.source ?? source ?? undefined,
+        renderMode: current?.renderMode,
+        textureProbe: current?.textureProbe,
       }));
     } catch (caught) {
       const message = caught instanceof Error ? caught.message : String(caught);
@@ -227,26 +238,70 @@ export function PlayerPage({
     }
   }, [onSnack, paused]);
 
-  const commitSeek = useCallback(async (value: number) => {
-    if (!window.nexplay || !Number.isFinite(value)) return;
-    if (seekInFlightRef.current) return;
-    const nextPosition = Math.max(0, Math.min(duration || value, value));
+  const flushPendingSeek = useCallback(async () => {
+    if (!window.nexplay || seekInFlightRef.current) return;
+    if (seekCommitTimerRef.current !== null) {
+      window.clearTimeout(seekCommitTimerRef.current);
+      seekCommitTimerRef.current = null;
+    }
     seekInFlightRef.current = true;
-    setScrubPosition(null);
-    setMpvState((current) => current ? { ...current, position: nextPosition } : current);
+
     try {
-      const nextState = await window.nexplay.mpvSeek(nextPosition);
-      setMpvState((current) => ({
-        ...nextState,
-        source: current?.source ?? source ?? undefined,
-      }));
-    } catch (caught) {
-      const message = caught instanceof Error ? caught.message : String(caught);
-      onSnack(`跳转失败：${message}`, "danger");
+      while (pendingSeekPositionRef.current !== null) {
+        const targetPosition = pendingSeekPositionRef.current;
+        pendingSeekPositionRef.current = null;
+
+        try {
+          const nextState = await window.nexplay.mpvSeek(targetPosition);
+          const stillLatest = latestSeekPositionRef.current === targetPosition
+            && pendingSeekPositionRef.current === null;
+          if (stillLatest) {
+            setMpvState((current) => ({
+              ...current,
+              ...nextState,
+              source: current?.source ?? source ?? undefined,
+              renderMode: current?.renderMode ?? nextState.renderMode,
+              textureProbe: current?.textureProbe ?? nextState.textureProbe,
+            }));
+          }
+        } catch (caught) {
+          const stillLatest = latestSeekPositionRef.current === targetPosition
+            && pendingSeekPositionRef.current === null;
+          if (stillLatest) {
+            const message = caught instanceof Error ? caught.message : String(caught);
+            onSnack(`跳转失败：${message}`, "danger");
+          }
+        }
+      }
     } finally {
       seekInFlightRef.current = false;
+      if (pendingSeekPositionRef.current === null) {
+        seekingRef.current = false;
+        setSeeking(false);
+      } else {
+        void flushPendingSeek();
+      }
     }
-  }, [duration, onSnack, source]);
+  }, [onSnack, source]);
+
+  const commitSeek = useCallback((value: number) => {
+    if (!window.nexplay || !Number.isFinite(value)) return;
+    const nextPosition = Math.max(0, Math.min(duration || value, value));
+    latestSeekPositionRef.current = nextPosition;
+    pendingSeekPositionRef.current = nextPosition;
+    seekingRef.current = true;
+    setSeeking(true);
+    setScrubPosition(null);
+    setMpvState((current) => current ? { ...current, position: nextPosition } : current);
+    if (seekInFlightRef.current) return;
+    if (seekCommitTimerRef.current !== null) {
+      window.clearTimeout(seekCommitTimerRef.current);
+    }
+    seekCommitTimerRef.current = window.setTimeout(() => {
+      seekCommitTimerRef.current = null;
+      void flushPendingSeek();
+    }, SEEK_COMMIT_DELAY_MS);
+  }, [duration, flushPendingSeek]);
 
   const setVolume = useCallback(async (value: number) => {
     if (!window.nexplay) return;
@@ -257,12 +312,18 @@ export function PlayerPage({
       setMpvState((current) => ({
         ...nextState,
         source: current?.source ?? source ?? undefined,
+        renderMode: current?.renderMode,
+        textureProbe: current?.textureProbe,
       }));
     } catch (caught) {
       const message = caught instanceof Error ? caught.message : String(caught);
       onSnack(`音量调整失败：${message}`, "danger");
     }
   }, [onSnack, source]);
+
+  const handleRenderSurfaceError = useCallback((message: string) => {
+    onSnack(`WebGL 画面渲染失败：${message}`, "danger");
+  }, [onSnack]);
 
   return (
     <div className="relative h-full overflow-hidden bg-[var(--color-bg)]">
@@ -320,7 +381,14 @@ export function PlayerPage({
               <div className="absolute inset-0 bg-black" />
               <div className="absolute inset-x-0 top-0 bottom-[86px] overflow-hidden rounded-t-[28px] bg-black">
                 {webglTextureReady ? (
-                  <div className="absolute inset-0 bg-black" />
+                  <MpvWebglSurface
+                    active={webglTextureReady && !loadingSource && !playbackError && !seeking}
+                    paused={paused}
+                    videoWidth={mpvState?.videoWidth}
+                    videoHeight={mpvState?.videoHeight}
+                    fps={mpvState?.fps}
+                    onError={handleRenderSurfaceError}
+                  />
                 ) : heroSrc ? (
                   <img
                     src={heroSrc}

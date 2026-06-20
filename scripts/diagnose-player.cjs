@@ -10,12 +10,15 @@ const defaultMedia =
 const rawArgs = process.argv.slice(2);
 const discover = rawArgs.includes("--discover");
 const includeSubtitles = rawArgs.includes("--subtitles");
+const nativeSize = rawArgs.includes("--native-size");
 const discoverDirCandidate = rawArgs[rawArgs.indexOf("--discover") + 1];
 const discoverDirArg = discoverDirCandidate && !discoverDirCandidate.startsWith("--") ? discoverDirCandidate : null;
 const limitArg = Number(rawArgs[rawArgs.indexOf("--limit") + 1]);
 const discoverProbeLimit = Number.isFinite(limitArg) && limitArg > 0 ? Math.round(limitArg) : 400;
+const playbackMsArg = Number(rawArgs[rawArgs.indexOf("--playback-ms") + 1]);
+const playbackMs = Number.isFinite(playbackMsArg) && playbackMsArg > 0 ? Math.round(playbackMsArg) : 2000;
 const optionValueIndexes = new Set(
-  ["--discover", "--limit"]
+  ["--discover", "--limit", "--playback-ms"]
     .map((option) => rawArgs.indexOf(option) + 1)
     .filter((index) => index > 0),
 );
@@ -125,24 +128,21 @@ async function renderAt(position, subtitleId, frameSize) {
 
 async function renderSameFrameWithSubtitle(position, subtitleId, frameSize) {
   const withSubtitle = await renderAt(position, subtitleId, frameSize);
-  await request({ type: "setPause", paused: true });
-  await sleep(40);
-  const withSubtitleAgain = {
-    frame: await request({ type: "renderFrame", width: frameSize.width, height: frameSize.height }),
-    state: await request({ type: "state" }),
-  };
-  await request({ type: "setPause", paused: true });
-  await request({ type: "setTrack", kind: "subtitle", id: null });
-  await request({ type: "setPause", paused: true });
-  await sleep(120);
-  const withoutSubtitle = {
-    frame: await request({ type: "renderFrame", width: frameSize.width, height: frameSize.height }),
-    state: await request({ type: "state" }),
-  };
+  const withSubtitleAgain = await renderAt(position, subtitleId, frameSize);
+  const withoutSubtitle = await renderAt(position, null, frameSize);
   return { withSubtitle, withSubtitleAgain, withoutSubtitle };
 }
 
-function frameSizeFromState(state) {
+function frameSizeFromState(state, { nativeSize = false } = {}) {
+  if (nativeSize) {
+    const sourceWidth = Math.max(2, Math.round(state.videoWidth || 960));
+    const sourceHeight = Math.max(2, Math.round(state.videoHeight || 540));
+    const scale = Math.min(3840 / sourceWidth, 2160 / sourceHeight, 1);
+    return {
+      width: Math.max(2, Math.round(sourceWidth * scale)),
+      height: Math.max(2, Math.round(sourceHeight * scale)),
+    };
+  }
   return {
     width: Math.max(2, Math.min(960, Math.round(state.videoWidth || 960))),
     height: Math.max(2, Math.min(540, Math.round(state.videoHeight || 540))),
@@ -171,6 +171,53 @@ async function renderMeasurementFrame(load, frameSize) {
     }
   }
   return fallback;
+}
+
+async function measureContinuousPlayback(frameSize, fps, durationMs) {
+  const frameBudgetMs = 1000 / Math.max(1, fps || 24);
+  const renderSamples = [];
+  const startedAt = performance.now();
+  let nextDueAt = startedAt;
+  let lateFrames = 0;
+  let renderedFrames = 0;
+
+  await request({ type: "setPause", paused: false });
+  while (performance.now() - startedAt < durationMs) {
+    const now = performance.now();
+    if (now < nextDueAt) {
+      await sleep(Math.max(0, nextDueAt - now));
+    }
+    const frameStart = performance.now();
+    await request({ type: "renderFrame", width: frameSize.width, height: frameSize.height }, 30000);
+    const renderMs = performance.now() - frameStart;
+    renderSamples.push(renderMs);
+    renderedFrames += 1;
+    if (renderMs > frameBudgetMs) {
+      lateFrames += 1;
+    }
+    nextDueAt += frameBudgetMs;
+    if (performance.now() > nextDueAt + frameBudgetMs) {
+      nextDueAt = performance.now();
+      lateFrames += 1;
+    }
+  }
+  await request({ type: "setPause", paused: true });
+
+  const elapsedMs = performance.now() - startedAt;
+  const expectedFrames = Math.max(1, Math.floor(elapsedMs / frameBudgetMs));
+  const avgMs = renderSamples.reduce((sum, value) => sum + value, 0) / Math.max(1, renderSamples.length);
+  return {
+    durationMs: Number(elapsedMs.toFixed(2)),
+    targetFps: Number(Math.max(1, fps || 24).toFixed(3)),
+    achievedFps: Number((renderedFrames / (elapsedMs / 1000)).toFixed(2)),
+    expectedFrames,
+    renderedFrames,
+    droppedFramesEstimate: Math.max(0, expectedFrames - renderedFrames),
+    lateFrames,
+    avgRenderMs: Number(avgMs.toFixed(2)),
+    maxRenderMs: Number(Math.max(...renderSamples).toFixed(2)),
+    frameBudgetMs: Number(frameBudgetMs.toFixed(2)),
+  };
 }
 
 function discoverMediaFiles(root) {
@@ -237,7 +284,7 @@ function selectDiscoveredSamples(root, probeLimit) {
   return selected;
 }
 
-async function diagnoseMedia(currentMediaPath, { includeSubtitles = true } = {}) {
+async function diagnoseMedia(currentMediaPath, { includeSubtitles = true, nativeSize = false } = {}) {
   const result = {
     ok: false,
     mediaPath: currentMediaPath,
@@ -252,7 +299,7 @@ async function diagnoseMedia(currentMediaPath, { includeSubtitles = true } = {})
   const load = await request({ type: "load", path: currentMediaPath }, 30000);
   await sleep(500);
   const state = await request({ type: "state" });
-  const frameSize = frameSizeFromState(state);
+  const frameSize = frameSizeFromState(state, { nativeSize });
 
   const measurement = await renderMeasurementFrame(load, frameSize);
   const frame = measurement.frame;
@@ -264,6 +311,7 @@ async function diagnoseMedia(currentMediaPath, { includeSubtitles = true } = {})
     renderSamples.push(performance.now() - sampleStart);
   }
   const avgRenderMs = renderSamples.reduce((sum, value) => sum + value, 0) / renderSamples.length;
+  const playback = await measureContinuousPlayback(frameSize, state.fps, playbackMs);
   result.render = {
     renderMode: textureProbe.ok
       ? "webglTexture"
@@ -273,6 +321,7 @@ async function diagnoseMedia(currentMediaPath, { includeSubtitles = true } = {})
     fallbackReason: textureProbe.ok ? null : textureProbe.error,
     width: frame.width,
     height: frame.height,
+    sizeMode: nativeSize ? "native" : "diagnostic",
     ms: Number(renderMs.toFixed(2)),
     measuredAt: measurement.position,
     avgMs: Number(avgRenderMs.toFixed(2)),
@@ -280,6 +329,7 @@ async function diagnoseMedia(currentMediaPath, { includeSubtitles = true } = {})
     sourceFrameBudgetMs: Number((1000 / Math.max(1, state.fps || 24)).toFixed(2)),
     ...frameStats(frame),
   };
+  result.playback = playback;
 
   const seekStart = performance.now();
   await request({ type: "seek", position: Math.min(300, Math.max(20, (load.duration || 600) / 3)) }, 30000);
@@ -324,8 +374,11 @@ async function diagnoseMedia(currentMediaPath, { includeSubtitles = true } = {})
       const baseline = diffFrames(withSubtitle.frame, withSubtitleAgain.frame);
       const diff = diffFrames(withSubtitle.frame, withoutSubtitle.frame);
       const score = Math.max(0, diff.changedPixels - baseline.changedPixels);
-      if (!best || score > best.score) {
-        best = { position, withSubtitle, withoutSubtitle, baseline, diff, score };
+      const totalPixels = withSubtitle.frame.width * withSubtitle.frame.height;
+      const suspiciousWholeFrameDiff = diff.changedPixels > totalPixels * 0.7;
+      const usableScore = suspiciousWholeFrameDiff ? 0 : score;
+      if (!best || usableScore > best.usableScore || (best.usableScore === 0 && score > best.score)) {
+        best = { position, withSubtitle, withoutSubtitle, baseline, diff, score, usableScore, suspiciousWholeFrameDiff };
       }
     }
 
@@ -335,8 +388,6 @@ async function diagnoseMedia(currentMediaPath, { includeSubtitles = true } = {})
       const withoutPath = `${prefix}-without-sub.ppm`;
       writePpm(withPath, best.withSubtitle.frame);
       writePpm(withoutPath, best.withoutSubtitle.frame);
-      const totalPixels = best.withSubtitle.frame.width * best.withSubtitle.frame.height;
-      const suspiciousWholeFrameDiff = best.diff.changedPixels > totalPixels * 0.7;
       result.subtitles = {
         trackId: selectedSubtitle.id,
         title: selectedSubtitle.title,
@@ -347,8 +398,8 @@ async function diagnoseMedia(currentMediaPath, { includeSubtitles = true } = {})
         changedPixels: best.diff.changedPixels,
         netChangedPixels: best.score,
         totalDelta: best.diff.totalDelta,
-        suspiciousWholeFrameDiff,
-        detected: best.score > Math.max(800, best.baseline.changedPixels * 3) && !suspiciousWholeFrameDiff,
+        suspiciousWholeFrameDiff: best.suspiciousWholeFrameDiff,
+        detected: best.score > Math.max(800, best.baseline.changedPixels * 3) && !best.suspiciousWholeFrameDiff,
       };
       result.artifacts = {
         withSubtitle: withPath,
@@ -363,6 +414,8 @@ async function diagnoseMedia(currentMediaPath, { includeSubtitles = true } = {})
     result.render.width === frameSize.width &&
     result.render.height === frameSize.height &&
     result.render.avgMs < Math.max(16.7, 1000 / Math.max(1, state.fps || 24)) &&
+    result.playback.achievedFps >= Math.max(1, (state.fps || 24) * 0.92) &&
+    result.playback.lateFrames <= Math.max(2, Math.ceil(result.playback.renderedFrames * 0.08)) &&
     result.seek.firstFrameMs < 120 &&
     result.continuousSeek.maxFirstFrameMs < 140 &&
     (!includeSubtitles || (state.subtitleTracks?.length ? result.subtitles.detected === true : true));
@@ -384,13 +437,14 @@ async function main() {
     const samples = selectDiscoveredSamples(root, discoverProbeLimit);
     const results = [];
     for (const sample of samples) {
-      results.push(await diagnoseMedia(sample.filePath, { includeSubtitles: false }));
+      results.push(await diagnoseMedia(sample.filePath, { includeSubtitles: false, nativeSize }));
     }
     await request({ type: "shutdown" });
     const output = {
       ok: results.every((result) => result.ok),
       root,
       probeLimit: discoverProbeLimit,
+      playbackMs,
       samples: results,
     };
     console.log(JSON.stringify(output, null, 2));
@@ -398,7 +452,7 @@ async function main() {
     return;
   }
 
-  const result = await diagnoseMedia(mediaPath, { includeSubtitles });
+  const result = await diagnoseMedia(mediaPath, { includeSubtitles, nativeSize });
   await request({ type: "shutdown" });
   console.log(JSON.stringify(result, null, 2));
   if (!result.ok) {

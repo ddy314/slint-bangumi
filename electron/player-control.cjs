@@ -49,15 +49,15 @@ class PlayerControl {
       this.renderBridge.probeWebglTextureRenderer()
     ));
     ipcMain.handle("mpv-render:frame", async (_event, payload) => {
-      const width = Math.min(Math.max(Number(payload.width) || 2, 2), 960);
-      const height = Math.min(Math.max(Number(payload.height) || 2, 2), 540);
+      const width = Math.min(Math.max(Math.round(Number(payload.width) || 2), 2), 3840);
+      const height = Math.min(Math.max(Math.round(Number(payload.height) || 2), 2), 2160);
       const frame = await this.renderBridge.request({ type: "renderFrame", width, height });
       if (frame && frame.ok === false) {
         throw new Error(frame.error || "failed to render diagnostic libmpv frame");
       }
       return {
         ...frame,
-        diagnosticOnly: true,
+        diagnosticOnly: false,
       };
     });
   }

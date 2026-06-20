@@ -1,4 +1,13 @@
+const path = require("node:path");
+const { fileURLToPath } = require("node:url");
 const { contextBridge, ipcRenderer } = require("electron");
+
+const { RenderBridge } = require("./render-bridge.cjs");
+
+const projectRoot = path.join(__dirname, "..");
+const renderBridge = new RenderBridge({ projectRoot });
+let activeMpvMode = null;
+let activeTextureProbe = null;
 
 function resolveAssetUrl(value) {
   if (typeof value !== "string" || !value.startsWith("file://")) {
@@ -9,6 +18,65 @@ function resolveAssetUrl(value) {
   return `nexplay-asset://local/${encodeURIComponent(filePath)}`;
 }
 
+function mediaPathFromSourceUrl(sourceUrl) {
+  return typeof sourceUrl === "string" && sourceUrl.startsWith("file://")
+    ? fileURLToPath(sourceUrl)
+    : sourceUrl;
+}
+
+function normalizeMediaSource(source) {
+  return {
+    ...source,
+    sourceUrl: resolveAssetUrl(source.sourceUrl),
+  };
+}
+
+async function loadMpvMedia(mediaId) {
+  const source = await ipcRenderer.invoke("backend:media-source", mediaId);
+  const bridgeInfo = await renderBridge.getInfo();
+  const textureProbe = await renderBridge.probeWebglTextureRenderer();
+  const canUseTextureRenderer = Boolean(bridgeInfo.available && textureProbe.ok);
+
+  if (!canUseTextureRenderer) {
+    activeMpvMode = "externalMpv";
+    activeTextureProbe = textureProbe;
+    return ipcRenderer.invoke("mpv:load", mediaId);
+  }
+
+  const state = await renderBridge.request({
+    type: "load",
+    path: mediaPathFromSourceUrl(source.sourceUrl),
+  });
+  if (state && state.ok === false) {
+    throw new Error(state.error || "libmpv failed to load media");
+  }
+
+  activeMpvMode = "webglTexture";
+  activeTextureProbe = textureProbe;
+  return {
+    ...state,
+    source: normalizeMediaSource(source),
+    renderMode: "webglTexture",
+    textureProbe,
+  };
+}
+
+async function controlMpv(command, fallback) {
+  if (activeMpvMode !== "webglTexture") {
+    return fallback();
+  }
+
+  const state = await renderBridge.request(command);
+  if (state && state.ok === false) {
+    throw new Error(state.error || "libmpv renderer command failed");
+  }
+  return state;
+}
+
+window.addEventListener("beforeunload", () => {
+  renderBridge.shutdown();
+});
+
 contextBridge.exposeInMainWorld("nexplay", {
   appName: "NexPlay",
   getSnapshot: () => ipcRenderer.invoke("backend:snapshot"),
@@ -18,21 +86,49 @@ contextBridge.exposeInMainWorld("nexplay", {
   openMedia: (mediaId) => ipcRenderer.invoke("backend:open-media", mediaId),
   getMediaSource: async (mediaId) => {
     const source = await ipcRenderer.invoke("backend:media-source", mediaId);
-    return {
-      ...source,
-      sourceUrl: resolveAssetUrl(source.sourceUrl),
-    };
+    return normalizeMediaSource(source);
   },
-  mpvLoad: (mediaId) => ipcRenderer.invoke("mpv:load", mediaId),
-  mpvSetTrack: (kind, id) => ipcRenderer.invoke("mpv:set-track", { kind, id }),
-  mpvSetPause: (paused) => ipcRenderer.invoke("mpv:set-pause", paused),
-  mpvSeek: (position) => ipcRenderer.invoke("mpv:seek", position),
-  mpvSetVolume: (volume) => ipcRenderer.invoke("mpv:set-volume", volume),
-  mpvStop: () => ipcRenderer.invoke("mpv:stop"),
-  mpvState: () => ipcRenderer.invoke("mpv:state"),
-  mpvRenderInfo: () => ipcRenderer.invoke("mpv-render:info"),
-  mpvProbeWebglTextureRenderer: () => ipcRenderer.invoke("mpv-render:probe-webgl-texture"),
-  mpvRenderFrame: (width, height) => ipcRenderer.invoke("mpv-render:frame", { width, height }),
+  mpvLoad: (mediaId) => loadMpvMedia(mediaId),
+  mpvSetTrack: (kind, id) => controlMpv(
+    { type: "setTrack", kind, id },
+    () => ipcRenderer.invoke("mpv:set-track", { kind, id }),
+  ),
+  mpvSetPause: (paused) => controlMpv(
+    { type: "setPause", paused },
+    () => ipcRenderer.invoke("mpv:set-pause", paused),
+  ),
+  mpvSeek: (position) => controlMpv(
+    { type: "seek", position },
+    () => ipcRenderer.invoke("mpv:seek", position),
+  ),
+  mpvSetVolume: (volume) => controlMpv(
+    { type: "setVolume", volume },
+    () => ipcRenderer.invoke("mpv:set-volume", volume),
+  ),
+  mpvStop: async () => {
+    const state = await controlMpv(
+      { type: "stop" },
+      () => ipcRenderer.invoke("mpv:stop"),
+    );
+    activeMpvMode = null;
+    activeTextureProbe = null;
+    return state;
+  },
+  mpvState: () => controlMpv(
+    { type: "state" },
+    () => ipcRenderer.invoke("mpv:state"),
+  ),
+  mpvRenderInfo: () => renderBridge.getInfo(),
+  mpvProbeWebglTextureRenderer: async () => {
+    activeTextureProbe = await renderBridge.probeWebglTextureRenderer();
+    return activeTextureProbe;
+  },
+  mpvRenderFrame: async (width, height) => {
+    if (activeMpvMode !== "webglTexture") {
+      return ipcRenderer.invoke("mpv-render:frame", { width, height });
+    }
+    return renderBridge.request({ type: "renderFrame", width, height });
+  },
   onBackendEvent: (callback) => {
     const listener = (_event, payload) => callback(payload);
     ipcRenderer.on("backend:event", listener);
