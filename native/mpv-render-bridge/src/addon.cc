@@ -481,7 +481,7 @@ napi_value Seek(napi_env env, napi_callback_info info) {
   }
 
   const double position = std::max(0.0, GetNumberArg(env, args[0], 0));
-  if (!Command(*g_player, {"seek", std::to_string(position), "absolute", "keyframes"}, error)) {
+  if (!Command(*g_player, {"seek", std::to_string(position), "absolute+exact"}, error)) {
     return ErrorObject(env, "seek", error);
   }
   return SeekState(env, position);

@@ -7,6 +7,7 @@ type DanmakuOverlayProps = {
   visible: boolean;
   paused: boolean;
   seeking: boolean;
+  seekReset?: { version: number; position: number } | null;
   position: number;
   duration: number;
   area: number;
@@ -69,6 +70,7 @@ type WorkerMessage =
   | { type: "resize"; width: number; height: number; dpr: number; area: number }
   | { type: "items"; items: NormalizedDanmakuItem[]; position: number }
   | { type: "rawItems"; items: DanmakuTrack["items"]; position: number }
+  | { type: "reset"; position: number; paused: boolean }
   | { type: "clock"; position: number; paused: boolean; seeking: boolean; timestamp: number }
   | { type: "visible"; visible: boolean; position: number }
   | { type: "area"; area: number; position: number }
@@ -100,6 +102,7 @@ export function DanmakuOverlay({
   visible,
   paused,
   seeking,
+  seekReset,
   position,
   duration,
   area,
@@ -144,6 +147,20 @@ export function DanmakuOverlay({
     postWorkerMessage({ type: "area", area, position });
     resetRendererToPosition(position);
   }, [area]);
+
+  useEffect(() => {
+    if (!seekReset) return;
+    const now = performance.now();
+    const nextPosition = Number.isFinite(seekReset.position) ? Math.max(0, seekReset.position) : 0;
+    clockRef.current = {
+      mediaId,
+      position: nextPosition,
+      timestamp: now,
+      paused,
+    };
+    postWorkerMessage({ type: "reset", position: nextPosition, paused });
+    resetRendererToPosition(nextPosition);
+  }, [mediaId, paused, seekReset?.version]);
 
   useEffect(() => {
     const now = performance.now();

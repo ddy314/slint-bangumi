@@ -250,7 +250,7 @@ impl LibMpvPlayer {
     }
 
     fn seek(&self, position: f64) -> Result<(), String> {
-        self.command(&["seek", &position.max(0.0).to_string(), "absolute", "keyframes"])
+        self.command(&["seek", &position.max(0.0).to_string(), "absolute+exact"])
     }
 
     fn seek_state(&self, position: f64) -> PlayerState {

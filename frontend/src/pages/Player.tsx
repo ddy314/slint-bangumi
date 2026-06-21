@@ -29,9 +29,8 @@ const SEEK_COMMIT_DELAY_MS = 80;
 const SEEK_POSITION_SETTLE_MS = 3500;
 const SEEK_POSITION_ACCEPT_BEFORE_SECONDS = 1.25;
 const SEEK_POSITION_ACCEPT_AFTER_SECONDS = 2.5;
-const SEEK_FRAME_SYNC_TIMEOUT_MS = 2500;
-const SEEK_FRAME_ACCEPT_WINDOW_SECONDS = 8;
 const FRAME_CLOCK_PUBLISH_INTERVAL_MS = 250;
+const DANMAKU_SEEK_RESET_DELAY_MS = 650;
 const DANMAKU_AREAS = [
   { label: "1/4屏", value: 0.25 },
   { label: "半屏", value: 0.5 },
@@ -61,12 +60,9 @@ export function PlayerPage({
     startedAt: number;
     until: number;
   } | null>(null);
-  const seekFrameSyncRef = useRef<{
-    target: number;
-    startedAt: number;
-  } | null>(null);
-  const videoFramePositionRef = useRef<number | null>(null);
   const lastFrameClockPublishAtRef = useRef(0);
+  const danmakuSeekResetTimerRef = useRef<number | null>(null);
+  const danmakuSeekResetVersionRef = useRef(0);
   const seekCommitTimerRef = useRef<number | null>(null);
   const seekingRef = useRef(false);
   const [currentKey, setCurrentKey] = useState(initialEpisode.key);
@@ -83,7 +79,8 @@ export function PlayerPage({
   const [stageFullscreen, setStageFullscreen] = useState(false);
   const [seeking, setSeeking] = useState(false);
   const [scrubPosition, setScrubPosition] = useState<number | null>(null);
-  const [videoFramePosition, setVideoFramePosition] = useState<number | null>(null);
+  const [danmakuSeekSuspended, setDanmakuSeekSuspended] = useState(false);
+  const [danmakuSeekReset, setDanmakuSeekReset] = useState<{ version: number; position: number } | null>(null);
   const heroAsset = subject.hero || subject.poster;
   const heroSrc = heroAsset ? window.nexplay?.resolveAssetUrl(heroAsset) ?? heroAsset : "";
   const playableEpisodes = useMemo(() => episodes.filter((episode) => episode.cached && episode.mediaId), [episodes]);
@@ -110,13 +107,40 @@ export function PlayerPage({
     : renderInfo?.reason);
   const duration = mpvState?.duration ?? 0;
   const position = mpvState?.position ?? 0;
-  const danmakuPosition = renderMode === "webglTexture" && videoFramePosition !== null
-    ? videoFramePosition
-    : position;
-  const waitingForWebglFrameSync = renderMode === "webglTexture" && seekFrameSyncRef.current !== null;
   const displayedPosition = scrubPosition ?? position;
   const volume = Math.round(mpvState?.volume ?? 100);
   const playbackControlsDisabled = loadingSource || Boolean(playbackError);
+
+  const clearDanmakuSeekResetTimer = useCallback(() => {
+    if (danmakuSeekResetTimerRef.current !== null) {
+      window.clearTimeout(danmakuSeekResetTimerRef.current);
+      danmakuSeekResetTimerRef.current = null;
+    }
+  }, []);
+
+  const suspendDanmakuForSeek = useCallback(() => {
+    clearDanmakuSeekResetTimer();
+    setDanmakuSeekSuspended(true);
+  }, [clearDanmakuSeekResetTimer]);
+
+  const scheduleDanmakuSeekReset = useCallback((targetPosition: number) => {
+    clearDanmakuSeekResetTimer();
+    setDanmakuSeekSuspended(true);
+    danmakuSeekResetTimerRef.current = window.setTimeout(() => {
+      danmakuSeekResetTimerRef.current = null;
+      danmakuSeekResetVersionRef.current += 1;
+      setDanmakuSeekReset({
+        version: danmakuSeekResetVersionRef.current,
+        position: targetPosition,
+      });
+      setDanmakuSeekSuspended(false);
+    }, DANMAKU_SEEK_RESET_DELAY_MS);
+  }, [clearDanmakuSeekResetTimer]);
+
+  const cancelDanmakuSeekReset = useCallback(() => {
+    clearDanmakuSeekResetTimer();
+    setDanmakuSeekSuspended(false);
+  }, [clearDanmakuSeekResetTimer]);
 
   useEffect(() => {
     setCurrentKey(initialEpisode.key);
@@ -168,10 +192,9 @@ export function PlayerPage({
       seekStabilizationRef.current = null;
       pendingSeekPositionRef.current = null;
       latestSeekPositionRef.current = null;
-      seekFrameSyncRef.current = null;
-      videoFramePositionRef.current = null;
       lastFrameClockPublishAtRef.current = 0;
-      setVideoFramePosition(null);
+      cancelDanmakuSeekReset();
+      setDanmakuSeekReset(null);
       const currentBrowserVideo = browserVideoRef.current;
       if (currentBrowserVideo) {
         currentBrowserVideo.pause();
@@ -227,7 +250,7 @@ export function PlayerPage({
     return () => {
       cancelled = true;
     };
-  }, [currentEpisode.mediaId, onSnack]);
+  }, [cancelDanmakuSeekReset, currentEpisode.mediaId, onSnack]);
 
   useEffect(() => {
     if (loadingSource || playbackError || !window.nexplay?.mpvState || mpvState?.renderMode === "browserVideo") {
@@ -270,9 +293,10 @@ export function PlayerPage({
       if (seekCommitTimerRef.current !== null) {
         window.clearTimeout(seekCommitTimerRef.current);
       }
+      clearDanmakuSeekResetTimer();
       void window.nexplay?.mpvStop();
     };
-  }, []);
+  }, [clearDanmakuSeekResetTimer]);
 
   useEffect(() => {
     const handleFullscreenChange = () => {
@@ -411,15 +435,7 @@ export function PlayerPage({
               startedAt,
               until: startedAt + SEEK_POSITION_SETTLE_MS,
             };
-            if ((mpvState?.renderMode ?? "webglTexture") === "webglTexture") {
-              seekFrameSyncRef.current = {
-                target: targetPosition,
-                startedAt,
-              };
-              videoFramePositionRef.current = null;
-              lastFrameClockPublishAtRef.current = 0;
-              setVideoFramePosition(null);
-            }
+            scheduleDanmakuSeekReset(targetPosition);
             setMpvState((current) => ({
               ...current,
               ...nextState,
@@ -433,7 +449,7 @@ export function PlayerPage({
           const stillLatest = latestSeekPositionRef.current === targetPosition
             && pendingSeekPositionRef.current === null;
           if (stillLatest) {
-            seekFrameSyncRef.current = null;
+            cancelDanmakuSeekReset();
             const message = caught instanceof Error ? caught.message : String(caught);
             onSnack(`跳转失败：${message}`, "danger");
           }
@@ -448,7 +464,7 @@ export function PlayerPage({
         void flushPendingSeek();
       }
     }
-  }, [mpvState?.renderMode, onSnack, source]);
+  }, [cancelDanmakuSeekReset, onSnack, scheduleDanmakuSeekReset, source]);
 
   const commitSeek = useCallback((value: number) => {
     if (!window.nexplay || !Number.isFinite(value)) return;
@@ -461,6 +477,7 @@ export function PlayerPage({
       seekingRef.current = false;
       setSeeking(false);
       setScrubPosition(null);
+      scheduleDanmakuSeekReset(nextPosition);
       setMpvState((current) => current ? { ...current, position: nextPosition } : current);
       return;
     }
@@ -472,17 +489,7 @@ export function PlayerPage({
       startedAt,
       until: startedAt + SEEK_POSITION_SETTLE_MS,
     };
-    if (mpvState?.renderMode === "webglTexture") {
-      seekFrameSyncRef.current = {
-        target: nextPosition,
-        startedAt,
-      };
-      videoFramePositionRef.current = null;
-      lastFrameClockPublishAtRef.current = 0;
-      setVideoFramePosition(null);
-    } else {
-      seekFrameSyncRef.current = null;
-    }
+    suspendDanmakuForSeek();
     pendingSeekPositionRef.current = nextPosition;
     seekingRef.current = true;
     setSeeking(true);
@@ -496,7 +503,7 @@ export function PlayerPage({
       seekCommitTimerRef.current = null;
       void flushPendingSeek();
     }, SEEK_COMMIT_DELAY_MS);
-  }, [duration, flushPendingSeek, mpvState?.renderMode]);
+  }, [duration, flushPendingSeek, mpvState?.renderMode, scheduleDanmakuSeekReset, suspendDanmakuForSeek]);
 
   const setVolume = useCallback(async (value: number) => {
     if (!window.nexplay) return;
@@ -535,28 +542,12 @@ export function PlayerPage({
     }
 
     const framePosition = Math.max(0, frame.position);
-    const sync = seekFrameSyncRef.current;
     const now = performance.now();
-    let shouldPublishFrameClock = videoFramePositionRef.current === null;
-    if (sync) {
-      const lowerBound = Math.max(0, sync.target - SEEK_FRAME_ACCEPT_WINDOW_SECONDS);
-      const upperBound = sync.target + SEEK_FRAME_ACCEPT_WINDOW_SECONDS;
-      const matchesSeekTarget = framePosition >= lowerBound && framePosition <= upperBound;
-      const timedOut = now - sync.startedAt >= SEEK_FRAME_SYNC_TIMEOUT_MS;
-      if (!matchesSeekTarget && !timedOut) {
-        return;
-      }
-      seekFrameSyncRef.current = null;
-      shouldPublishFrameClock = true;
-    }
-
-    if (!shouldPublishFrameClock && now - lastFrameClockPublishAtRef.current < FRAME_CLOCK_PUBLISH_INTERVAL_MS) {
+    if (now - lastFrameClockPublishAtRef.current < FRAME_CLOCK_PUBLISH_INTERVAL_MS) {
       return;
     }
 
-    videoFramePositionRef.current = framePosition;
     lastFrameClockPublishAtRef.current = now;
-    setVideoFramePosition(framePosition);
     setMpvState((current) => current ? { ...current, position: framePosition } : current);
   }, []);
 
@@ -701,10 +692,11 @@ export function PlayerPage({
 
                 <DanmakuOverlay
                   mediaId={currentEpisode.mediaId}
-                  visible={danmakuVisible && !loadingSource && !playbackError && !waitingForWebglFrameSync}
+                  visible={danmakuVisible && !loadingSource && !playbackError && !danmakuSeekSuspended}
                   paused={paused}
-                  seeking={seeking || waitingForWebglFrameSync}
-                  position={danmakuPosition}
+                  seeking={seeking}
+                  seekReset={danmakuSeekReset}
+                  position={position}
                   duration={duration}
                   area={danmakuArea}
                   onError={handleDanmakuError}

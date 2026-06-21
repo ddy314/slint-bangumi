@@ -62,6 +62,7 @@ type WorkerMessage =
   | { type: "resize"; width: number; height: number; dpr: number; area: number }
   | { type: "items"; items: WorkerDanmakuItem[]; position: number }
   | { type: "rawItems"; items: RawDanmakuItem[]; position: number }
+  | { type: "reset"; position: number; paused: boolean }
   | { type: "clock"; position: number; paused: boolean; seeking: boolean; timestamp: number }
   | { type: "visible"; visible: boolean; position: number }
   | { type: "area"; area: number; position: number }
@@ -150,6 +151,9 @@ self.onmessage = (event: MessageEvent<WorkerMessage>) => {
     case "rawItems":
       items = normalizeDanmakuItems(message.items);
       resetRendererToPosition(message.position);
+      break;
+    case "reset":
+      resetClockToPosition(message.position, message.paused);
       break;
     case "clock":
       updateClock(message.position, message.paused, message.seeking, message.timestamp);
@@ -277,6 +281,18 @@ function updateClock(position: number, paused: boolean, seeking: boolean, timest
     timestamp: now,
     paused: false,
   };
+}
+
+function resetClockToPosition(position: number, paused: boolean) {
+  const now = performance.now();
+  const nextPosition = Number.isFinite(position) ? Math.max(0, position) : 0;
+  state.seeking = false;
+  clock = {
+    position: nextPosition,
+    timestamp: now,
+    paused,
+  };
+  resetRendererToPosition(nextPosition);
 }
 
 function renderFrame() {

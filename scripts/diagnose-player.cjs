@@ -17,6 +17,7 @@ const limitArg = Number(rawArgs[rawArgs.indexOf("--limit") + 1]);
 const discoverProbeLimit = Number.isFinite(limitArg) && limitArg > 0 ? Math.round(limitArg) : 400;
 const playbackMsArg = Number(rawArgs[rawArgs.indexOf("--playback-ms") + 1]);
 const playbackMs = Number.isFinite(playbackMsArg) && playbackMsArg > 0 ? Math.round(playbackMsArg) : 2000;
+const seekSettleSampleMs = 650;
 const optionValueIndexes = new Set(
   ["--discover", "--limit", "--playback-ms"]
     .map((option) => rawArgs.indexOf(option) + 1)
@@ -356,10 +357,15 @@ async function diagnoseMedia(currentMediaPath, { includeSubtitles = true, native
     const seekFrame = await request({ type: "renderFrame", width: frameSize.width, height: frameSize.height }, 30000);
     const frameDone = performance.now();
     const framePosition = typeof seekFrame.position === "number" ? seekFrame.position : position;
+    await sleep(seekSettleSampleMs);
+    const settledFrame = await request({ type: "renderFrame", width: frameSize.width, height: frameSize.height }, 30000);
+    const settledFramePosition = typeof settledFrame.position === "number" ? settledFrame.position : position;
     seekSamples.push({
       position,
       framePosition: Number(framePosition.toFixed(3)),
       framePositionDelta: Number(Math.abs(framePosition - position).toFixed(3)),
+      settledFramePosition: Number(settledFramePosition.toFixed(3)),
+      settledFramePositionDelta: Number(Math.abs(settledFramePosition - position).toFixed(3)),
       commandMs: Number((seekCommandDone - start).toFixed(2)),
       firstFrameMs: Number((frameDone - seekCommandDone).toFixed(2)),
     });
