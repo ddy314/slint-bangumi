@@ -20,6 +20,7 @@ export default function App() {
   const [detail, setDetail] = useState<Subject | null>(null);
   const [playback, setPlayback] = useState<PlaybackState | null>(null);
   const [theme, setTheme] = useState<"light" | "dark">("light");
+  const [navCollapsed, setNavCollapsed] = useState(false);
   const snack = useSnackbar();
   const backend = useBackendSnapshot();
 
@@ -37,16 +38,19 @@ export default function App() {
   return (
     <div
       data-theme={theme}
-      className="relative h-screen w-screen overflow-hidden bg-[var(--color-bg)] text-[var(--color-text-primary)]"
+      data-nav-collapsed={navCollapsed ? "true" : "false"}
+      className="app-shell relative h-screen w-screen overflow-hidden bg-[var(--color-bg)] text-[var(--color-text-primary)]"
     >
       <NavRail
         route={route}
         onRoute={handleRoute}
         theme={theme}
         onToggleTheme={() => setTheme((current) => (current === "light" ? "dark" : "light"))}
+        collapsed={navCollapsed}
+        onToggleCollapsed={() => setNavCollapsed((current) => !current)}
       />
 
-      <main className="app-main absolute inset-0 z-10 min-w-0 overflow-hidden pl-[var(--nav-width)]">
+      <main className="app-main absolute inset-0 z-10 min-w-0 overflow-hidden pl-[var(--nav-width)] transition-[padding] duration-200 ease-out">
         <AnimatePresence mode="wait">
           <motion.div
             key={playback ? `playback-${playback.subject.id}-${playback.episode.key}` : detail ? `detail-${detail.id}` : `route-${route}`}

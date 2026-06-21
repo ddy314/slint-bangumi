@@ -1,5 +1,5 @@
 import { motion } from "framer-motion";
-import { Home, Library, Moon, Search, Settings, Sun } from "lucide-react";
+import { Home, Library, Moon, PanelLeftClose, PanelLeftOpen, Search, Settings, Sun } from "lucide-react";
 import type { ReactNode } from "react";
 import { appleSpring, appleSpringBouncy } from "./motion";
 import { cn } from "./utils/cn";
@@ -18,16 +18,35 @@ export function NavRail({
   onRoute,
   theme,
   onToggleTheme,
+  collapsed,
+  onToggleCollapsed,
 }: {
   route: Route;
   onRoute: (r: Route) => void;
   theme: "light" | "dark";
   onToggleTheme: () => void;
+  collapsed: boolean;
+  onToggleCollapsed: () => void;
 }) {
   return (
-    <aside className="nav-rail fixed inset-y-0 left-0 z-40 flex w-[var(--nav-width)] shrink-0 flex-col overflow-visible px-4 py-6 backdrop-blur-[32px] backdrop-saturate-[180%]">
-      <div className="nav-brand mb-8 flex items-center px-1">
-        <span className="text-[18px] font-semibold tracking-tight">NexPlay</span>
+    <aside
+      className={cn(
+        "nav-rail fixed inset-y-0 left-0 z-40 flex w-[var(--nav-width)] shrink-0 flex-col overflow-visible px-4 py-6 backdrop-blur-[32px] backdrop-saturate-[180%]",
+        collapsed && "is-collapsed"
+      )}
+    >
+      <div className="nav-brand mb-8 flex items-center justify-between gap-2 px-1">
+        <span className="nav-brand-text text-[18px] font-semibold tracking-tight">NexPlay</span>
+        <span className="nav-brand-mark hidden text-[17px] font-bold tracking-tight">N</span>
+        <button
+          type="button"
+          className="nav-collapse-button"
+          onClick={onToggleCollapsed}
+          aria-label={collapsed ? "展开侧边栏" : "折叠侧边栏"}
+          title={collapsed ? "展开侧边栏" : "折叠侧边栏"}
+        >
+          {collapsed ? <PanelLeftOpen size={18} /> : <PanelLeftClose size={18} />}
+        </button>
       </div>
       <nav className="relative z-[1] flex w-full flex-col gap-1.5">
         {items.map((item) => {
@@ -37,6 +56,8 @@ export function NavRail({
               key={item.id}
               type="button"
               onClick={() => onRoute(item.id)}
+              title={collapsed ? item.label : undefined}
+              aria-label={item.label}
               className={cn(
                 "nav-item relative flex h-[44px] w-full items-center gap-3 rounded-[var(--radius-control)] px-3.5 text-[15px] font-medium transition-colors",
                 active
@@ -54,7 +75,7 @@ export function NavRail({
                 />
               )}
               <span className="nav-item-icon relative flex size-6 shrink-0 items-center justify-center">{item.icon}</span>
-              <span className="relative leading-none">{item.label}</span>
+              <span className="nav-item-label relative leading-none">{item.label}</span>
             </motion.button>
           );
         })}
@@ -64,12 +85,13 @@ export function NavRail({
         type="button"
         title="切换外观"
         onClick={onToggleTheme}
+        aria-label={theme === "light" ? "切换到深色外观" : "切换到浅色外观"}
         className="nav-item relative z-[1] mt-auto flex h-[42px] w-full items-center gap-3 rounded-[var(--radius-control)] px-3.5 text-[14px] font-medium text-[var(--color-text-secondary)] transition-colors hover:text-[var(--color-text-primary)]"
       >
         <span className="nav-item-icon flex size-6 shrink-0 items-center justify-center">
           {theme === "light" ? <Moon size={19} strokeWidth={2} /> : <Sun size={19} strokeWidth={2} />}
         </span>
-        <span>{theme === "light" ? "深色" : "浅色"}</span>
+        <span className="nav-item-label">{theme === "light" ? "深色" : "浅色"}</span>
       </button>
     </aside>
   );
