@@ -1,15 +1,17 @@
 import { motion } from "framer-motion";
-import { Home, Library, Moon, PanelLeftClose, PanelLeftOpen, Search, Settings, Sun } from "lucide-react";
+import { DownloadCloud, Home, Library, Moon, PanelLeftClose, PanelLeftOpen, Search, Settings, Sun, Tags } from "lucide-react";
 import type { ReactNode } from "react";
 import { appleSpring, appleSpringBouncy } from "./motion";
 import { cn } from "./utils/cn";
 
-export type Route = "search" | "home" | "library" | "settings";
+export type Route = "search" | "home" | "library" | "resources" | "downloads" | "settings";
 
 const items: { id: Route; label: string; icon: ReactNode }[] = [
   { id: "search", label: "搜索", icon: <Search size={21} strokeWidth={2.1} /> },
   { id: "home", label: "主页", icon: <Home size={19} strokeWidth={2} /> },
   { id: "library", label: "媒体库", icon: <Library size={19} strokeWidth={2} /> },
+  { id: "resources", label: "资源", icon: <Tags size={19} strokeWidth={2} /> },
+  { id: "downloads", label: "下载", icon: <DownloadCloud size={19} strokeWidth={2} /> },
   { id: "settings", label: "设置", icon: <Settings size={19} strokeWidth={2} /> },
 ];
 

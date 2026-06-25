@@ -75,6 +75,9 @@ function registerBackendIpc(backendClient) {
   ipcMain.handle("backend:online-subject", (_event, payload) => (
     backendClient.request("onlineSubject", payload)
   ));
+  ipcMain.handle("backend:refresh-subject-metadata", (_event, payload) => (
+    backendClient.request("refreshSubjectMetadata", payload)
+  ));
   ipcMain.handle("backend:episode-resources", (_event, payload) => (
     backendClient.request("episodeResources", payload)
   ));
@@ -82,6 +85,9 @@ function registerBackendIpc(backendClient) {
     backendClient.request("startResourceDownload", payload)
   ));
   ipcMain.handle("backend:download-tasks", () => backendClient.request("downloadTasks"));
+  ipcMain.handle("backend:control-download-task", (_event, payload) => (
+    backendClient.request("controlDownloadTask", payload)
+  ));
   ipcMain.handle("backend:test-qbittorrent", () => backendClient.request("testQbittorrentConnection"));
 }
 

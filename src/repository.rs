@@ -37,6 +37,7 @@ impl Repository {
                     l.subject_id,
                     COUNT(DISTINCT m.id) AS file_count,
                     COALESCE(SUM(m.file_size), 0) AS total_size,
+                    COALESCE(MAX(m.modified_at), 0) AS latest_modified_at,
                     COALESCE(MAX(m.file_name), '') AS latest_file_name
                 FROM media_subject_links l
                 JOIN media_items m ON m.id = l.media_id AND m.deleted_at IS NULL
@@ -86,7 +87,8 @@ impl Repository {
             LEFT JOIN subject_image_cache hero
                 ON hero.subject_id = s.id AND hero.image_kind = 'hero'
             GROUP BY s.id
-            ORDER BY COALESCE(NULLIF(s.title_cn, ''), s.title) COLLATE NOCASE
+            ORDER BY COALESCE(fs.latest_modified_at, 0) DESC,
+                     COALESCE(NULLIF(s.title_cn, ''), s.title) COLLATE NOCASE
             "#,
         )?;
         let rows = stmt.query_map([], |row| {
@@ -1618,6 +1620,12 @@ impl Repository {
         )?;
         let rows = stmt.query_map([], map_download_task)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn delete_download_task(&self, task_id: i64) -> AppResult<()> {
+        let conn = self.connect()?;
+        conn.execute("DELETE FROM download_tasks WHERE id = ?1", params![task_id])?;
+        Ok(())
     }
 
     fn connect(&self) -> AppResult<Connection> {

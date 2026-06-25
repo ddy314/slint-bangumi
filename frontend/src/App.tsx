@@ -4,6 +4,8 @@ import { NavRail, type Route } from "./NavRail";
 import { LibraryPage } from "./pages/Library";
 import { DetailPage } from "./pages/Detail";
 import { PlayerPage } from "./pages/Player";
+import { DownloadsPage } from "./pages/Downloads";
+import { ResourcesPage, type ResourceSearchPrefill } from "./pages/Resources";
 import { SettingsPage } from "./pages/Settings";
 import { useBackendSnapshot } from "./backend";
 import { appleSpringSoft } from "./motion";
@@ -20,6 +22,7 @@ export default function App() {
   const [detail, setDetail] = useState<Subject | null>(null);
   const [playback, setPlayback] = useState<PlaybackState | null>(null);
   const [searchQuery, setSearchQuery] = useState("");
+  const [resourcePrefill, setResourcePrefill] = useState<ResourceSearchPrefill | null>(null);
   const [theme, setTheme] = useState<"light" | "dark">("light");
   const [navCollapsed, setNavCollapsed] = useState(false);
   const snack = useSnackbar();
@@ -37,6 +40,17 @@ export default function App() {
     if (r !== "search") {
       setSearchQuery("");
     }
+    if (r !== "resources") {
+      setResourcePrefill(null);
+    }
+  }, []);
+
+  const openResourceSearch = useCallback((subject: Subject) => {
+    setPlayback(null);
+    setDetail(null);
+    setResourcePrefill({ subject });
+    setRoute("resources");
+    window.scrollTo({ top: 0, behavior: "instant" as ScrollBehavior });
   }, []);
 
   return (
@@ -79,10 +93,19 @@ export default function App() {
                 subject={detail}
                 onBack={() => setDetail(null)}
                 onPlay={(subject, episode) => setPlayback({ subject, episode })}
+                onFindResources={openResourceSearch}
                 onSnack={snack.show}
               />
             ) : route === "settings" ? (
               <SettingsPage onSnack={snack.show} />
+            ) : route === "resources" ? (
+              <ResourcesPage
+                prefill={resourcePrefill}
+                onBackToDetail={(subject) => setDetail(subject)}
+                onSnack={snack.show}
+              />
+            ) : route === "downloads" ? (
+              <DownloadsPage onSnack={snack.show} />
             ) : (
               <LibraryPage
                 route={route}

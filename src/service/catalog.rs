@@ -1,13 +1,15 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, mpsc};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use quick_xml::Reader;
 use quick_xml::events::Event;
 use regex::Regex;
-use reqwest::blocking::{Client, multipart};
+use reqwest::Url;
+use reqwest::blocking::{Client, RequestBuilder, multipart};
+use reqwest::header::{ORIGIN, REFERER};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use ts_rs::TS;
@@ -89,6 +91,12 @@ pub struct DownloadTaskData {
     pub save_path: String,
     pub error: String,
     pub updated_at: i64,
+    pub state: String,
+    pub size: i64,
+    pub downloaded: i64,
+    pub dlspeed: i64,
+    pub eta: i64,
+    pub stale: bool,
 }
 
 #[derive(Clone)]
@@ -120,83 +128,22 @@ impl CatalogService {
 
     pub fn search_catalog(&self, query: &str, limit: usize) -> AppResult<Vec<CatalogSubjectData>> {
         let query = query.trim();
-        if query.chars().count() < 2 {
+        if query.is_empty() {
             return Ok(Vec::new());
         }
 
-        let variants = search_query_variants(query);
-        let (bangumi_tx, bangumi_rx) = std::sync::mpsc::channel();
-        let (dandan_tx, dandan_rx) = std::sync::mpsc::channel();
-
-        if let Ok(provider) = self.bangumi_provider() {
-            let variants = variants.clone();
-            std::thread::spawn(move || {
-                let mut out = Vec::new();
-                for variant in variants.iter().take(6) {
-                    match provider.search_subjects(variant) {
-                        Ok(subjects) => out.extend(
-                            subjects
-                                .into_iter()
-                                .take(8)
-                                .map(catalog_from_bangumi_search),
-                        ),
-                        Err(error) => {
-                            let _ = bangumi_tx.send(Err(error));
-                            return;
-                        }
-                    }
-                }
-                let _ = bangumi_tx.send(Ok(out));
-            });
-        } else {
-            let _ = bangumi_tx.send(Ok(Vec::new()));
-        }
-
-        if self.dandanplay_configured() {
-            let service = self.clone();
-            let variants = variants.clone();
-            std::thread::spawn(move || {
-                let mut out = Vec::new();
-                for variant in variants.iter().take(3) {
-                    match service.search_dandanplay_anime(variant) {
-                        Ok(subjects) => out.extend(subjects.into_iter().take(8)),
-                        Err(error) => {
-                            let _ = dandan_tx.send(Err(error));
-                            return;
-                        }
-                    }
-                }
-                let _ = dandan_tx.send(Ok(out));
-            });
-        } else {
-            let _ = dandan_tx.send(Ok(Vec::new()));
-        }
-
+        let provider = self.bangumi_provider()?;
         let mut results = Vec::new();
         let mut seen = HashSet::new();
-        let deadline = Instant::now() + Duration::from_secs(8);
-        for receiver in [bangumi_rx, dandan_rx] {
-            let remaining = deadline
-                .checked_duration_since(Instant::now())
-                .unwrap_or_else(|| Duration::from_millis(1));
-            let received = receiver.recv_timeout(remaining);
-            match received {
-                Ok(Ok(subjects)) => {
-                    for subject in subjects.into_iter().take(limit.max(1)) {
-                        push_unique(&mut results, &mut seen, subject);
-                    }
-                }
-                Ok(Err(error)) => self.send_log(format!("online catalog search failed: {error}")),
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => self.send_log(
-                    "online catalog search timed out; returning partial results".to_string(),
-                ),
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    self.send_log("online catalog worker disconnected".to_string())
-                }
-            }
+        for subject in provider
+            .search_subjects(query)?
+            .into_iter()
+            .take(limit.max(1))
+            .map(catalog_from_bangumi_search)
+        {
+            push_unique(&mut results, &mut seen, subject);
         }
 
-        let mut results = merge_equivalent_subjects(results);
         results.sort_by(|left, right| {
             online_subject_score(right, query)
                 .cmp(&online_subject_score(left, query))
@@ -280,7 +227,7 @@ impl CatalogService {
         title: &str,
         title_cn: &str,
         aliases: &[String],
-        episode_number: f64,
+        episode_number: Option<f64>,
         limit: usize,
     ) -> AppResult<Vec<EpisodeResourceData>> {
         let config = self.config.snapshot().nyaa;
@@ -298,7 +245,7 @@ impl CatalogService {
         }
 
         for query in resource_queries(&title_candidates, episode_number) {
-            let mut candidates = self.fetch_nyaa_rss(&config.base_url, &config.category, &query)?;
+            let mut candidates = self.fetch_nyaa_rss(&config.base_url, "0_0", &query)?;
             for candidate in candidates.drain(..) {
                 if !seen.insert(candidate.torrent_url.clone()) {
                     continue;
@@ -306,18 +253,25 @@ impl CatalogService {
                 if !resource_matches_title(&candidate.title, &title_candidates) {
                     continue;
                 }
-                if !resource_matches_episode(&candidate.title, episode_number) {
-                    continue;
+                if let Some(episode_number) = episode_number {
+                    if !resource_matches_episode(&candidate.title, episode_number) {
+                        continue;
+                    }
                 }
+                let display_episode = episode_number.unwrap_or_else(|| {
+                    parse_episode_number(&candidate.title)
+                        .map(|episode| episode as f64)
+                        .unwrap_or(1.0)
+                });
                 let mut candidate = candidate;
                 candidate.subject_provider = subject_provider.to_string();
                 candidate.provider_subject_id = provider_subject_id.to_string();
-                candidate.episode_number = Some(episode_number);
+                candidate.episode_number = episode_number;
                 let id = self
                     .repository
                     .upsert_resource_candidate(&candidate, task::unix_timestamp_ms())?;
                 candidate.id = id;
-                resources.push(frontend_resource_from_domain(candidate, episode_number));
+                resources.push(frontend_resource_from_domain(candidate, display_episode));
             }
             if resources.len() >= limit.max(1) {
                 break;
@@ -398,16 +352,111 @@ impl CatalogService {
     }
 
     pub fn list_download_tasks(&self) -> AppResult<Vec<DownloadTaskData>> {
-        Ok(self
+        let tasks = self
             .repository
             .list_download_tasks()?
             .into_iter()
-            .map(frontend_download_task_from_domain)
+            .collect::<Vec<_>>();
+        let qbit_by_hash = self.refresh_qbittorrent_task_statuses(&tasks);
+        Ok(tasks
+            .into_iter()
+            .map(|task| {
+                let hash = task
+                    .qbittorrent_hash
+                    .as_deref()
+                    .or(task.info_hash.as_deref())
+                    .map(|hash| hash.to_ascii_lowercase());
+                let qbit = hash
+                    .as_deref()
+                    .and_then(|hash| qbit_by_hash.as_ref().ok().and_then(|map| map.get(hash)));
+                let mut data = frontend_download_task_from_domain(task);
+                if let Some(info) = qbit {
+                    apply_qbittorrent_info_to_frontend(&mut data, info);
+                } else if qbit_by_hash.is_ok() && is_active_download_status(&data.status) {
+                    data.status = "missing".to_string();
+                    data.stale = true;
+                    if data.error.is_empty() {
+                        data.error = "qBittorrent 中不存在此任务，可清除本地记录。".to_string();
+                    }
+                } else if qbit_by_hash.is_err() && is_active_download_status(&data.status) {
+                    data.stale = true;
+                    if data.error.is_empty() {
+                        data.error = qbit_by_hash
+                            .as_ref()
+                            .err()
+                            .map(ToString::to_string)
+                            .unwrap_or_else(|| "qBittorrent status refresh failed".to_string());
+                    }
+                }
+                data
+            })
             .collect())
     }
 
     pub fn test_qbittorrent_connection(&self) -> AppResult<()> {
-        self.login_qbittorrent().map(|_| ())
+        let session = self.login_qbittorrent()?;
+        self.validate_qbittorrent_session(&session).map(|_| ())
+    }
+
+    pub fn control_download_task(
+        &self,
+        task_id: i64,
+        action: &str,
+        delete_files: bool,
+    ) -> AppResult<()> {
+        let Some(task) = self.repository.get_download_task(task_id)? else {
+            return Err(AppError::Api(format!("download task #{task_id} not found")));
+        };
+        let hash = task
+            .qbittorrent_hash
+            .as_deref()
+            .or(task.info_hash.as_deref())
+            .map(str::trim)
+            .filter(|hash| !hash.is_empty())
+            .map(ToString::to_string);
+
+        match action {
+            "pause" => {
+                let hash = hash.ok_or_else(|| {
+                    AppError::Api("download task has no qBittorrent hash".to_string())
+                })?;
+                self.qbittorrent_torrent_action("pause", &hash, false)?;
+                self.repository.update_download_task_status(
+                    task_id,
+                    "paused",
+                    task.progress,
+                    Some(&hash),
+                    task.save_path.as_deref(),
+                    None,
+                    task::unix_timestamp_ms(),
+                )
+            }
+            "resume" => {
+                let hash = hash.ok_or_else(|| {
+                    AppError::Api("download task has no qBittorrent hash".to_string())
+                })?;
+                self.qbittorrent_torrent_action("resume", &hash, false)?;
+                self.repository.update_download_task_status(
+                    task_id,
+                    "queued",
+                    task.progress,
+                    Some(&hash),
+                    task.save_path.as_deref(),
+                    None,
+                    task::unix_timestamp_ms(),
+                )
+            }
+            "cancel" => {
+                if let Some(hash) = hash.as_deref() {
+                    self.qbittorrent_torrent_action("delete", hash, delete_files)?;
+                }
+                self.repository.delete_download_task(task_id)
+            }
+            "remove" => self.repository.delete_download_task(task_id),
+            other => Err(AppError::Api(format!(
+                "unsupported download action: {other}"
+            ))),
+        }
     }
 
     fn bangumi_provider(&self) -> AppResult<BangumiProvider> {
@@ -486,26 +535,42 @@ impl CatalogService {
         parse_nyaa_rss(&response.text()?)
     }
 
-    fn login_qbittorrent(&self) -> AppResult<QbittorrentConfig> {
+    fn login_qbittorrent(&self) -> AppResult<QbittorrentSession> {
         let config = self.config.snapshot().qbittorrent;
         if !config.enabled {
             return Err(AppError::Config(
                 "qBittorrent integration is disabled".to_string(),
             ));
         }
-        let base = config.base_url.trim_end_matches('/');
+        let base = config.base_url.trim_end_matches('/').to_string();
+        let origin = qbit_origin_from_base(&base)?;
+        let session = QbittorrentSession {
+            config,
+            base,
+            origin,
+        };
         let response = self
-            .client
-            .post(format!("{base}/api/v2/auth/login"))
-            .header("Referer", base)
+            .qbit_headers(
+                self.client
+                    .post(format!("{}/api/v2/auth/login", session.base)),
+                &session,
+            )
             .form(&[
-                ("username", config.username.as_str()),
-                ("password", config.password.as_str()),
+                ("username", session.config.username.as_str()),
+                ("password", session.config.password.as_str()),
             ])
             .send()?;
         ensure_http_success(response.status(), "qBittorrent login")?;
         let body = response.text().unwrap_or_default();
         if !body.trim().eq_ignore_ascii_case("Ok.") {
+            if body.trim().is_empty() {
+                self.validate_qbittorrent_session(&session).map_err(|error| {
+                    AppError::Api(format!(
+                        "qBittorrent login returned an empty response and session validation failed: {error}"
+                    ))
+                })?;
+                return Ok(session);
+            }
             let message = if body.trim().eq_ignore_ascii_case("Fails.") {
                 "qBittorrent login rejected username or password".to_string()
             } else {
@@ -513,29 +578,54 @@ impl CatalogService {
             };
             return Err(AppError::Api(message));
         }
-        Ok(config)
+        Ok(session)
+    }
+
+    fn validate_qbittorrent_session(&self, session: &QbittorrentSession) -> AppResult<String> {
+        let response = self
+            .qbit_headers(
+                self.client
+                    .get(format!("{}/api/v2/torrents/info", session.base)),
+                session,
+            )
+            .query(&[("limit", "1")])
+            .send()?;
+        ensure_http_success(response.status(), "qBittorrent torrent list check")?;
+        Ok(response.text().unwrap_or_default())
     }
 
     fn add_qbittorrent_torrent(
         &self,
         resource: &EpisodeResourceData,
     ) -> AppResult<QbitTorrentInfo> {
-        let config = self.login_qbittorrent()?;
-        let base = config.base_url.trim_end_matches('/');
+        let session = self.login_qbittorrent()?;
         let mut form = multipart::Form::new().text("urls", resource.torrent_url.clone());
-        if !config.save_path.trim().is_empty() {
-            form = form.text("savepath", config.save_path.clone());
+        let save_path = if !session.config.save_path.trim().is_empty() {
+            session.config.save_path.clone()
+        } else {
+            self.config
+                .snapshot()
+                .media_libraries
+                .first()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default()
+        };
+        if !save_path.trim().is_empty() {
+            form = form.text("savepath", save_path);
         }
-        if !config.category.trim().is_empty() {
-            form = form.text("category", config.category.clone());
+        if !session.config.category.trim().is_empty() {
+            form = form.text("category", session.config.category.clone());
         }
-        if !config.tags.trim().is_empty() {
-            form = form.text("tags", config.tags.clone());
+        if !session.config.tags.trim().is_empty() {
+            form = form.text("tags", session.config.tags.clone());
         }
 
         let response = self
-            .client
-            .post(format!("{base}/api/v2/torrents/add"))
+            .qbit_headers(
+                self.client
+                    .post(format!("{}/api/v2/torrents/add", session.base)),
+                &session,
+            )
             .multipart(form)
             .send()?;
         ensure_http_success(response.status(), "qBittorrent add torrent")?;
@@ -545,8 +635,11 @@ impl CatalogService {
             return Ok(QbitTorrentInfo::default());
         }
         let response = self
-            .client
-            .get(format!("{base}/api/v2/torrents/info"))
+            .qbit_headers(
+                self.client
+                    .get(format!("{}/api/v2/torrents/info", session.base)),
+                &session,
+            )
             .query(&[("hashes", info_hash.as_str())])
             .send()?;
         ensure_http_success(response.status(), "qBittorrent torrent info")?;
@@ -555,6 +648,108 @@ impl CatalogService {
             hash: Some(info_hash),
             ..QbitTorrentInfo::default()
         }))
+    }
+
+    fn refresh_qbittorrent_task_statuses(
+        &self,
+        tasks: &[DownloadTask],
+    ) -> AppResult<HashMap<String, QbitTorrentInfo>> {
+        let hashes = tasks
+            .iter()
+            .filter(|task| is_active_download_status(&task.status))
+            .filter_map(|task| {
+                task.qbittorrent_hash
+                    .as_deref()
+                    .or(task.info_hash.as_deref())
+                    .map(str::trim)
+                    .filter(|hash| !hash.is_empty())
+                    .map(|hash| hash.to_ascii_lowercase())
+            })
+            .collect::<Vec<_>>();
+        if hashes.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let session = self.login_qbittorrent()?;
+        let hash_query = dedupe_strings(hashes).join("|");
+        let response = self
+            .qbit_headers(
+                self.client
+                    .get(format!("{}/api/v2/torrents/info", session.base)),
+                &session,
+            )
+            .query(&[("hashes", hash_query.as_str())])
+            .send()?;
+        ensure_http_success(response.status(), "qBittorrent torrent info")?;
+        let infos = response.json::<Vec<QbitTorrentInfo>>()?;
+        let now = task::unix_timestamp_ms();
+        let mut by_hash = HashMap::new();
+        for info in infos {
+            let Some(hash) = info.hash.as_deref().map(|hash| hash.to_ascii_lowercase()) else {
+                continue;
+            };
+            if let Some(task) = tasks.iter().find(|task| {
+                task.qbittorrent_hash
+                    .as_deref()
+                    .or(task.info_hash.as_deref())
+                    .is_some_and(|candidate| candidate.eq_ignore_ascii_case(&hash))
+            }) {
+                let status = qbit_status(&info);
+                let was_completed = task.status == "completed";
+                self.repository.update_download_task_status(
+                    task.id,
+                    &status,
+                    info.progress,
+                    Some(&hash),
+                    info.save_path.as_deref(),
+                    None,
+                    now,
+                )?;
+                if !was_completed && status == "completed" {
+                    let _ = self.events.send(AppEvent::DownloadCompleted {
+                        task_id: task.id,
+                        title: task.title.clone(),
+                    });
+                }
+            }
+            by_hash.insert(hash, info);
+        }
+        Ok(by_hash)
+    }
+
+    fn qbit_headers(
+        &self,
+        request: RequestBuilder,
+        session: &QbittorrentSession,
+    ) -> RequestBuilder {
+        request
+            .header(ORIGIN, session.origin.as_str())
+            .header(REFERER, session.origin.as_str())
+    }
+
+    fn qbittorrent_torrent_action(
+        &self,
+        action: &str,
+        hash: &str,
+        delete_files: bool,
+    ) -> AppResult<()> {
+        let session = self.login_qbittorrent()?;
+        let mut params = vec![("hashes", hash.to_string())];
+        if action == "delete" {
+            params.push(("deleteFiles", delete_files.to_string()));
+        }
+        let response = self
+            .qbit_headers(
+                self.client
+                    .post(format!("{}/api/v2/torrents/{action}", session.base)),
+                &session,
+            )
+            .form(&params)
+            .send()?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(());
+        }
+        ensure_http_success(response.status(), &format!("qBittorrent {action} torrent"))
     }
 
     fn signed_dandanplay_headers(
@@ -953,16 +1148,20 @@ fn push_resource_title(titles: &mut Vec<String>, title: &str) {
     titles.push(title.to_string());
 }
 
-fn resource_queries(titles: &[String], episode_number: f64) -> Vec<String> {
-    let episode = episode_number.round().max(1.0) as i64;
+fn resource_queries(titles: &[String], episode_number: Option<f64>) -> Vec<String> {
     let mut queries = Vec::new();
     for raw_title in titles {
         let title = raw_title.trim();
-        queries.push(format!("{title} {episode:02}"));
-        queries.push(format!("{title} {episode}"));
-        queries.push(format!("{title} S01E{episode:02}"));
-        if episode > 1 {
-            queries.push(format!("{title} batch"));
+        if let Some(episode_number) = episode_number {
+            let episode = episode_number.round().max(1.0) as i64;
+            queries.push(format!("{title} {episode:02}"));
+            queries.push(format!("{title} {episode}"));
+            queries.push(format!("{title} S01E{episode:02}"));
+            if episode > 1 {
+                queries.push(format!("{title} batch"));
+            }
+        } else {
+            queries.push(title.to_string());
         }
     }
     dedupe_strings(queries)
@@ -1021,7 +1220,56 @@ fn frontend_download_task_from_domain(task: DownloadTask) -> DownloadTaskData {
         save_path: task.save_path.unwrap_or_default(),
         error: task.error.unwrap_or_default(),
         updated_at: task.updated_at,
+        state: String::new(),
+        size: 0,
+        downloaded: 0,
+        dlspeed: 0,
+        eta: -1,
+        stale: false,
     }
+}
+
+fn apply_qbittorrent_info_to_frontend(task: &mut DownloadTaskData, info: &QbitTorrentInfo) {
+    task.state = info.state.clone().unwrap_or_default();
+    task.status = qbit_status(info);
+    task.progress = info.progress;
+    task.save_path = info.save_path.clone().unwrap_or_default();
+    task.size = info.size.unwrap_or_default();
+    task.downloaded = info.downloaded.unwrap_or_default();
+    task.dlspeed = info.dlspeed.unwrap_or_default();
+    task.eta = info.eta.unwrap_or(-1);
+    task.stale = false;
+    if let Some(hash) = &info.hash {
+        task.qbittorrent_hash = hash.clone();
+    }
+}
+
+fn qbit_status(info: &QbitTorrentInfo) -> String {
+    let state = info.state.as_deref().unwrap_or_default();
+    let progress = info.progress.clamp(0.0, 1.0);
+    match state {
+        "error" | "missingFiles" => "failed".to_string(),
+        "pausedDL" | "pausedUP" => {
+            if progress >= 0.999 {
+                "completed".to_string()
+            } else {
+                "paused".to_string()
+            }
+        }
+        "queuedDL" | "checkingDL" | "metaDL" => "queued".to_string(),
+        "downloading" | "stalledDL" | "forcedDL" | "checkingResumeData" | "moving" => {
+            "downloading".to_string()
+        }
+        "uploading" | "stalledUP" | "queuedUP" | "checkingUP" | "forcedUP" => {
+            "completed".to_string()
+        }
+        _ if progress >= 0.999 => "completed".to_string(),
+        _ => "queued".to_string(),
+    }
+}
+
+fn is_active_download_status(status: &str) -> bool {
+    !matches!(status, "completed" | "failed" | "cancelled")
 }
 
 fn parse_nyaa_rss(xml: &str) -> AppResult<Vec<ResourceCandidate>> {
@@ -1259,6 +1507,18 @@ fn dedupe_strings(values: Vec<String>) -> Vec<String> {
     out
 }
 
+fn qbit_origin_from_base(base: &str) -> AppResult<String> {
+    let url = Url::parse(base)
+        .map_err(|error| AppError::Config(format!("invalid qBittorrent WebUI address: {error}")))?;
+    let origin = url.origin().ascii_serialization();
+    if origin == "null" {
+        return Err(AppError::Config(
+            "invalid qBittorrent WebUI address: missing origin".to_string(),
+        ));
+    }
+    Ok(origin)
+}
+
 fn strip_html(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     let mut in_tag = false;
@@ -1373,8 +1633,19 @@ struct DandanBangumiDetail {
 struct QbitTorrentInfo {
     hash: Option<String>,
     progress: f64,
+    state: Option<String>,
+    size: Option<i64>,
+    downloaded: Option<i64>,
+    dlspeed: Option<i64>,
+    eta: Option<i64>,
     #[serde(rename = "save_path")]
     save_path: Option<String>,
+}
+
+struct QbittorrentSession {
+    config: QbittorrentConfig,
+    base: String,
+    origin: String,
 }
 
 #[cfg(test)]
@@ -1444,7 +1715,7 @@ mod tests {
             "在超市后门吸烟的二人",
             &["Smoking Behind the Supermarket with You".to_string()],
         );
-        let queries = resource_queries(&titles, 7.0);
+        let queries = resource_queries(&titles, Some(7.0));
         assert!(
             !queries
                 .iter()
@@ -1458,6 +1729,12 @@ mod tests {
             "[SubsPlease] Completely Different Anime (01-12) (1080p) [Batch]",
             &titles
         ));
+    }
+
+    #[test]
+    fn subject_resource_search_uses_selected_keyword_once() {
+        let queries = resource_queries(&["章鱼哔的原罪".to_string()], None);
+        assert_eq!(queries, vec!["章鱼哔的原罪"]);
     }
 
     #[test]
@@ -1502,5 +1779,39 @@ mod tests {
         assert!(online_subject_score(&matching, query) > online_subject_score(&unrelated, query));
     }
 
+    #[test]
+    fn parses_qbittorrent_origin_without_path() {
+        assert_eq!(
+            qbit_origin_from_base("http://127.0.0.1:8080/").expect("origin"),
+            "http://127.0.0.1:8080"
+        );
+        assert_eq!(
+            qbit_origin_from_base("https://example.test/qbit").expect("origin"),
+            "https://example.test"
+        );
+    }
 
+    #[test]
+    fn maps_qbittorrent_states_to_download_statuses() {
+        let downloading = QbitTorrentInfo {
+            state: Some("downloading".to_string()),
+            progress: 0.42,
+            ..QbitTorrentInfo::default()
+        };
+        assert_eq!(qbit_status(&downloading), "downloading");
+
+        let completed = QbitTorrentInfo {
+            state: Some("stalledUP".to_string()),
+            progress: 1.0,
+            ..QbitTorrentInfo::default()
+        };
+        assert_eq!(qbit_status(&completed), "completed");
+
+        let failed = QbitTorrentInfo {
+            state: Some("missingFiles".to_string()),
+            progress: 0.2,
+            ..QbitTorrentInfo::default()
+        };
+        assert_eq!(qbit_status(&failed), "failed");
+    }
 }

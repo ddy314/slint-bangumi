@@ -30,7 +30,7 @@ const emptySettings: EditableSettings = {
   dandanplayApiKey: "",
   nyaaEnabled: true,
   nyaaBaseUrl: "https://nyaa.si",
-  nyaaCategory: "1_2",
+  nyaaCategory: "0_0",
   qbittorrentEnabled: false,
   qbittorrentBaseUrl: "http://127.0.0.1:8080",
   qbittorrentUsername: "admin",
@@ -346,7 +346,7 @@ export function SettingsPage({
               />
               <SettingsRow
                 title="分类"
-                desc="Nyaa 分类 ID，默认 1_2 为 Anime - English-translated。"
+                desc="Nyaa 分类 ID，默认 0_0 为全分类搜索。"
                 control={
                   <TextInput
                     value={settings.nyaaCategory}

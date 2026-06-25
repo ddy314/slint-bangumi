@@ -312,6 +312,8 @@ export function useBackendSnapshot() {
     void refresh();
   }, [refresh]);
 
+  const autoScanGuardRef = useRef(false);
+
   useEffect(() => {
     if (!window.nexplay?.onBackendEvent) {
       return;
@@ -373,10 +375,19 @@ export function useBackendSnapshot() {
             stage: "failed",
             message: event.message || "扫描失败",
           }));
+          autoScanGuardRef.current = false;
+          break;
+        case "downloadCompleted":
+          if (!autoScanGuardRef.current) {
+            autoScanGuardRef.current = true;
+            scanLibrary().finally(() => {
+              autoScanGuardRef.current = false;
+            });
+          }
           break;
       }
     });
-  }, [appendLog, commitScanStatus, queueScanStatus]);
+  }, [appendLog, commitScanStatus, queueScanStatus, scanLibrary]);
 
   useEffect(() => () => {
     if (logFlushTimerRef.current !== null) {
@@ -416,13 +427,20 @@ export async function loadOnlineSubject(provider: string, providerSubjectId: str
   return window.nexplay.onlineSubject({ provider, providerSubjectId });
 }
 
+export async function refreshSubjectMetadata(subjectId: number) {
+  if (!window.nexplay) {
+    throw new Error("当前页面没有连接到 NexPlay 后端。");
+  }
+  return window.nexplay.refreshSubjectMetadata({ subjectId });
+}
+
 export async function searchEpisodeResources(input: {
   subjectProvider: string;
   providerSubjectId: string;
   title: string;
   titleCn: string;
   aliases?: string[];
-  episodeNumber: number;
+  episodeNumber?: number;
   limit?: number;
 }): Promise<EpisodeResources> {
   if (!window.nexplay) {
@@ -441,6 +459,24 @@ export async function startResourceDownload(input: {
     throw new Error("当前页面没有连接到 NexPlay 后端。");
   }
   return window.nexplay.startResourceDownload(input);
+}
+
+export async function downloadTasks(): Promise<DownloadTasks> {
+  if (!window.nexplay) {
+    return { tasks: [] };
+  }
+  return window.nexplay.downloadTasks();
+}
+
+export async function controlDownloadTask(input: {
+  taskId: number;
+  action: "pause" | "resume" | "cancel" | "remove";
+  deleteFiles?: boolean;
+}): Promise<DownloadTasks> {
+  if (!window.nexplay) {
+    return { tasks: [] };
+  }
+  return window.nexplay.controlDownloadTask({ ...input, deleteFiles: input.deleteFiles ?? false });
 }
 
 export async function testQbittorrentConnection(): Promise<ConnectionTest> {

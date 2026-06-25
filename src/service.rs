@@ -436,6 +436,24 @@ impl MetadataService {
         self.repository.tentative_count()
     }
 
+    pub fn refresh_subject_blocking(&self, subject_id: i64) -> AppResult<()> {
+        let subject = self
+            .repository
+            .get_subject(subject_id)?
+            .ok_or_else(|| AppError::Api(format!("subject #{subject_id} not found")))?;
+        if subject.provider != "bangumi" {
+            return Err(AppError::Api(format!(
+                "metadata refresh is only supported for Bangumi subjects, got {}",
+                subject.provider
+            )));
+        }
+        let provider = self.provider()?;
+        let detail = provider.get_subject(&subject.provider_subject_id)?;
+        self.upsert_subject_detail_with_children(&provider, &detail)?;
+        let _ = self.events.send(AppEvent::SubjectUpdated { subject_id });
+        Ok(())
+    }
+
     pub fn scrape_library_blocking(&self) -> AppResult<usize> {
         let media = self.repository.metadata_scrape_targets()?;
         if media.is_empty() {

@@ -41,7 +41,7 @@ export type CatalogSubjectData = { id: string, provider: string, providerSubject
 
 export type EpisodeResourceData = { id: number, provider: string, title: string, subtitleGroup: string, resolution: string, torrentUrl: string, pageUrl: string, infoHash: string, size: string, seeders: number, leechers: number, downloads: number, trusted: boolean, remake: boolean, batch: boolean, episodeStart: number, episodeEnd: number, publishedAt: string, score: number, };
 
-export type DownloadTaskData = { id: number, resourceId?: number, subjectProvider: string, providerSubjectId: string, episodeNumber?: number, title: string, torrentUrl: string, infoHash: string, qbittorrentHash: string, status: string, progress: number, savePath: string, error: string, updatedAt: number, };
+export type DownloadTaskData = { id: number, resourceId?: number, subjectProvider: string, providerSubjectId: string, episodeNumber?: number, title: string, torrentUrl: string, infoHash: string, qbittorrentHash: string, status: string, progress: number, savePath: string, error: string, updatedAt: number, state: string, size: number, downloaded: number, dlspeed: number, eta: number, stale: boolean, };
 
 export type CatalogSearchRequest = { query: string, limit: number, };
 
@@ -49,13 +49,17 @@ export type CatalogSearchResponse = { subjects: Array<FrontendSubject>, };
 
 export type OnlineSubjectRequest = { provider: string, providerSubjectId: string, };
 
-export type EpisodeResourcesRequest = { subjectProvider: string, providerSubjectId: string, title: string, titleCn: string, aliases: Array<string>, episodeNumber: number, limit: number, };
+export type RefreshSubjectRequest = { subjectId: number, };
+
+export type EpisodeResourcesRequest = { subjectProvider: string, providerSubjectId: string, title: string, titleCn: string, aliases: Array<string>, episodeNumber?: number, limit: number, };
 
 export type EpisodeResourcesResponse = { resources: Array<EpisodeResourceData>, };
 
 export type StartResourceDownloadRequest = { resource: EpisodeResourceData, subjectProvider: string, providerSubjectId: string, episodeNumber?: number, };
 
 export type DownloadTasksResponse = { tasks: Array<DownloadTaskData>, };
+
+export type DownloadTaskActionRequest = { taskId: number, action: string, deleteFiles: boolean, };
 
 export type ConnectionTestResponse = { ok: boolean, message: string, };
 

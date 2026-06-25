@@ -9,9 +9,11 @@ interface Window {
     saveSettings: (settings: import("./backend").EditableSettings) => Promise<import("./backend").EditableSettings>;
     searchCatalog: (payload: import("./generated/backend").CatalogSearchRequest) => Promise<import("./backend").CatalogSearch>;
     onlineSubject: (payload: import("./generated/backend").OnlineSubjectRequest) => Promise<import("./data").Subject>;
+    refreshSubjectMetadata: (payload: import("./generated/backend").RefreshSubjectRequest) => Promise<import("./data").Subject>;
     episodeResources: (payload: import("./generated/backend").EpisodeResourcesRequest) => Promise<import("./backend").EpisodeResources>;
     startResourceDownload: (payload: import("./generated/backend").StartResourceDownloadRequest) => Promise<import("./backend").DownloadTask>;
     downloadTasks: () => Promise<import("./backend").DownloadTasks>;
+    controlDownloadTask: (payload: import("./generated/backend").DownloadTaskActionRequest) => Promise<import("./backend").DownloadTasks>;
     testQbittorrentConnection: () => Promise<import("./backend").ConnectionTest>;
     openMedia: (mediaId: number) => Promise<{ opened: boolean }>;
     getMediaSource: (mediaId: number) => Promise<import("./backend").MediaSource>;

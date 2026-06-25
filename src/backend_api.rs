@@ -203,13 +203,20 @@ pub struct OnlineSubjectRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
+pub struct RefreshSubjectRequest {
+    pub subject_id: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
 pub struct EpisodeResourcesRequest {
     pub subject_provider: String,
     pub provider_subject_id: String,
     pub title: String,
     pub title_cn: String,
     pub aliases: Vec<String>,
-    pub episode_number: f64,
+    #[ts(optional)]
+    pub episode_number: Option<f64>,
     pub limit: usize,
 }
 
@@ -233,6 +240,14 @@ pub struct StartResourceDownloadRequest {
 #[serde(rename_all = "camelCase")]
 pub struct DownloadTasksResponse {
     pub tasks: Vec<DownloadTaskData>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct DownloadTaskActionRequest {
+    pub task_id: i64,
+    pub action: String,
+    pub delete_files: bool,
 }
 
 #[derive(Debug, Serialize, TS)]
@@ -424,6 +439,27 @@ pub fn online_subject(
         .map(frontend_subject_from_catalog)
 }
 
+pub fn refresh_subject_metadata(
+    context: &AppContext,
+    input: RefreshSubjectRequest,
+) -> AppResult<FrontendSubject> {
+    context
+        .metadata
+        .refresh_subject_blocking(input.subject_id)?;
+    let card = context
+        .media
+        .list_series_cards()?
+        .into_iter()
+        .find(|card| card.subject_id == input.subject_id)
+        .ok_or_else(|| {
+            crate::error::AppError::Api(format!(
+                "refreshed subject #{} is not in the local library",
+                input.subject_id
+            ))
+        })?;
+    Ok(frontend_subject_from_series(card))
+}
+
 pub fn episode_resources(
     context: &AppContext,
     input: EpisodeResourcesRequest,
@@ -457,6 +493,16 @@ pub fn download_tasks(context: &AppContext) -> AppResult<DownloadTasksResponse> 
     Ok(DownloadTasksResponse {
         tasks: context.catalog.list_download_tasks()?,
     })
+}
+
+pub fn control_download_task(
+    context: &AppContext,
+    input: DownloadTaskActionRequest,
+) -> AppResult<DownloadTasksResponse> {
+    context
+        .catalog
+        .control_download_task(input.task_id, &input.action, input.delete_files)?;
+    download_tasks(context)
 }
 
 pub fn test_qbittorrent_connection(context: &AppContext) -> ConnectionTestResponse {
@@ -731,6 +777,11 @@ pub fn frontend_event_from_app(event: AppEvent) -> BackendEvent {
             message: Some(message),
             ..BackendEvent::new("metadataStatus")
         },
+        AppEvent::DownloadCompleted { task_id, title } => BackendEvent {
+            target_id: Some(task_id),
+            message: Some(format!("下载完成：{title}")),
+            ..BackendEvent::new("downloadCompleted")
+        },
     }
 }
 
@@ -766,10 +817,12 @@ pub fn export_types(output_path: impl AsRef<Path>) -> AppResult<()> {
         CatalogSearchRequest::decl(&ts_config),
         CatalogSearchResponse::decl(&ts_config),
         OnlineSubjectRequest::decl(&ts_config),
+        RefreshSubjectRequest::decl(&ts_config),
         EpisodeResourcesRequest::decl(&ts_config),
         EpisodeResourcesResponse::decl(&ts_config),
         StartResourceDownloadRequest::decl(&ts_config),
         DownloadTasksResponse::decl(&ts_config),
+        DownloadTaskActionRequest::decl(&ts_config),
         ConnectionTestResponse::decl(&ts_config),
         BackendEvent::decl(&ts_config),
     ]

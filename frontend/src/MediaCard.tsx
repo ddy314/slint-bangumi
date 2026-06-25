@@ -92,6 +92,7 @@ export const MediaCard = memo(function MediaCard({
     <button
       type="button"
       onClick={handleClick}
+      data-timeline-year={subject.year > 0 ? subject.year : undefined}
       className={cn(
         "media-card cv-media-card group relative min-w-0 cursor-pointer text-left focus:outline-none",
         selected && "ring-2 ring-[var(--color-primary)] ring-offset-2 ring-offset-[var(--color-bg)]"

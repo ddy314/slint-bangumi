@@ -60,6 +60,10 @@ pub enum AppEvent {
         error: String,
     },
     MetadataStatus(String),
+    DownloadCompleted {
+        task_id: i64,
+        title: String,
+    },
 }
 
 pub fn spawn_media_scan(

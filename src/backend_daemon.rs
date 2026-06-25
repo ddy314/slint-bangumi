@@ -7,11 +7,12 @@ use serde_json::Value;
 
 use crate::app::AppContext;
 use crate::backend_api::{
-    CatalogSearchRequest, DanmakuTrackRequest, EpisodeResourcesRequest, FrontendEditableSettings,
-    MediaSourceRequest, OnlineSubjectRequest, OpenMediaRequest, StartResourceDownloadRequest,
-    danmaku_track, download_tasks, episode_resources, frontend_event_from_app, media_source,
-    online_subject, open_media, save_settings_config, scan, search_catalog, settings_config,
-    snapshot, start_resource_download, test_qbittorrent_connection,
+    CatalogSearchRequest, DanmakuTrackRequest, DownloadTaskActionRequest, EpisodeResourcesRequest,
+    FrontendEditableSettings, MediaSourceRequest, OnlineSubjectRequest, OpenMediaRequest,
+    RefreshSubjectRequest, StartResourceDownloadRequest, control_download_task, danmaku_track,
+    download_tasks, episode_resources, frontend_event_from_app, media_source, online_subject,
+    open_media, refresh_subject_metadata, save_settings_config, scan, search_catalog,
+    settings_config, snapshot, start_resource_download, test_qbittorrent_connection,
 };
 use crate::error::{AppError, AppResult, io_error};
 use crate::task::AppEvent;
@@ -147,6 +148,10 @@ fn dispatch(context: &AppContext, method: &str, params: Option<Value>) -> AppRes
             let input: OnlineSubjectRequest = from_params(params)?;
             to_value(online_subject(context, input)?)
         }
+        "refreshSubjectMetadata" => {
+            let input: RefreshSubjectRequest = from_params(params)?;
+            to_value(refresh_subject_metadata(context, input)?)
+        }
         "episodeResources" => {
             let input: EpisodeResourcesRequest = from_params(params)?;
             to_value(episode_resources(context, input)?)
@@ -156,6 +161,10 @@ fn dispatch(context: &AppContext, method: &str, params: Option<Value>) -> AppRes
             to_value(start_resource_download(context, input)?)
         }
         "downloadTasks" => to_value(download_tasks(context)?),
+        "controlDownloadTask" => {
+            let input: DownloadTaskActionRequest = from_params(params)?;
+            to_value(control_download_task(context, input)?)
+        }
         "testQbittorrentConnection" => to_value(test_qbittorrent_connection(context)),
         other => Err(AppError::Api(format!("unknown JSON-RPC method: {other}"))),
     }

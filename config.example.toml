@@ -20,7 +20,7 @@ cache_images = true
 [nyaa]
 enabled = true
 base_url = "https://nyaa.si"
-category = "1_2"
+category = "0_0"
 
 [qbittorrent]
 enabled = false

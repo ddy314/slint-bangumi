@@ -1,6 +1,6 @@
 import { memo, useDeferredValue, useEffect, useMemo, useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
-import { RefreshCw, Search, Sparkles } from "lucide-react";
+import { Calendar, LayoutGrid, List, RefreshCw, Search, Sparkles, Star } from "lucide-react";
 import { loadOnlineSubject, searchCatalog, type BackendLogEntry, type ScanStatus } from "../backend";
 import type { Subject } from "../data";
 import type { Route } from "../NavRail";
@@ -11,16 +11,18 @@ import { Button } from "../ui";
 import { resolveAssetUrl } from "../utils/assets";
 import { cn } from "../utils/cn";
 
-type CatalogRoute = Exclude<Route, "settings">;
-type SearchIndexEntry = {
+type CatalogRoute = Extract<Route, "search" | "home" | "library">;
+type SearchSort = "year" | "rating" | "title";
+type LibrarySort = "default" | "title" | "year" | "rating";
+type LibraryLayout = "grid" | "list";
+type SearchResult = {
   subject: Subject;
-  text: string;
 };
 
 const pageCopy: Record<CatalogRoute, { title: string; subtitle?: string }> = {
   search: {
     title: "搜索",
-    subtitle: "查找标题、文件名或标签",
+    subtitle: "直接搜索 Bangumi 条目",
   },
   home: {
     title: "主页",
@@ -60,40 +62,25 @@ export function LibraryPage({
   const [onlineLoading, setOnlineLoading] = useState(false);
   const [onlineError, setOnlineError] = useState<string | null>(null);
   const [heroIndex, setHeroIndex] = useState(0);
+  const [searchSort, setSearchSort] = useState<SearchSort>("year");
+  const [librarySort, setLibrarySort] = useState<LibrarySort>("default");
+  const [libraryLayout, setLibraryLayout] = useState<LibraryLayout>("grid");
   const deferredQuery = useDeferredValue(searchQuery);
 
   const watching = useMemo(
     () => subjects.filter((subject) => subject.progress > 0 && subject.progress < 1),
     [subjects]
   );
-  const completed = useMemo(
-    () => subjects.filter((subject) => subject.progress >= 1),
-    [subjects]
-  );
-  const recent = useMemo(() => subjects.slice(0, 18), [subjects]);
-  const completedPreview = useMemo(() => completed.slice(0, 18), [completed]);
+  const recent = useMemo(() => {
+    const sorted = librarySort !== "default" ? [...subjects].sort(librarySorter(librarySort)) : subjects;
+    return sorted.slice(0, 18);
+  }, [subjects, librarySort]);
   const heroSubject = watching[heroIndex % Math.max(1, watching.length)] ?? subjects[0];
-  const searchIndex = useMemo<SearchIndexEntry[]>(
-    () => subjects.map((subject) => ({
-      subject,
-      text: [
-        subject.title,
-        subject.titleCn,
-        subject.fileSummary,
-        ...subject.tags,
-        ...subject.aliases,
-      ].join("\n").toLowerCase(),
-    })),
-    [subjects]
-  );
 
-  const searchResults = useMemo(() => {
-    const q = deferredQuery.trim().toLowerCase();
-    if (!q) return [];
-    return searchIndex
-      .filter((entry) => entry.text.includes(q))
-      .map((entry) => entry.subject);
-  }, [deferredQuery, searchIndex]);
+  const sortedSubjects = useMemo(() => {
+    if (librarySort === "default") return subjects;
+    return [...subjects].sort(librarySorter(librarySort));
+  }, [subjects, librarySort]);
 
   useEffect(() => {
     if (route !== "search") {
@@ -104,7 +91,7 @@ export function LibraryPage({
     }
 
     const q = deferredQuery.trim();
-    if (q.length < 2) {
+    if (!q) {
       setOnlineResults([]);
       setOnlineError(null);
       setOnlineLoading(false);
@@ -114,7 +101,7 @@ export function LibraryPage({
     let cancelled = false;
     setOnlineLoading(true);
     const timer = window.setTimeout(() => {
-      searchCatalog(q, 24)
+      searchCatalog(q, 36)
         .then((response) => {
           if (cancelled) return;
           setOnlineResults(response.subjects);
@@ -139,14 +126,14 @@ export function LibraryPage({
 
   const mergedSearchResults = useMemo(() => {
     if (route !== "search") return [];
-    const seen = new Set(searchResults.map((subject) => `${subject.provider}:${subject.providerSubjectId}`));
-    return [
-      ...searchResults,
-      ...onlineResults.filter((subject) => !seen.has(`${subject.provider}:${subject.providerSubjectId}`)),
-    ];
-  }, [onlineResults, route, searchResults]);
+    return onlineResults
+      .map((subject) => ({ subject }))
+      .sort(searchResultSorter(searchSort));
+  }, [onlineResults, route, searchSort]);
 
-  const displayItems = route === "search" ? mergedSearchResults : subjects;
+  const displayItems = route === "search"
+    ? mergedSearchResults
+    : (route === "library" ? sortedSubjects : subjects).map((subject) => ({ subject }));
   const {
     hasMore,
     loadMore,
@@ -156,7 +143,7 @@ export function LibraryPage({
   } = useIncrementalItems(displayItems, {
     initialCount: route === "library" ? 72 : 36,
     step: 36,
-    resetKey: `${route}:${deferredQuery}:${displayItems.length}`,
+    resetKey: `${route}:${deferredQuery}:${displayItems.length}:${searchSort}`,
   });
   const remainingCount = Math.max(0, displayItems.length - visibleCount);
   const copy = pageCopy[route];
@@ -186,7 +173,12 @@ export function LibraryPage({
           transition={appleSpringSoft}
         >
           {route === "search" && (
-            <SearchHeader query={searchQuery} setQuery={onSearchQueryChange} />
+            <SearchHeader
+              query={searchQuery}
+              setQuery={onSearchQueryChange}
+              sort={searchSort}
+              setSort={setSearchSort}
+            />
           )}
 
           {route !== "search" && (
@@ -194,19 +186,65 @@ export function LibraryPage({
               title={copy.title}
               subtitle={copy.subtitle}
               action={
-                route === "library" ? (
-                  <Button
-                    icon={<RefreshCw size={16} className={scanStatus.running ? "animate-spin" : ""} />}
-                    loading={scanStatus.running}
-                    onClick={() => {
-                      onSnack("已开始扫描媒体目录...");
-                      void onScan();
-                    }}
-                    className="h-10 px-4 text-[13px]"
-                  >
-                    {scanStatus.running ? "扫描中" : "扫描"}
-                  </Button>
-                ) : null
+                <div className="flex items-center gap-2">
+                  {route === "library" && (
+                    <>
+                      <div className="search-filter-row">
+                        <label>
+                          <select
+                            value={librarySort}
+                            onChange={(event) => setLibrarySort(event.target.value as LibrarySort)}
+                            className="h-9 rounded-[var(--radius-control)] px-3 text-[12.5px] font-medium"
+                          >
+                            <option value="default">最近更新</option>
+                            <option value="title">标题</option>
+                            <option value="year">年份</option>
+                            <option value="rating">评分</option>
+                          </select>
+                        </label>
+                      </div>
+                      <div className="flex items-center rounded-[var(--radius-control)] bg-[var(--color-surface-elevated)] p-0.5">
+                        <button
+                          type="button"
+                          onClick={() => setLibraryLayout("grid")}
+                          className={`flex size-8 items-center justify-center rounded-[var(--radius-sm)] transition-colors ${
+                            libraryLayout === "grid"
+                              ? "bg-[var(--color-primary)] text-white"
+                              : "text-[var(--color-text-secondary)] hover:text-[var(--color-text-primary)]"
+                          }`}
+                          title="网格视图"
+                        >
+                          <LayoutGrid size={15} />
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setLibraryLayout("list")}
+                          className={`flex size-8 items-center justify-center rounded-[var(--radius-sm)] transition-colors ${
+                            libraryLayout === "list"
+                              ? "bg-[var(--color-primary)] text-white"
+                              : "text-[var(--color-text-secondary)] hover:text-[var(--color-text-primary)]"
+                          }`}
+                          title="列表视图"
+                        >
+                          <List size={15} />
+                        </button>
+                      </div>
+                    </>
+                  )}
+                  {route === "library" && (
+                    <Button
+                      icon={<RefreshCw size={16} className={scanStatus.running ? "animate-spin" : ""} />}
+                      loading={scanStatus.running}
+                      onClick={() => {
+                        onSnack("已开始扫描媒体目录...");
+                        void onScan();
+                      }}
+                      className="h-10 px-4 text-[13px]"
+                    >
+                      {scanStatus.running ? "扫描中" : "扫描"}
+                    </Button>
+                  )}
+                </div>
               }
             />
           )}
@@ -216,8 +254,6 @@ export function LibraryPage({
               query={deferredQuery}
               results={visibleItems}
               total={mergedSearchResults.length}
-              localCount={searchResults.length}
-              onlineCount={onlineResults.length}
               onlineLoading={onlineLoading}
               onlineError={onlineError}
               hasMore={hasMore}
@@ -252,28 +288,33 @@ export function LibraryPage({
               </Section>
             </>
           ) : (
-            <>
-              {(scanStatus.running || logs.length > 0) && (
-                <div className="mt-5">
-                  <ScanPanel status={scanStatus} logs={logs} />
-                </div>
-              )}
-              {completed.length > 0 && (
-                <Section title="已完成">
-                  <CardGrid subjects={completedPreview} onOpen={(subject) => void openSubject(subject)} />
-                </Section>
-              )}
-              <Section title="全部番剧">
-                <CardGrid subjects={visibleItems} onOpen={(subject) => void openSubject(subject)} />
-                {hasMore && (
-                  <LoadMore
-                    remainingCount={remainingCount}
-                    sentinelRef={sentinelRef}
-                    onLoadMore={loadMore}
-                  />
+            <div className="flex gap-6">
+              <div className="min-w-0 flex-1">
+                {(scanStatus.running || logs.length > 0) && (
+                  <div className="mt-5">
+                    <ScanPanel status={scanStatus} logs={logs} />
+                  </div>
                 )}
-              </Section>
-            </>
+                <Section title="最近更新">
+                  {libraryLayout === "list" ? (
+                    <SubjectList subjects={visibleItems.map((item) => item.subject)} onOpen={(subject) => void openSubject(subject)} />
+                  ) : (
+                    <CardGrid subjects={visibleItems.map((item) => item.subject)} onOpen={(subject) => void openSubject(subject)} />
+                  )}
+                  {hasMore && (
+                    <LoadMore
+                      remainingCount={remainingCount}
+                      sentinelRef={sentinelRef}
+                      onLoadMore={loadMore}
+                    />
+                  )}
+                </Section>
+              </div>
+              <Timeline subjects={sortedSubjects} onJump={(year) => {
+                const target = document.querySelector(`[data-timeline-year="${year}"]`);
+                target?.scrollIntoView({ behavior: "smooth", block: "start" });
+              }} />
+            </div>
           )}
         </motion.div>
       </AnimatePresence>
@@ -284,25 +325,37 @@ export function LibraryPage({
 function SearchHeader({
   query,
   setQuery,
+  sort,
+  setSort,
 }: {
   query: string;
   setQuery: (value: string) => void;
+  sort: SearchSort;
+  setSort: (value: SearchSort) => void;
 }) {
   return (
-    <div className="search-page-header">
-      <label className="search-field flex h-12 min-w-0 flex-1 items-center gap-3 rounded-[var(--radius-pill)] px-4">
-        <Search size={22} className="text-[var(--color-text-tertiary)]" strokeWidth={2.1} />
-        <input
-          autoFocus
-          value={query}
-          onChange={(event) => setQuery(event.target.value)}
-          placeholder="搜索标题、文件名、标签..."
-          className="min-w-0 flex-1 bg-transparent text-[17px] font-semibold text-[var(--color-text-primary)] outline-none placeholder:text-[var(--color-text-tertiary)]/85"
-        />
-      </label>
-      <div className="search-scope">
-        <button type="button" className="active">全部</button>
-        <button type="button">在线自动</button>
+    <div className="search-page-header search-page-header-stacked">
+      <div className="flex w-full min-w-0 items-center gap-3">
+        <label className="search-field flex h-12 min-w-0 flex-1 items-center gap-3 rounded-[var(--radius-pill)] px-4">
+          <Search size={22} className="text-[var(--color-text-tertiary)]" strokeWidth={2.1} />
+          <input
+            autoFocus
+            value={query}
+            onChange={(event) => setQuery(event.target.value)}
+            placeholder="搜索标题、文件名、标签..."
+            className="min-w-0 flex-1 bg-transparent text-[17px] font-semibold text-[var(--color-text-primary)] outline-none placeholder:text-[var(--color-text-tertiary)]/85"
+          />
+        </label>
+      </div>
+      <div className="search-filter-row">
+        <label>
+          <span>排序</span>
+          <select value={sort} onChange={(event) => setSort(event.target.value as SearchSort)}>
+            <option value="year">年份</option>
+            <option value="rating">评分</option>
+            <option value="title">标题</option>
+          </select>
+        </label>
       </div>
     </div>
   );
@@ -312,8 +365,6 @@ function SearchContent({
   query,
   results,
   total,
-  localCount,
-  onlineCount,
   onlineLoading,
   onlineError,
   hasMore,
@@ -323,10 +374,8 @@ function SearchContent({
   onOpen,
 }: {
   query: string;
-  results: Subject[];
+  results: SearchResult[];
   total: number;
-  localCount: number;
-  onlineCount: number;
   onlineLoading: boolean;
   onlineError: string | null;
   hasMore: boolean;
@@ -338,8 +387,8 @@ function SearchContent({
   if (!query.trim()) {
     return (
       <EmptyState
-        title="搜索你的资料库"
-        desc="输入标题、文件名或标签后，结果会显示在这里。"
+        title="搜索 Bangumi"
+        desc="输入番剧标题、原名或译名。"
       />
     );
   }
@@ -347,20 +396,26 @@ function SearchContent({
   return (
     <Section
       title="搜索结果"
-      subtitle={
-        onlineLoading
-          ? `${localCount} 本地 · 正在搜索在线资料`
-          : `${total} 部 · 本地 ${localCount} · 在线 ${onlineCount}`
-      }
+      subtitle={onlineLoading ? "正在搜索 Bangumi" : `${total} 部`}
     >
       {onlineError && (
         <div className="mb-4 rounded-[var(--radius-card)] bg-rose-500/8 px-4 py-2 text-[12px] font-medium text-rose-600">
           在线搜索失败：{onlineError}
         </div>
       )}
-      {results.length ? (
+      {onlineLoading && !results.length ? (
+        <SearchLoadingRows />
+      ) : results.length ? (
         <>
-          <CardGrid subjects={results} onOpen={onOpen} />
+          <div className="search-result-list">
+            {results.map(({ subject }) => (
+              <SearchResultRow
+                key={`${subject.id}-${subject.provider}-${subject.providerSubjectId}`}
+                subject={subject}
+                onOpen={() => onOpen(subject)}
+              />
+            ))}
+          </div>
           {hasMore && (
             <LoadMore
               remainingCount={remainingCount}
@@ -373,6 +428,59 @@ function SearchContent({
         <EmptyState title="没有匹配的番剧" desc="换一个搜索词再试。" compact />
       )}
     </Section>
+  );
+}
+
+function SearchResultRow({
+  subject,
+  onOpen,
+}: {
+  subject: Subject;
+  onOpen: () => void;
+}) {
+  return (
+    <button type="button" className="search-result-row" onClick={onOpen} data-timeline-year={subject.year > 0 ? subject.year : undefined}>
+      <div className="search-result-poster">
+        {subject.poster ? (
+          <img src={resolveAssetUrl(subject.poster)} alt={subject.title} loading="lazy" />
+        ) : (
+          <span>{(subject.titleCn || subject.title || "?").slice(0, 1)}</span>
+        )}
+      </div>
+      <div className="min-w-0 flex-1 text-left">
+        <div className="flex min-w-0 items-center gap-2">
+          <div className="truncate text-[14px] font-semibold text-[var(--color-text-primary)]">
+            {subject.title}
+          </div>
+        </div>
+        <div className="mt-1 truncate text-[12px] text-[var(--color-text-tertiary)]">
+          {subject.titleCn || subject.fileSummary || subject.summary || subject.aliases.slice(0, 2).join(" / ")}
+        </div>
+        <div className="mt-2 flex flex-wrap gap-x-3 gap-y-1 text-[11px] text-[var(--color-text-tertiary)]">
+          {subject.year > 0 && <span className="inline-flex items-center gap-1"><Calendar size={11} />{subject.year}</span>}
+          {subject.rating > 0 && <span className="inline-flex items-center gap-1"><Star size={11} />{subject.rating.toFixed(1)}</span>}
+          {subject.files > 0 && <span>{subject.files} 文件</span>}
+          {subject.episodes > 0 && <span>{subject.episodes} 话</span>}
+        </div>
+      </div>
+    </button>
+  );
+}
+
+function SearchLoadingRows() {
+  return (
+    <div className="search-result-list">
+      {[0, 1, 2].map((index) => (
+        <div key={index} className="search-result-row pointer-events-none animate-pulse">
+          <div className="search-result-poster bg-black/[0.06]" />
+          <div className="min-w-0 flex-1">
+            <div className="h-4 w-2/5 rounded-full bg-black/[0.07]" />
+            <div className="mt-3 h-3 w-3/5 rounded-full bg-black/[0.05]" />
+            <div className="mt-3 h-3 w-1/4 rounded-full bg-black/[0.04]" />
+          </div>
+        </div>
+      ))}
+    </div>
   );
 }
 
@@ -514,6 +622,26 @@ function Section({
   );
 }
 
+const SubjectList = memo(function SubjectList({
+  subjects,
+  onOpen,
+}: {
+  subjects: Subject[];
+  onOpen: (subject: Subject) => void;
+}) {
+  return (
+    <div className="search-result-list">
+      {subjects.map((subject) => (
+        <SearchResultRow
+          key={subject.id}
+          subject={subject}
+          onOpen={() => onOpen(subject)}
+        />
+      ))}
+    </div>
+  );
+});
+
 const CardGrid = memo(function CardGrid({
   subjects,
   onOpen,
@@ -557,6 +685,70 @@ function LoadMore({
       >
         继续加载剩余 {remainingCount} 项
       </button>
+    </div>
+  );
+}
+
+function searchResultSorter(sort: SearchSort) {
+  return (left: SearchResult, right: SearchResult) => {
+    if (sort === "rating") {
+      return right.subject.rating - left.subject.rating || left.subject.title.localeCompare(right.subject.title);
+    }
+    if (sort === "year") {
+      return right.subject.year - left.subject.year || left.subject.title.localeCompare(right.subject.title);
+    }
+    return left.subject.title.localeCompare(right.subject.title);
+  };
+}
+
+function librarySorter(sort: LibrarySort) {
+  return (left: Subject, right: Subject) => {
+    if (sort === "rating") {
+      return right.rating - left.rating || left.title.localeCompare(right.title);
+    }
+    if (sort === "year") {
+      return right.year - left.year || left.title.localeCompare(right.title);
+    }
+    if (sort === "title") {
+      return left.title.localeCompare(right.title);
+    }
+    return 0;
+  };
+}
+
+function Timeline({
+  subjects,
+  onJump,
+}: {
+  subjects: Subject[];
+  onJump: (year: number) => void;
+}) {
+  const years = useMemo(() => {
+    const yearSet = new Set<number>();
+    for (const s of subjects) {
+      if (s.year > 0) yearSet.add(s.year);
+    }
+    return Array.from(yearSet).sort((a, b) => b - a);
+  }, [subjects]);
+
+  if (years.length === 0) return null;
+
+  return (
+    <div className="hidden w-[60px] shrink-0 xl:block">
+      <div className="sticky top-8 pt-5">
+        <div className="flex flex-col items-center gap-1">
+          {years.map((year) => (
+            <button
+              key={year}
+              type="button"
+              onClick={() => onJump(year)}
+              className="text-[11px] font-semibold text-[var(--color-text-tertiary)] transition-colors hover:text-[var(--color-accent)]"
+            >
+              {year}
+            </button>
+          ))}
+        </div>
+      </div>
     </div>
   );
 }

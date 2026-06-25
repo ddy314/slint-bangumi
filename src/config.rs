@@ -55,7 +55,7 @@ impl Default for NyaaConfig {
         Self {
             enabled: true,
             base_url: "https://nyaa.si".to_string(),
-            category: "1_2".to_string(),
+            category: "0_0".to_string(),
         }
     }
 }
