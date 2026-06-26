@@ -115,9 +115,9 @@ export function DiscoverPage({
   };
 
   return (
-    <div className="h-full overflow-y-auto overflow-x-hidden">
+    <div className="h-full overflow-y-auto overflow-x-hidden bg-[linear-gradient(180deg,rgba(0,122,255,0.045)_0%,transparent_220px),var(--color-bg)]">
       <motion.div
-        className="page-shell pb-12"
+        className="page-shell max-w-[1560px] pb-12"
         initial={{ opacity: 0, y: 8 }}
         animate={{ opacity: 1, y: 0 }}
         exit={{ opacity: 0, y: -8 }}
@@ -125,8 +125,8 @@ export function DiscoverPage({
       >
         <header className="page-header">
           <div>
-            <h1 className="text-[42px] font-bold leading-[1] tracking-tight text-[var(--color-text-primary)]">主页</h1>
-            <p className="mt-2.5 text-[17px] font-medium text-[var(--color-text-secondary)]">
+            <h1 className="text-[40px] font-bold leading-[1] tracking-tight text-[var(--color-text-primary)]">主页</h1>
+            <p className="mt-2 text-[15px] font-medium text-[var(--color-text-secondary)]">
               账号状态、观看历史、本地资源和推荐内容的综合中心
             </p>
           </div>
@@ -141,12 +141,16 @@ export function DiscoverPage({
           </Button>
         </header>
 
-        <div className="mt-6 grid gap-5 xl:grid-cols-[minmax(0,1.55fr)_minmax(340px,0.8fr)]">
-          {spotlight ? (
-            <Spotlight subject={spotlight} profile={profile} onOpen={() => onOpen(spotlight)} />
-          ) : (
-            <StarterHero auth={auth} syncing={isSyncing} onNavigate={onNavigate} />
-          )}
+        <div className="mt-7 grid items-start gap-5 xl:grid-cols-[minmax(0,1.52fr)_minmax(340px,0.78fr)]">
+          <div className="min-w-0">
+            {spotlight ? (
+              <Spotlight subject={spotlight} profile={profile} onOpen={() => onOpen(spotlight)} />
+            ) : (
+              <StarterHero auth={auth} syncing={isSyncing} onNavigate={onNavigate} />
+            )}
+            <InsightStrip profile={profile} auth={auth} />
+            <BrowseTiles profile={profile} onOpen={onOpen} onNavigate={onNavigate} />
+          </div>
           <StatusColumn
             auth={auth}
             status={syncStatus}
@@ -155,8 +159,6 @@ export function DiscoverPage({
             onNavigate={onNavigate}
           />
         </div>
-
-        <InsightStrip profile={profile} auth={auth} />
 
         {profile.tags.length > 0 && (
           <TagRiver tags={profile.tags} />
@@ -198,13 +200,15 @@ function Spotlight({
   onOpen: () => void;
 }) {
   const image = resolveAssetUrl(subject.hero || subject.poster);
+  const poster = resolveAssetUrl(subject.poster || subject.hero);
   const title = subject.titleCn || subject.title;
   const status = statusLabel(subject);
-  const summary = subject.summary || subject.fileSummary || `来自 ${profile.totalCollections || profile.totalSubjects} 个条目的主页推荐`;
+  const sourceCount = profile.totalCollections || profile.totalSubjects;
+  const summary = subject.summary || subject.fileSummary || (sourceCount > 0 ? `来自 ${sourceCount} 个条目的主页推荐` : "Bangumi 推荐条目");
   return (
     <motion.button
       type="button"
-      className="group relative min-h-[390px] overflow-hidden rounded-[8px] bg-[var(--color-surface-elevated)] text-left ring-1 ring-inset ring-black/[0.05]"
+      className="home-feature-panel group relative min-h-[330px] self-start overflow-hidden rounded-[26px] text-left"
       onClick={onOpen}
       whileHover={{ scale: 1.002 }}
       whileTap={{ scale: 0.99 }}
@@ -214,39 +218,63 @@ function Spotlight({
         <img
           src={image}
           alt={title}
-          className="absolute inset-0 size-full object-cover transition-transform duration-700 group-hover:scale-[1.025]"
+          className="absolute inset-0 size-full scale-110 object-cover opacity-[0.18] blur-2xl saturate-[1.25] transition-transform duration-700 group-hover:scale-[1.15]"
         />
       ) : (
         <div className="absolute inset-0 bg-[var(--color-surface-elevated)]" />
       )}
-      <div className="absolute inset-0 bg-gradient-to-r from-black/78 via-black/42 to-black/10" />
-      <div className="absolute inset-0 bg-gradient-to-t from-black/80 via-transparent to-black/12" />
-      <div className="absolute inset-x-0 bottom-0 p-7 md:p-9">
-        <div className="mb-4 flex flex-wrap items-center gap-2">
-          <Pill icon={<Activity size={12} />}>{status}</Pill>
-          {scoreLabel(subject) && <Pill icon={<Star size={12} />}>{scoreLabel(subject)}</Pill>}
-          {subject.files > 0 && <Pill icon={<HardDrive size={12} />}>本地可播</Pill>}
-        </div>
-        <motion.h2
-          className="max-w-3xl text-[36px] font-bold leading-[1.06] tracking-tight text-white md:text-[48px]"
-          initial={{ opacity: 0, y: 12 }}
-          animate={{ opacity: 1, y: 0 }}
-          transition={appleSpringSoft}
-        >
-          {title}
-        </motion.h2>
-        <p className="mt-3 line-clamp-2 max-w-2xl text-[14px] font-medium leading-relaxed text-white/72">
-          {summary}
-        </p>
-        {subject.progress > 0 && (
-          <div className="mt-6 max-w-[420px]">
-            <div className="mb-2 flex justify-between text-[12px] font-semibold text-white/75">
-              <span>观看进度</span>
-              <span>{Math.round(subject.progress * 100)}%</span>
-            </div>
-            <Progress value={subject.progress} className="bg-white/20" tone="success" />
+      <div className="absolute inset-0 bg-white/58 backdrop-blur-[26px] backdrop-saturate-[165%] dark:bg-black/30" />
+      <div className="relative grid min-h-[330px] md:grid-cols-[250px_minmax(0,1fr)]">
+        <div className="flex items-center justify-center p-7">
+          <div className="relative aspect-[3/4] w-[172px] overflow-hidden rounded-[18px] bg-black/5 shadow-[0_22px_48px_rgba(0,0,0,0.18)] ring-1 ring-inset ring-black/5">
+            {poster ? (
+              <img
+                src={poster}
+                alt={title}
+                className="size-full object-cover transition-transform duration-500 group-hover:scale-[1.025]"
+              />
+            ) : (
+              <div className="grid size-full place-items-center text-[44px] font-bold text-[var(--color-text-tertiary)]">
+                {title.slice(0, 1) || "N"}
+              </div>
+            )}
           </div>
-        )}
+        </div>
+        <div className="flex min-w-0 flex-col justify-center px-7 pb-8 pt-0 md:px-7 md:py-8">
+          <div className="mb-4 text-[12px] font-bold uppercase tracking-[0.16em] text-[var(--color-accent)]">
+            {subject.progress > 0 && subject.progress < 1 ? "继续观看" : "精选条目"}
+          </div>
+          <div className="mb-4 flex flex-wrap items-center gap-2">
+            <Pill tone="light" icon={<Activity size={12} />}>{status}</Pill>
+            {scoreLabel(subject) && <Pill tone="light" icon={<Star size={12} />}>{scoreLabel(subject)}</Pill>}
+            {subject.files > 0 && <Pill tone="light" icon={<HardDrive size={12} />}>本地可播</Pill>}
+          </div>
+          <motion.h2
+            className="line-clamp-3 max-w-[720px] text-[32px] font-bold leading-[1.08] tracking-tight text-[var(--color-text-primary)] md:text-[38px]"
+            initial={{ opacity: 0, y: 10 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={appleSpringSoft}
+          >
+            {title}
+          </motion.h2>
+          {subject.titleCn && subject.titleCn !== subject.title && (
+            <div className="mt-2 truncate text-[15px] font-semibold text-[var(--color-text-tertiary)]">
+              {subject.title}
+            </div>
+          )}
+          <p className="mt-4 line-clamp-2 max-w-[720px] text-[14px] font-medium leading-relaxed text-[var(--color-text-secondary)]">
+            {summary}
+          </p>
+          {subject.progress > 0 && (
+            <div className="mt-6 max-w-[420px]">
+              <div className="mb-2 flex justify-between text-[12px] font-semibold text-[var(--color-text-tertiary)]">
+                <span>观看进度</span>
+                <span>{Math.round(subject.progress * 100)}%</span>
+              </div>
+              <Progress value={subject.progress} className="h-1.5 bg-black/10 dark:bg-white/10" tone="success" />
+            </div>
+          )}
+        </div>
       </div>
     </motion.button>
   );
@@ -262,7 +290,7 @@ function StarterHero({
   onNavigate?: (route: HomeRoute) => void;
 }) {
   return (
-    <section className="grid min-h-[390px] gap-7 rounded-[8px] bg-[var(--color-surface-elevated)] p-7 ring-1 ring-inset ring-black/[0.05] md:grid-cols-[minmax(0,1fr)_300px]">
+    <section className="home-panel grid min-h-[330px] self-start rounded-[26px] p-7 md:grid-cols-[minmax(0,1fr)_300px]">
       <div className="flex min-w-0 flex-col justify-end">
         <div className="mb-5 flex size-12 items-center justify-center rounded-[8px] bg-[var(--color-primary-soft)] text-[var(--color-primary)]">
           {syncing ? <Loader2 size={22} className="animate-spin" /> : <Compass size={22} />}
@@ -307,8 +335,8 @@ function StatusColumn({
   return (
     <aside className="grid gap-3">
       <section className={cn(
-        "rounded-[8px] bg-[var(--color-surface-elevated)] p-5 ring-1 ring-inset",
-        error ? "ring-rose-500/20" : "ring-black/[0.05]"
+        "home-panel rounded-[24px] p-5",
+        error && "ring-rose-500/20"
       )}>
         <div className="flex items-center gap-3">
           <div className={cn(
@@ -346,7 +374,7 @@ function StatusColumn({
         </div>
       </section>
 
-      <section className="rounded-[8px] bg-[var(--color-surface-elevated)] p-5 ring-1 ring-inset ring-black/[0.05]">
+      <section className="home-panel rounded-[24px] p-5">
         <div className="mb-4 flex items-center justify-between">
           <h2 className="text-[15px] font-bold text-[var(--color-text-primary)]">状态概览</h2>
           <button
@@ -360,7 +388,7 @@ function StatusColumn({
         <StatusBars counts={profile.statusCounts} total={Math.max(1, profile.totalCollections)} />
       </section>
 
-      <section className="rounded-[8px] bg-[var(--color-surface-elevated)] p-5 ring-1 ring-inset ring-black/[0.05]">
+      <section className="home-panel rounded-[24px] p-5">
         <div className="mb-4 flex items-center gap-2">
           <Sparkles size={16} className="text-[var(--color-accent)]" />
           <h2 className="text-[15px] font-bold text-[var(--color-text-primary)]">快速入口</h2>
@@ -416,12 +444,134 @@ function Insight({
 }) {
   return (
     <div className={cn(
-      "rounded-[8px] bg-[var(--color-surface-elevated)] px-4 py-3 ring-1 ring-inset ring-black/[0.05]",
+      "home-panel rounded-[16px] px-4 py-3",
       warn && "bg-amber-500/8 ring-amber-500/15"
     )}>
       <div className="text-[24px] font-bold leading-none tracking-tight text-[var(--color-text-primary)]">{value}</div>
       <div className="mt-1.5 text-[11px] font-semibold text-[var(--color-text-tertiary)]">{label}</div>
     </div>
+  );
+}
+
+function BrowseTiles({
+  profile,
+  onOpen,
+  onNavigate,
+}: {
+  profile: HomeProfile;
+  onOpen: (subject: Subject) => void;
+  onNavigate?: (route: HomeRoute) => void;
+}) {
+  const tiles = [
+    {
+      id: "continue",
+      title: "继续观看",
+      count: profile.continuing.length,
+      subject: profile.continuing[0],
+      icon: <PlayCircle size={19} />,
+    },
+    {
+      id: "completed",
+      title: "看过档案",
+      count: profile.completed.length,
+      subject: profile.completed[0],
+      icon: <CheckCircle2 size={19} />,
+    },
+    {
+      id: "recommend",
+      title: "为你推荐",
+      count: profile.recommendations.length || profile.trending.length,
+      subject: profile.recommendations[0] ?? profile.trending[0],
+      icon: <Sparkles size={19} />,
+    },
+    {
+      id: "local",
+      title: "本地可播",
+      count: profile.localPlayable.length,
+      subject: profile.localPlayable[0],
+      icon: <HardDrive size={19} />,
+      route: "library" as HomeRoute,
+    },
+  ].filter((tile) => tile.count > 0 || tile.route);
+
+  if (!tiles.length) return null;
+
+  return (
+    <section className="mt-8">
+      <div className="mb-4 flex items-end justify-between gap-4">
+        <div>
+          <h2 className="text-[24px] font-bold leading-none tracking-tight text-[var(--color-text-primary)]">类别浏览</h2>
+          <p className="mt-2 text-[13px] font-medium text-[var(--color-text-tertiary)]">按观看状态和资源来源进入内容</p>
+        </div>
+      </div>
+      <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
+        {tiles.map((tile, index) => (
+          <BrowseTile
+            key={tile.id}
+            title={tile.title}
+            count={tile.count}
+            icon={tile.icon}
+            subject={tile.subject}
+            index={index}
+            onClick={() => {
+              if (tile.subject) {
+                onOpen(tile.subject);
+                return;
+              }
+              if (tile.route) onNavigate?.(tile.route);
+            }}
+          />
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function BrowseTile({
+  title,
+  count,
+  icon,
+  subject,
+  index,
+  onClick,
+}: {
+  title: string;
+  count: number;
+  icon: ReactNode;
+  subject?: Subject;
+  index: number;
+  onClick: () => void;
+}) {
+  const image = resolveAssetUrl(subject?.hero || subject?.poster);
+  return (
+    <motion.button
+      type="button"
+      className="home-browse-tile group relative min-h-[138px] overflow-hidden rounded-[22px] p-5 text-left"
+      onClick={onClick}
+      initial={{ opacity: 0, y: 8 }}
+      animate={{ opacity: 1, y: 0 }}
+      transition={{ ...appleSpringSoft, delay: index * 0.025 }}
+      whileHover={{ y: -2 }}
+    >
+      {image && (
+        <img
+          src={image}
+          alt={subject?.titleCn || subject?.title || title}
+          loading="lazy"
+          className="absolute inset-0 size-full object-cover opacity-78 transition-transform duration-500 group-hover:scale-[1.035]"
+        />
+      )}
+      <div className="absolute inset-0 bg-gradient-to-r from-black/70 via-black/34 to-black/10" />
+      <div className="relative flex h-full min-h-[98px] flex-col justify-between">
+        <div className="flex size-9 items-center justify-center rounded-full bg-white/20 text-white ring-1 ring-inset ring-white/20 backdrop-blur">
+          {icon}
+        </div>
+        <div>
+          <div className="text-[22px] font-bold leading-tight tracking-tight text-white">{title}</div>
+          <div className="mt-1 text-[12px] font-semibold text-white/70">{count > 0 ? `${count} 个条目` : "打开媒体库"}</div>
+        </div>
+      </div>
+    </motion.button>
   );
 }
 
@@ -435,7 +585,7 @@ function TagRiver({ tags }: { tags: Array<[string, number]> }) {
       {tags.slice(0, 14).map(([tag, weight], index) => (
         <span
           key={tag}
-          className="rounded-full bg-[var(--color-surface-elevated)] px-3 py-1.5 font-semibold text-[var(--color-text-secondary)] ring-1 ring-inset ring-black/[0.05]"
+          className="home-chip rounded-full px-3 py-1.5 font-semibold text-[var(--color-text-secondary)]"
           style={{ fontSize: `${Math.min(15, 11 + Math.log2(weight + 1) + index * 0.02)}px` }}
         >
           {tag}
@@ -465,7 +615,7 @@ function Shelf({
       <div className="mb-4 flex items-end justify-between gap-4">
         <div>
           <div className="flex items-center gap-2 text-[var(--color-text-primary)]">
-            <span className="flex size-7 items-center justify-center rounded-[8px] bg-[var(--color-surface-elevated)] text-[var(--color-accent)] ring-1 ring-inset ring-black/[0.05]">
+            <span className="home-chip flex size-7 items-center justify-center rounded-[10px] text-[var(--color-accent)]">
               {icon}
             </span>
             <h2 className="text-[24px] font-bold leading-none tracking-tight">{title}</h2>
@@ -512,7 +662,7 @@ function SubjectTile({
       whileHover={{ y: -2 }}
     >
       <div className={cn(
-        "relative overflow-hidden rounded-[8px] bg-[var(--color-surface-elevated)] ring-1 ring-inset ring-black/[0.05]",
+        "relative overflow-hidden rounded-[14px] bg-[var(--color-surface-elevated)] shadow-[0_8px_22px_rgba(0,0,0,0.08)] ring-1 ring-inset ring-black/[0.05]",
         layout === "wide" ? "aspect-[16/9]" : "aspect-[3/4]"
       )}>
         {image ? (
@@ -580,7 +730,7 @@ function StarterActions({
         <button
           key={action.title}
           type="button"
-          className="rounded-[8px] bg-[var(--color-surface-elevated)] p-5 text-left ring-1 ring-inset ring-black/[0.05] transition-colors hover:bg-black/[0.035]"
+          className="home-panel rounded-[22px] p-5 text-left transition-colors hover:bg-white/78 dark:hover:bg-white/10"
           onClick={() => onNavigate?.(action.route)}
         >
           <div className="mb-4 flex size-10 items-center justify-center rounded-[8px] bg-[var(--color-primary-soft)] text-[var(--color-primary)]">
@@ -718,9 +868,24 @@ function ActionButton({
   );
 }
 
-function Pill({ icon, children }: { icon?: ReactNode; children: ReactNode }) {
+function Pill({
+  icon,
+  children,
+  tone = "dark",
+}: {
+  icon?: ReactNode;
+  children: ReactNode;
+  tone?: "dark" | "light";
+}) {
   return (
-    <span className="inline-flex h-7 items-center gap-1.5 rounded-full bg-white/16 px-2.5 text-[11px] font-semibold text-white ring-1 ring-inset ring-white/16 backdrop-blur">
+    <span
+      className={cn(
+        "inline-flex h-7 items-center gap-1.5 rounded-full px-2.5 text-[11px] font-semibold backdrop-blur",
+        tone === "light"
+          ? "bg-white/72 text-[var(--color-text-primary)] ring-1 ring-inset ring-white/70 dark:bg-white/12 dark:text-white dark:ring-white/14"
+          : "bg-white/16 text-white ring-1 ring-inset ring-white/16"
+      )}
+    >
       {icon}
       {children}
     </span>
