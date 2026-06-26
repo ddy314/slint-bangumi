@@ -11,6 +11,10 @@ api_key = ""
 [bangumi]
 enabled = true
 base_url = "https://api.bgm.tv"
+oauth_base_url = "https://bgm.tv"
+client_id = ""
+client_secret = ""
+redirect_uri = "http://127.0.0.1:17654/bangumi/callback"
 access_token = ""
 user_agent = "NexPlay/0.1.0"
 request_timeout_secs = 20

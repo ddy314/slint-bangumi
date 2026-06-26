@@ -20,6 +20,23 @@ impl WatchHistoryService {
         self.repository.get_progress(media_id)
     }
 
+    pub fn save(
+        &self,
+        media_id: i64,
+        position_ms: i64,
+        duration_ms: i64,
+    ) -> AppResult<WatchProgress> {
+        let now = task::unix_timestamp_ms();
+        self.repository
+            .save_progress(media_id, position_ms, duration_ms, now)?;
+        Ok(WatchProgress {
+            media_id,
+            position_ms,
+            duration_ms,
+            updated_at: now,
+        })
+    }
+
     pub fn save_test_progress(&self, media_id: i64) -> AppResult<WatchProgress> {
         let now = task::unix_timestamp_ms();
         let position_ms = 15 * 60 * 1000;

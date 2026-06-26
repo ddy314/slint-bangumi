@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { motion } from "framer-motion";
 import { ArrowLeft, Download, Loader2, Search, ShieldCheck } from "lucide-react";
 import { searchEpisodeResources, startResourceDownload, type EpisodeResource } from "../backend";
@@ -31,6 +31,7 @@ export function ResourcesPage({
   const [sort, setSort] = useState<ResourceSort>("score");
   const [resolution, setResolution] = useState<ResolutionFilter>("all");
   const [batchFilter, setBatchFilter] = useState<BatchFilter>("all");
+  const searchRequestIdRef = useRef(0);
 
   const keywordOptions = useMemo(() => {
     const values = [
@@ -46,9 +47,12 @@ export function ResourcesPage({
 
   const runSearch = useCallback(async () => {
     if (!canSearch) {
+      searchRequestIdRef.current += 1;
       setResources([]);
       return;
     }
+    const requestId = searchRequestIdRef.current + 1;
+    searchRequestIdRef.current = requestId;
     setLoading(true);
     setError(null);
     try {
@@ -60,16 +64,20 @@ export function ResourcesPage({
         aliases: [],
         limit: 80,
       });
+      if (searchRequestIdRef.current !== requestId) return;
       setResources(response.resources);
       if (!response.resources.length) {
         setError("没有找到匹配资源。");
       }
     } catch (caught) {
+      if (searchRequestIdRef.current !== requestId) return;
       const message = caught instanceof Error ? caught.message : String(caught);
       setResources([]);
       setError(message);
     } finally {
-      setLoading(false);
+      if (searchRequestIdRef.current === requestId) {
+        setLoading(false);
+      }
     }
   }, [canSearch, context, searchTitle]);
 

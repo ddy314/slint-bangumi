@@ -1555,6 +1555,15 @@ body {
 }
 
 @media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+  }
+
   .media-card {
     animation: none;
     opacity: 1;
@@ -1564,5 +1573,45 @@ body {
   .media-card-play,
   .media-card-progress {
     transition: none;
+  }
+}
+
+@media (max-width: 900px) {
+  .app-shell {
+    --nav-width: 76px;
+  }
+
+  .nav-rail {
+    padding-inline: 12px;
+  }
+
+  .nav-brand {
+    justify-content: center;
+    padding-inline: 0;
+  }
+
+  .nav-brand-text,
+  .nav-collapse-button,
+  .nav-item-label {
+    display: none;
+  }
+
+  .nav-brand-mark {
+    display: inline-flex;
+  }
+
+  .nav-rail .nav-item {
+    justify-content: center;
+    gap: 0;
+    padding-inline: 0;
+  }
+
+  .page-shell {
+    padding: 34px 22px 58px;
+  }
+
+  .page-header {
+    flex-direction: column;
+    align-items: stretch;
   }
 }

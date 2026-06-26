@@ -46,4 +46,9 @@ copyDirectoryIfPresent(
   path.join(nativeDist, "build"),
 );
 
+const nativeAddonPath = path.join(nativeDist, "build", "Release", "mpv_render_bridge.node");
+if (process.platform !== "win32" && !fs.existsSync(nativeAddonPath)) {
+  throw new Error(`native render bridge build not found: ${nativeAddonPath}`);
+}
+
 console.log(`Prepared release backend: dist/backend/${executableName}`);

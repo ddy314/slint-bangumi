@@ -10,6 +10,9 @@ const { RenderBridge } = require("./render-bridge.cjs");
 const isDev = !app.isPackaged;
 const useDevRenderer = isDev && process.env.NEXPLAY_RENDERER_MODE !== "production";
 const projectRoot = app.isPackaged ? process.resourcesPath : path.join(__dirname, "..");
+let assetRoots = [];
+
+process.env.NEXPLAY_PROJECT_ROOT = projectRoot;
 
 if (app.isPackaged && !process.env.NEXPLAY_CONFIG) {
   process.env.NEXPLAY_CONFIG = path.join(app.getPath("userData"), "config.toml");
@@ -37,7 +40,52 @@ const playerControl = new PlayerControl({
   renderBridge,
 });
 
-registerBackendIpc(backendClient);
+function resolveConfiguredPath(value) {
+  if (typeof value !== "string" || !value.trim()) {
+    return null;
+  }
+  return path.isAbsolute(value) ? value : path.join(projectRoot, value);
+}
+
+function buildAssetRoots(settings = null) {
+  const roots = [app.getPath("userData")];
+  if (!app.isPackaged) {
+    roots.push(path.join(projectRoot, "data"));
+  }
+
+  for (const library of settings?.mediaLibraries || []) {
+    const resolved = resolveConfiguredPath(library);
+    if (resolved) {
+      roots.push(resolved);
+    }
+  }
+
+  const databasePath = resolveConfiguredPath(settings?.databasePath || "data/nexplay.sqlite3");
+  if (databasePath) {
+    const databaseDir = path.dirname(databasePath);
+    roots.push(databaseDir);
+    roots.push(path.join(databaseDir, "cache", "images"));
+  }
+
+  return roots;
+}
+
+async function refreshAssetRoots() {
+  try {
+    const settings = await backendClient.request("getSettings");
+    assetRoots = buildAssetRoots(settings);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.warn(`[asset] failed to refresh configured roots: ${message}`);
+    assetRoots = buildAssetRoots();
+  }
+}
+
+registerBackendIpc(backendClient, {
+  onSettingsChanged: async () => {
+    await refreshAssetRoots();
+  },
+});
 playerControl.registerIpc();
 
 function createMainWindow() {
@@ -70,8 +118,12 @@ function createMainWindow() {
   }
 }
 
-app.whenReady().then(() => {
-  registerAssetProtocol();
+app.whenReady().then(async () => {
+  assetRoots = buildAssetRoots();
+  registerAssetProtocol({
+    getAllowedRoots: () => assetRoots,
+  });
+  await refreshAssetRoots();
   createMainWindow();
 
   app.on("activate", () => {

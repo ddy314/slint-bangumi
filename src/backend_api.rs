@@ -7,15 +7,25 @@ use crate::config::{
     AppConfig, BangumiConfig, DandanplayConfig, DatabaseConfig, LoggingConfig, NyaaConfig,
     QbittorrentConfig,
 };
-use crate::domain::{DanmakuMode, DanmakuTrack, ScanSummary, UiSeriesCardData};
+use crate::domain::{
+    BangumiEpisodeCollection, BangumiSubjectCollection, DanmakuMode, DanmakuTrack, ScanSummary,
+    UiSeriesCardData,
+};
 use crate::error::AppResult;
-use crate::service::{CatalogSubjectData, DownloadTaskData, EpisodeResourceData};
+use crate::service::{
+    BangumiAuthStatusData, BangumiBatchUpdateEpisodesInput, BangumiCompleteOAuthInput,
+    BangumiLoginStartData, BangumiSyncSummaryData, BangumiUpdateCollectionInput,
+    BangumiUpdateEpisodeInput, CatalogSubjectData, DownloadTaskData, EpisodeResourceData,
+    episode_collection_label, subject_collection_label, subject_json_to_summary,
+};
 use crate::task::AppEvent;
 
 #[derive(Debug, Serialize, TS)]
 #[serde(rename_all = "camelCase")]
 pub struct BackendSnapshot {
     pub subjects: Vec<FrontendSubject>,
+    pub bangumi_collections: Vec<FrontendSubject>,
+    pub bangumi_auth: BangumiAuthStatusData,
     pub stats: LibraryStats,
     pub settings: FrontendSettings,
 }
@@ -74,6 +84,11 @@ pub struct FrontendSubject {
     #[ts(optional)]
     pub current_episode: Option<usize>,
     pub progress: f64,
+    #[ts(optional)]
+    pub bgm_collection_type: Option<i64>,
+    pub bgm_collection_label: String,
+    pub bgm_rate: i64,
+    pub bgm_pending: bool,
     pub files: usize,
     pub total_size: String,
     #[ts(optional)]
@@ -100,10 +115,16 @@ pub struct FrontendLocalFile {
 #[serde(rename_all = "camelCase")]
 pub struct FrontendEpisode {
     pub episode: usize,
+    #[ts(optional)]
+    pub bgm_episode_id: Option<i64>,
     pub title: String,
     pub title_cn: String,
     pub air_date: String,
     pub cached: bool,
+    #[ts(optional)]
+    pub bgm_collection_type: Option<i64>,
+    pub bgm_collection_label: String,
+    pub bgm_pending: bool,
     #[ts(optional)]
     pub media_id: Option<i64>,
     #[ts(optional)]
@@ -119,7 +140,13 @@ pub struct FrontendEditableSettings {
     pub database_path: String,
     pub bangumi_enabled: bool,
     pub bangumi_base_url: String,
+    pub bangumi_oauth_base_url: String,
+    pub bangumi_client_id: String,
+    pub bangumi_client_secret: String,
+    pub bangumi_client_secret_configured: bool,
+    pub bangumi_redirect_uri: String,
     pub bangumi_access_token: String,
+    pub bangumi_access_token_configured: bool,
     pub bangumi_user_agent: String,
     pub bangumi_request_timeout_secs: u64,
     pub bangumi_auto_match: bool,
@@ -250,6 +277,17 @@ pub struct DownloadTaskActionRequest {
     pub delete_files: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct PlaybackProgressRequest {
+    pub subject_id: i64,
+    pub episode_id: i64,
+    #[ts(optional)]
+    pub media_id: Option<i64>,
+    pub position: f64,
+    pub duration: f64,
+}
+
 #[derive(Debug, Serialize, TS)]
 #[serde(rename_all = "camelCase")]
 pub struct ConnectionTestResponse {
@@ -290,11 +328,36 @@ pub struct DanmakuTrackResponse {
     pub items: Vec<FrontendDanmakuItem>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub enum BackendEventType {
+    Log,
+    ScanStarted,
+    ScanProgress,
+    ScanFinished,
+    ScanFailed,
+    DanmakuMatched,
+    MetadataStarted,
+    MetadataProgress,
+    MetadataFinished,
+    SubjectUpdated,
+    ImageCached,
+    MetadataFailed,
+    MetadataStatus,
+    BangumiSyncStarted,
+    BangumiSyncProgress,
+    BangumiSyncFinished,
+    BangumiSyncFailed,
+    BangumiOAuthCompleted,
+    BangumiOAuthFailed,
+    DownloadCompleted,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 pub struct BackendEvent {
     #[serde(rename = "type")]
-    pub event_type: String,
+    pub event_type: BackendEventType,
     #[ts(optional)]
     pub message: Option<String>,
     #[ts(optional)]
@@ -318,9 +381,9 @@ pub struct BackendEvent {
 }
 
 impl BackendEvent {
-    fn new(event_type: impl Into<String>) -> Self {
+    fn new(event_type: BackendEventType) -> Self {
         Self {
-            event_type: event_type.into(),
+            event_type,
             message: None,
             scanned: None,
             indexed: None,
@@ -345,9 +408,10 @@ pub fn save_settings_config(
     context: &AppContext,
     input: FrontendEditableSettings,
 ) -> AppResult<FrontendEditableSettings> {
+    let current = context.media.config_snapshot();
     let saved = context
         .media
-        .replace_config(config_from_frontend_settings(input))?;
+        .replace_config(config_from_frontend_settings(input, current))?;
     Ok(frontend_settings_from_config(saved))
 }
 
@@ -357,12 +421,48 @@ pub fn snapshot(context: &AppContext) -> AppResult<BackendSnapshot> {
     let (_, _, unmatched) = context.media.library_counts()?;
     let tentative = context.metadata.tentative_count()?;
     let flags = context.media.settings_flags();
+    let bangumi_auth = context.bangumi.auth_status()?;
+    let bangumi_collections = context.bangumi.cached_subject_collections()?;
+    let bangumi_by_subject_id = bangumi_collections
+        .iter()
+        .map(|collection| (collection.subject_id, collection.clone()))
+        .collect::<std::collections::HashMap<_, _>>();
+    let bangumi_episodes_by_subject = context.bangumi.cached_episode_collections_by_subject()?;
+    let local_subjects = cards
+        .into_iter()
+        .map(|card| {
+            let bgm_subject_id = (card.provider == "bangumi")
+                .then(|| card.provider_subject_id.parse::<i64>().ok())
+                .flatten();
+            let collection = bgm_subject_id
+                .and_then(|subject_id| bangumi_by_subject_id.get(&subject_id).cloned());
+            let episodes = bgm_subject_id
+                .and_then(|subject_id| bangumi_episodes_by_subject.get(&subject_id))
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            frontend_subject_from_series(card, collection.as_ref(), episodes)
+        })
+        .collect::<Vec<_>>();
+    let local_bgm_ids = local_subjects
+        .iter()
+        .filter_map(|subject| subject.provider_subject_id.parse::<i64>().ok())
+        .collect::<std::collections::HashSet<_>>();
+    let collection_subjects = bangumi_collections
+        .iter()
+        .filter(|collection| !local_bgm_ids.contains(&collection.subject_id))
+        .map(|collection| {
+            let episodes = bangumi_episodes_by_subject
+                .get(&collection.subject_id)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            frontend_subject_from_bangumi_collection(collection, episodes)
+        })
+        .collect::<Vec<_>>();
 
     Ok(BackendSnapshot {
-        subjects: cards
-            .into_iter()
-            .map(frontend_subject_from_series)
-            .collect(),
+        subjects: local_subjects,
+        bangumi_collections: collection_subjects,
+        bangumi_auth,
         stats: LibraryStats {
             total: series_count,
             matched: series_count,
@@ -457,7 +557,22 @@ pub fn refresh_subject_metadata(
                 input.subject_id
             ))
         })?;
-    Ok(frontend_subject_from_series(card))
+    let bgm_subject_id = (card.provider == "bangumi")
+        .then(|| card.provider_subject_id.parse::<i64>().ok())
+        .flatten();
+    let collection = bgm_subject_id
+        .map(|subject_id| context.bangumi.cached_subject_collection(subject_id))
+        .transpose()?
+        .flatten();
+    let episodes = bgm_subject_id
+        .map(|subject_id| context.bangumi.cached_episode_collections(subject_id))
+        .transpose()?
+        .unwrap_or_default();
+    Ok(frontend_subject_from_series(
+        card,
+        collection.as_ref(),
+        &episodes,
+    ))
 }
 
 pub fn episode_resources(
@@ -505,6 +620,87 @@ pub fn control_download_task(
     download_tasks(context)
 }
 
+pub fn bangumi_auth_status(context: &AppContext) -> AppResult<BangumiAuthStatusData> {
+    context.bangumi.auth_status()
+}
+
+pub fn start_bangumi_login(context: &AppContext) -> AppResult<BangumiLoginStartData> {
+    context.bangumi.start_login()
+}
+
+pub fn complete_bangumi_oauth(
+    context: &AppContext,
+    input: BangumiCompleteOAuthInput,
+) -> AppResult<BangumiAuthStatusData> {
+    context.bangumi.complete_oauth(input)
+}
+
+pub fn logout_bangumi(context: &AppContext) -> AppResult<BangumiAuthStatusData> {
+    context.bangumi.logout()
+}
+
+pub fn sync_bangumi_now(context: &AppContext) -> AppResult<BangumiSyncSummaryData> {
+    context.bangumi.sync_all()
+}
+
+pub fn sync_bangumi_subject(
+    context: &AppContext,
+    input: RefreshSubjectRequest,
+) -> AppResult<BangumiSyncSummaryData> {
+    context.bangumi.sync_subject(input.subject_id)
+}
+
+pub fn update_bangumi_collection(
+    context: &AppContext,
+    input: BangumiUpdateCollectionInput,
+) -> AppResult<BangumiSyncSummaryData> {
+    context.bangumi.update_collection(input)
+}
+
+pub fn update_bangumi_episode(
+    context: &AppContext,
+    input: BangumiUpdateEpisodeInput,
+) -> AppResult<BangumiSyncSummaryData> {
+    context.bangumi.update_episode(input)
+}
+
+pub fn batch_update_bangumi_episodes(
+    context: &AppContext,
+    input: BangumiBatchUpdateEpisodesInput,
+) -> AppResult<BangumiSyncSummaryData> {
+    context.bangumi.batch_update_episodes(input)
+}
+
+pub fn report_playback_progress(
+    context: &AppContext,
+    input: PlaybackProgressRequest,
+) -> AppResult<BangumiSyncSummaryData> {
+    if let Some(media_id) = input.media_id {
+        if input.duration.is_finite() && input.position.is_finite() && input.duration > 0.0 {
+            context.watch_history.save(
+                media_id,
+                (input.position * 1000.0).round() as i64,
+                (input.duration * 1000.0).round() as i64,
+            )?;
+        }
+    }
+    if input.subject_id > 0
+        && input.episode_id > 0
+        && crate::service::playback_completion_reached(input.position, input.duration)
+    {
+        context
+            .bangumi
+            .mark_playback_completed(input.subject_id, input.episode_id)
+    } else {
+        Ok(BangumiSyncSummaryData {
+            subjects: 0,
+            episodes: 0,
+            queued: context.bangumi.auth_status()?.pending_sync_count,
+            message: "播放进度尚未达到 Bangumi 完播阈值".to_string(),
+        })
+    }
+}
+
 pub fn test_qbittorrent_connection(context: &AppContext) -> ConnectionTestResponse {
     match context.catalog.test_qbittorrent_connection() {
         Ok(()) => ConnectionTestResponse {
@@ -518,16 +714,15 @@ pub fn test_qbittorrent_connection(context: &AppContext) -> ConnectionTestRespon
     }
 }
 
-fn frontend_subject_from_series(card: UiSeriesCardData) -> FrontendSubject {
+fn frontend_subject_from_series(
+    card: UiSeriesCardData,
+    collection: Option<&BangumiSubjectCollection>,
+    bangumi_episodes: &[BangumiEpisodeCollection],
+) -> FrontendSubject {
     let display_title = if card.title_cn.trim().is_empty() {
         card.title.clone()
     } else {
         card.title_cn.clone()
-    };
-    let progress = if card.episode_count == 0 {
-        0.0
-    } else {
-        (card.linked_episode_count as f64 / card.episode_count as f64).clamp(0.0, 1.0)
     };
     let local_files = card
         .local_files
@@ -540,20 +735,61 @@ fn frontend_subject_from_series(card: UiSeriesCardData) -> FrontendSubject {
             modified_at: file.modified_at,
         })
         .collect();
+    let mut bgm_by_sort = std::collections::HashMap::<usize, &BangumiEpisodeCollection>::new();
+    for episode in bangumi_episodes {
+        if let Some(sort) = episode.sort_number {
+            bgm_by_sort.insert(rounded_episode_number(sort), episode);
+        }
+    }
+    let local_watched_episodes = card
+        .episodes
+        .iter()
+        .filter(|episode| episode.media_id.is_some() && episode.watched)
+        .count();
+    let local_current_episode = card
+        .episodes
+        .iter()
+        .filter(|episode| episode.media_id.is_some() && !episode.watched && episode.progress > 0.0)
+        .map(|episode| rounded_episode_number(episode.episode_number))
+        .min();
     let episodes_detail = card
         .episodes
         .into_iter()
-        .map(|episode| FrontendEpisode {
-            episode: rounded_episode_number(episode.episode_number),
-            title: episode.title,
-            title_cn: episode.title_cn,
-            air_date: episode.air_date,
-            cached: episode.media_id.is_some(),
-            media_id: episode.media_id,
-            file_name: episode.file_name,
-            file_size: episode.file_size.map(format_bytes),
+        .map(|episode| {
+            let episode_number = rounded_episode_number(episode.episode_number);
+            let bgm = bgm_by_sort.get(&episode_number).copied();
+            FrontendEpisode {
+                episode: episode_number,
+                bgm_episode_id: bgm.map(|episode| episode.episode_id),
+                title: bgm
+                    .and_then(|episode| episode.title.clone())
+                    .unwrap_or(episode.title),
+                title_cn: bgm
+                    .and_then(|episode| episode.title_cn.clone())
+                    .unwrap_or(episode.title_cn),
+                air_date: bgm
+                    .and_then(|episode| episode.air_date.clone())
+                    .unwrap_or(episode.air_date),
+                cached: episode.media_id.is_some(),
+                bgm_collection_type: bgm.map(|episode| episode.collection_type),
+                bgm_collection_label: bgm
+                    .map(|episode| episode_collection_label(episode.collection_type).to_string())
+                    .unwrap_or_else(|| episode_collection_label(0).to_string()),
+                bgm_pending: bgm.map(|episode| episode.pending).unwrap_or(false),
+                media_id: episode.media_id,
+                file_name: episode.file_name,
+                file_size: episode.file_size.map(format_bytes),
+            }
         })
         .collect();
+    let episode_total = card.episode_count.max(bangumi_episodes.len());
+    let progress = if episode_total == 0 {
+        0.0
+    } else {
+        (local_watched_episodes as f64 / episode_total as f64).clamp(0.0, 1.0)
+    };
+    let current_episode = local_current_episode
+        .or_else(|| (local_watched_episodes < episode_total).then_some(local_watched_episodes + 1));
 
     FrontendSubject {
         id: format!("subject-{}", card.subject_id),
@@ -579,10 +815,20 @@ fn frontend_subject_from_series(card: UiSeriesCardData) -> FrontendSubject {
         poster: normalize_asset_path(&card.poster_path),
         hero: normalize_asset_path(&card.hero_path),
         status: FrontendMatchStatus::Matched,
-        episodes: card.episode_count,
-        watched_episodes: card.linked_episode_count,
-        current_episode: None,
+        episodes: episode_total,
+        watched_episodes: local_watched_episodes,
+        current_episode,
         progress,
+        bgm_collection_type: collection.map(|collection| collection.collection_type),
+        bgm_collection_label: collection
+            .map(|collection| subject_collection_label(collection.collection_type).to_string())
+            .unwrap_or_else(|| "未标记".to_string()),
+        bgm_rate: collection
+            .map(|collection| collection.rate)
+            .unwrap_or_default(),
+        bgm_pending: collection
+            .map(|collection| collection.pending)
+            .unwrap_or(false),
         files: card.file_count,
         total_size: format_bytes(card.total_size),
         last_played: None,
@@ -608,10 +854,14 @@ fn frontend_subject_from_catalog(subject: CatalogSubjectData) -> FrontendSubject
         (1..=subject.episodes)
             .map(|episode| FrontendEpisode {
                 episode,
+                bgm_episode_id: None,
                 title: format!("Episode {episode}"),
                 title_cn: String::new(),
                 air_date: String::new(),
                 cached: false,
+                bgm_collection_type: None,
+                bgm_collection_label: episode_collection_label(0).to_string(),
+                bgm_pending: false,
                 media_id: None,
                 file_name: None,
                 file_size: None,
@@ -625,10 +875,14 @@ fn frontend_subject_from_catalog(subject: CatalogSubjectData) -> FrontendSubject
                 let episode = rounded_episode_number(ep.sort_number);
                 FrontendEpisode {
                     episode,
+                    bgm_episode_id: ep.provider_episode_id.parse::<i64>().ok(),
                     title: ep.title,
                     title_cn: ep.title_cn.unwrap_or_default(),
                     air_date: ep.air_date.unwrap_or_default(),
                     cached: false,
+                    bgm_collection_type: None,
+                    bgm_collection_label: episode_collection_label(0).to_string(),
+                    bgm_pending: false,
                     media_id: None,
                     file_name: None,
                     file_size: None,
@@ -664,6 +918,10 @@ fn frontend_subject_from_catalog(subject: CatalogSubjectData) -> FrontendSubject
         watched_episodes: 0,
         current_episode: None,
         progress: 0.0,
+        bgm_collection_type: None,
+        bgm_collection_label: "未标记".to_string(),
+        bgm_rate: 0,
+        bgm_pending: false,
         files: subject.files,
         total_size: String::new(),
         last_played: None,
@@ -674,6 +932,159 @@ fn frontend_subject_from_catalog(subject: CatalogSubjectData) -> FrontendSubject
         } else {
             "在线资料库".to_string()
         },
+        local_files: Vec::new(),
+        episodes_detail,
+    }
+}
+
+fn frontend_subject_from_bangumi_collection(
+    collection: &BangumiSubjectCollection,
+    bangumi_episodes: &[BangumiEpisodeCollection],
+) -> FrontendSubject {
+    let summary = collection
+        .subject_json
+        .as_deref()
+        .and_then(subject_json_to_summary);
+    let title = summary
+        .as_ref()
+        .and_then(|summary| {
+            summary
+                .name_cn
+                .clone()
+                .filter(|value| !value.trim().is_empty())
+        })
+        .or_else(|| summary.as_ref().and_then(|summary| summary.name.clone()))
+        .unwrap_or_else(|| format!("Bangumi #{}", collection.subject_id));
+    let title_cn = summary
+        .as_ref()
+        .and_then(|summary| summary.name.clone())
+        .unwrap_or_default();
+    let poster = summary
+        .as_ref()
+        .and_then(|summary| summary.images.as_ref())
+        .and_then(|images| {
+            images
+                .get("large")
+                .or_else(|| images.get("common"))
+                .or_else(|| images.get("medium"))
+                .cloned()
+        })
+        .unwrap_or_default();
+    let rating = summary
+        .as_ref()
+        .and_then(|summary| summary.rating.as_ref())
+        .and_then(|rating| rating.score)
+        .unwrap_or_default();
+    let tags = summary
+        .as_ref()
+        .and_then(|summary| summary.tags.clone())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|tag| tag.name)
+        .collect::<Vec<_>>();
+    let episode_total = summary
+        .as_ref()
+        .and_then(|summary| summary.total_episodes.or(summary.eps))
+        .unwrap_or(bangumi_episodes.len());
+    let watched_episodes = 0;
+    let progress = 0.0;
+    let current_episode = None;
+    let episodes_detail = if bangumi_episodes.is_empty() {
+        (1..=episode_total)
+            .map(|episode| FrontendEpisode {
+                episode,
+                bgm_episode_id: None,
+                title: format!("Episode {episode}"),
+                title_cn: String::new(),
+                air_date: String::new(),
+                cached: false,
+                bgm_collection_type: None,
+                bgm_collection_label: episode_collection_label(0).to_string(),
+                bgm_pending: false,
+                media_id: None,
+                file_name: None,
+                file_size: None,
+            })
+            .collect()
+    } else {
+        bangumi_episodes
+            .iter()
+            .enumerate()
+            .map(|(index, episode)| {
+                let episode_number = episode
+                    .sort_number
+                    .map(rounded_episode_number)
+                    .unwrap_or(index + 1);
+                FrontendEpisode {
+                    episode: episode_number,
+                    bgm_episode_id: Some(episode.episode_id),
+                    title: episode
+                        .title
+                        .clone()
+                        .unwrap_or_else(|| format!("Episode {episode_number}")),
+                    title_cn: episode.title_cn.clone().unwrap_or_default(),
+                    air_date: episode.air_date.clone().unwrap_or_default(),
+                    cached: false,
+                    bgm_collection_type: Some(episode.collection_type),
+                    bgm_collection_label: episode_collection_label(episode.collection_type)
+                        .to_string(),
+                    bgm_pending: episode.pending,
+                    media_id: None,
+                    file_name: None,
+                    file_size: None,
+                }
+            })
+            .collect()
+    };
+
+    FrontendSubject {
+        id: format!("bangumi-collection-{}", collection.subject_id),
+        media_id: 0,
+        subject_id: collection.subject_id,
+        source: "bangumiCollection".to_string(),
+        provider: "bangumi".to_string(),
+        provider_subject_id: collection.subject_id.to_string(),
+        local: false,
+        aliases: Vec::new(),
+        title,
+        title_cn,
+        year: summary
+            .as_ref()
+            .and_then(|summary| summary.date.as_ref())
+            .and_then(|date| date.get(0..4))
+            .and_then(|year| year.parse().ok())
+            .unwrap_or_default(),
+        air_date: summary
+            .as_ref()
+            .and_then(|summary| summary.date.clone())
+            .unwrap_or_default(),
+        rating,
+        rank: summary
+            .as_ref()
+            .and_then(|summary| summary.rank)
+            .unwrap_or_default(),
+        tags,
+        summary: summary
+            .as_ref()
+            .and_then(|summary| summary.summary.clone())
+            .unwrap_or_default(),
+        poster: normalize_asset_path(&poster),
+        hero: normalize_asset_path(&poster),
+        status: FrontendMatchStatus::Matched,
+        episodes: episode_total,
+        watched_episodes,
+        current_episode,
+        progress,
+        bgm_collection_type: Some(collection.collection_type),
+        bgm_collection_label: subject_collection_label(collection.collection_type).to_string(),
+        bgm_rate: collection.rate,
+        bgm_pending: collection.pending,
+        files: 0,
+        total_size: String::new(),
+        last_played: None,
+        new_episode: false,
+        metadata_ready: true,
+        file_summary: "Bangumi 云端条目".to_string(),
         local_files: Vec::new(),
         episodes_detail,
     }
@@ -711,40 +1122,40 @@ pub fn frontend_event_from_app(event: AppEvent) -> BackendEvent {
     match event {
         AppEvent::Log(message) => BackendEvent {
             message: Some(message),
-            ..BackendEvent::new("log")
+            ..BackendEvent::new(BackendEventType::Log)
         },
         AppEvent::ScanStarted => BackendEvent {
             message: Some("扫描已开始".to_string()),
-            ..BackendEvent::new("scanStarted")
+            ..BackendEvent::new(BackendEventType::ScanStarted)
         },
         AppEvent::ScanProgress { scanned, indexed } => BackendEvent {
             scanned: Some(scanned),
             indexed: Some(indexed),
             message: Some(format!("已扫描 {scanned} 个文件")),
-            ..BackendEvent::new("scanProgress")
+            ..BackendEvent::new(BackendEventType::ScanProgress)
         },
         AppEvent::ScanFinished { summary, .. } => BackendEvent {
             message: Some(format!("文件扫描完成：{} 个文件", summary.scanned_files)),
             summary: Some(summary),
-            ..BackendEvent::new("scanFinished")
+            ..BackendEvent::new(BackendEventType::ScanFinished)
         },
         AppEvent::ScanFailed(error) => BackendEvent {
             message: Some(error),
-            ..BackendEvent::new("scanFailed")
+            ..BackendEvent::new(BackendEventType::ScanFailed)
         },
         AppEvent::DanmakuMatched(match_result) => BackendEvent {
             message: Some(match_result.title),
-            ..BackendEvent::new("danmakuMatched")
+            ..BackendEvent::new(BackendEventType::DanmakuMatched)
         },
         AppEvent::MetadataMatchStarted { media_id } => BackendEvent {
             media_id: Some(media_id),
-            ..BackendEvent::new("metadataStarted")
+            ..BackendEvent::new(BackendEventType::MetadataStarted)
         },
         AppEvent::MetadataMatchProgress { processed, total } => BackendEvent {
             processed: Some(processed),
             total: Some(total),
             message: Some(format!("元数据整理 {processed}/{total}")),
-            ..BackendEvent::new("metadataProgress")
+            ..BackendEvent::new(BackendEventType::MetadataProgress)
         },
         AppEvent::MetadataMatchFinished {
             media_id,
@@ -754,11 +1165,11 @@ pub fn frontend_event_from_app(event: AppEvent) -> BackendEvent {
             media_id: Some(media_id),
             subject_id,
             message: Some(title.unwrap_or_else(|| format!("media #{media_id}"))),
-            ..BackendEvent::new("metadataFinished")
+            ..BackendEvent::new(BackendEventType::MetadataFinished)
         },
         AppEvent::SubjectUpdated { subject_id } => BackendEvent {
             subject_id: Some(subject_id),
-            ..BackendEvent::new("subjectUpdated")
+            ..BackendEvent::new(BackendEventType::SubjectUpdated)
         },
         AppEvent::ImageCached {
             subject_id,
@@ -766,21 +1177,50 @@ pub fn frontend_event_from_app(event: AppEvent) -> BackendEvent {
         } => BackendEvent {
             subject_id: Some(subject_id),
             image_kind: Some(image_kind),
-            ..BackendEvent::new("imageCached")
+            ..BackendEvent::new(BackendEventType::ImageCached)
         },
         AppEvent::MetadataFailed { target_id, error } => BackendEvent {
             target_id: Some(target_id),
             message: Some(error),
-            ..BackendEvent::new("metadataFailed")
+            ..BackendEvent::new(BackendEventType::MetadataFailed)
         },
         AppEvent::MetadataStatus(message) => BackendEvent {
             message: Some(message),
-            ..BackendEvent::new("metadataStatus")
+            ..BackendEvent::new(BackendEventType::MetadataStatus)
+        },
+        AppEvent::BangumiSyncStarted { total, message } => BackendEvent {
+            total: Some(total),
+            message: Some(message),
+            ..BackendEvent::new(BackendEventType::BangumiSyncStarted)
+        },
+        AppEvent::BangumiSyncProgress {
+            processed,
+            total,
+            message,
+        } => BackendEvent {
+            processed: Some(processed),
+            total: Some(total),
+            message: Some(message),
+            ..BackendEvent::new(BackendEventType::BangumiSyncProgress)
+        },
+        AppEvent::BangumiSyncFinished {
+            subjects,
+            episodes,
+            message,
+        } => BackendEvent {
+            processed: Some(subjects),
+            total: Some(episodes),
+            message: Some(message),
+            ..BackendEvent::new(BackendEventType::BangumiSyncFinished)
+        },
+        AppEvent::BangumiSyncFailed { error } => BackendEvent {
+            message: Some(error),
+            ..BackendEvent::new(BackendEventType::BangumiSyncFailed)
         },
         AppEvent::DownloadCompleted { task_id, title } => BackendEvent {
             target_id: Some(task_id),
             message: Some(format!("下载完成：{title}")),
-            ..BackendEvent::new("downloadCompleted")
+            ..BackendEvent::new(BackendEventType::DownloadCompleted)
         },
     }
 }
@@ -823,7 +1263,16 @@ pub fn export_types(output_path: impl AsRef<Path>) -> AppResult<()> {
         StartResourceDownloadRequest::decl(&ts_config),
         DownloadTasksResponse::decl(&ts_config),
         DownloadTaskActionRequest::decl(&ts_config),
+        BangumiAuthStatusData::decl(&ts_config),
+        BangumiLoginStartData::decl(&ts_config),
+        BangumiSyncSummaryData::decl(&ts_config),
+        BangumiCompleteOAuthInput::decl(&ts_config),
+        BangumiUpdateCollectionInput::decl(&ts_config),
+        BangumiUpdateEpisodeInput::decl(&ts_config),
+        BangumiBatchUpdateEpisodesInput::decl(&ts_config),
+        PlaybackProgressRequest::decl(&ts_config),
         ConnectionTestResponse::decl(&ts_config),
+        BackendEventType::decl(&ts_config),
         BackendEvent::decl(&ts_config),
     ]
     .join("\n\n")
@@ -850,7 +1299,13 @@ fn frontend_settings_from_config(config: AppConfig) -> FrontendEditableSettings 
         database_path: config.database.path.display().to_string(),
         bangumi_enabled: config.bangumi.enabled,
         bangumi_base_url: config.bangumi.base_url,
-        bangumi_access_token: config.bangumi.access_token,
+        bangumi_oauth_base_url: config.bangumi.oauth_base_url,
+        bangumi_client_id: config.bangumi.client_id,
+        bangumi_client_secret: String::new(),
+        bangumi_client_secret_configured: !config.bangumi.client_secret.trim().is_empty(),
+        bangumi_redirect_uri: config.bangumi.redirect_uri,
+        bangumi_access_token: String::new(),
+        bangumi_access_token_configured: !config.bangumi.access_token.trim().is_empty(),
         bangumi_user_agent: config.bangumi.user_agent,
         bangumi_request_timeout_secs: config.bangumi.request_timeout_secs,
         bangumi_auto_match: config.bangumi.auto_match,
@@ -872,7 +1327,7 @@ fn frontend_settings_from_config(config: AppConfig) -> FrontendEditableSettings 
     }
 }
 
-fn config_from_frontend_settings(input: FrontendEditableSettings) -> AppConfig {
+fn config_from_frontend_settings(input: FrontendEditableSettings, current: AppConfig) -> AppConfig {
     AppConfig {
         database: DatabaseConfig {
             path: PathBuf::from(input.database_path.trim()),
@@ -891,7 +1346,19 @@ fn config_from_frontend_settings(input: FrontendEditableSettings) -> AppConfig {
         bangumi: BangumiConfig {
             enabled: input.bangumi_enabled,
             base_url: input.bangumi_base_url,
-            access_token: input.bangumi_access_token,
+            oauth_base_url: input.bangumi_oauth_base_url,
+            client_id: input.bangumi_client_id,
+            client_secret: if input.bangumi_client_secret.trim().is_empty() {
+                current.bangumi.client_secret
+            } else {
+                input.bangumi_client_secret
+            },
+            redirect_uri: input.bangumi_redirect_uri,
+            access_token: if input.bangumi_access_token.trim().is_empty() {
+                current.bangumi.access_token
+            } else {
+                input.bangumi_access_token
+            },
             user_agent: input.bangumi_user_agent,
             request_timeout_secs: input.bangumi_request_timeout_secs.max(1),
             auto_match: input.bangumi_auto_match,

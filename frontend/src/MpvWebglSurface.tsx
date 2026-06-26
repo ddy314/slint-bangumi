@@ -13,6 +13,7 @@ type MpvWebglSurfaceProps = {
   videoWidth?: number;
   videoHeight?: number;
   fps?: number;
+  generation?: number;
   className?: string;
   onError?: (message: string) => void;
   onFrame?: (frame: MpvFrame) => void;
@@ -33,6 +34,7 @@ export function MpvWebglSurface({
   videoWidth,
   videoHeight,
   fps,
+  generation = 0,
   className,
   onError,
   onFrame,
@@ -41,6 +43,7 @@ export function MpvWebglSurface({
   const glStateRef = useRef<GlState | null>(null);
   const activeRef = useRef(active);
   const pausedRef = useRef(paused);
+  const generationRef = useRef(generation);
   const dimensionsRef = useRef({ width: videoWidth, height: videoHeight, fps });
   const onErrorRef = useRef(onError);
   const onFrameRef = useRef(onFrame);
@@ -52,6 +55,10 @@ export function MpvWebglSurface({
   useEffect(() => {
     pausedRef.current = paused;
   }, [paused]);
+
+  useEffect(() => {
+    generationRef.current = generation;
+  }, [generation]);
 
   useEffect(() => {
     dimensionsRef.current = { width: videoWidth, height: videoHeight, fps };
@@ -86,10 +93,16 @@ export function MpvWebglSurface({
     let hasFrame = false;
     let lastError = "";
     let adaptiveFrameInterval = 0;
+    let observedGeneration = generationRef.current;
 
     const renderLoop = (now: number) => {
       if (disposed) {
         return;
+      }
+      if (observedGeneration !== generationRef.current) {
+        observedGeneration = generationRef.current;
+        hasFrame = false;
+        lastSubmitAt = 0;
       }
 
       const { fps: currentFps } = dimensionsRef.current;
@@ -106,9 +119,10 @@ export function MpvWebglSurface({
         lastSubmitAt = now;
         const { width, height } = chooseRenderSize(canvas, dimensionsRef.current.width, dimensionsRef.current.height);
         const requestStartedAt = performance.now();
+        const requestGeneration = generationRef.current;
         mpvRenderFrame(width, height)
           .then((frame) => {
-            if (disposed || frame.ok === false) {
+            if (disposed || frame.ok === false || requestGeneration !== generationRef.current || !activeRef.current) {
               return;
             }
             uploadFrame(glState, frame);

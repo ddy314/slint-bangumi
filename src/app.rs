@@ -4,7 +4,8 @@ use crate::config::ConfigStore;
 use crate::error::AppResult;
 use crate::repository::Repository;
 use crate::service::{
-    CatalogService, DanmakuService, MediaService, MetadataService, WatchHistoryService,
+    BangumiService, CatalogService, DanmakuService, MediaService, MetadataService,
+    WatchHistoryService,
 };
 use crate::task::AppEvent;
 
@@ -15,6 +16,7 @@ pub struct AppContext {
     pub danmaku: DanmakuService,
     pub metadata: MetadataService,
     pub catalog: CatalogService,
+    pub bangumi: BangumiService,
     pub event_receiver: Arc<std::sync::Mutex<Option<mpsc::Receiver<AppEvent>>>>,
 }
 
@@ -42,6 +44,7 @@ impl AppContext {
             )?,
             danmaku,
             catalog,
+            bangumi: BangumiService::new(config.clone(), repository.clone(), events.clone()),
             event_receiver: Arc::new(std::sync::Mutex::new(Some(receiver))),
         })
     }

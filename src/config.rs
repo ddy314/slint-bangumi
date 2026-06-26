@@ -36,6 +36,14 @@ pub struct DandanplayConfig {
 pub struct BangumiConfig {
     pub enabled: bool,
     pub base_url: String,
+    #[serde(default = "default_bangumi_oauth_base_url")]
+    pub oauth_base_url: String,
+    #[serde(default)]
+    pub client_id: String,
+    #[serde(default)]
+    pub client_secret: String,
+    #[serde(default = "default_bangumi_redirect_uri")]
+    pub redirect_uri: String,
     pub access_token: String,
     pub user_agent: String,
     pub request_timeout_secs: u64,
@@ -90,6 +98,10 @@ impl Default for BangumiConfig {
         Self {
             enabled: true,
             base_url: "https://api.bgm.tv".to_string(),
+            oauth_base_url: default_bangumi_oauth_base_url(),
+            client_id: String::new(),
+            client_secret: String::new(),
+            redirect_uri: default_bangumi_redirect_uri(),
             access_token: String::new(),
             user_agent: format!("NexPlay/{}", env!("CARGO_PKG_VERSION")),
             request_timeout_secs: 20,
@@ -97,6 +109,14 @@ impl Default for BangumiConfig {
             cache_images: true,
         }
     }
+}
+
+fn default_bangumi_oauth_base_url() -> String {
+    "https://bgm.tv".to_string()
+}
+
+fn default_bangumi_redirect_uri() -> String {
+    "http://127.0.0.1:17654/bangumi/callback".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

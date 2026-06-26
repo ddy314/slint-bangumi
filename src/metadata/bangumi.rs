@@ -71,7 +71,9 @@ impl MetadataProvider for BangumiProvider {
         let status = response.status();
         if !status.is_success() {
             let message = if status.as_u16() == 401 {
-                format!("bangumi returned 401: access token may have expired. You can clear it in Settings → Bangumi and try again.")
+                format!(
+                    "bangumi returned 401: access token may have expired. You can clear it in Settings → Bangumi and try again."
+                )
             } else {
                 format!("bangumi search rejected: {status}")
             };

@@ -2,6 +2,26 @@ const fs = require("node:fs");
 const path = require("node:path");
 const { fork } = require("node:child_process");
 
+const DEFAULT_REQUEST_TIMEOUT_MS = 5000;
+const FAST_REQUEST_TIMEOUT_MS = 1800;
+const LOAD_REQUEST_TIMEOUT_MS = 15000;
+const RENDER_FRAME_TIMEOUT_MS = 1200;
+
+function timeoutForCommand(command) {
+  switch (command?.type) {
+    case "info":
+    case "probeWebglTextureRenderer":
+    case "state":
+      return FAST_REQUEST_TIMEOUT_MS;
+    case "load":
+      return LOAD_REQUEST_TIMEOUT_MS;
+    case "renderFrame":
+      return RENDER_FRAME_TIMEOUT_MS;
+    default:
+      return DEFAULT_REQUEST_TIMEOUT_MS;
+  }
+}
+
 class RenderBridge {
   constructor({ projectRoot }) {
     this.projectRoot = projectRoot;
@@ -44,14 +64,27 @@ class RenderBridge {
     }
   }
 
-  request(command) {
+  request(command, options = {}) {
     const child = this.ensureStarted();
     const id = this.nextRequestId++;
+    const timeoutMs = options.timeoutMs ?? timeoutForCommand(command);
     return new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject });
+      const timer = setTimeout(() => {
+        if (!this.pending.delete(id)) {
+          return;
+        }
+        const error = new Error(`native render bridge request timed out: ${command?.type || "unknown"}`);
+        reject(error);
+        this.restart(error);
+      }, timeoutMs);
+      this.pending.set(id, { resolve, reject, timer });
       child.send({ id, command }, (error) => {
         if (error) {
-          this.pending.delete(id);
+          const pending = this.pending.get(id);
+          if (pending) {
+            clearTimeout(pending.timer);
+            this.pending.delete(id);
+          }
           reject(error);
         }
       });
@@ -69,10 +102,16 @@ class RenderBridge {
       throw new Error("native render bridge is not built");
     }
 
+    const execPath = process.env.NEXPLAY_NODE_BIN || process.execPath;
+    const env = { ...process.env };
+    if (!process.env.NEXPLAY_NODE_BIN) {
+      env.ELECTRON_RUN_AS_NODE = "1";
+    }
+
     const child = fork(daemonPath, [], {
       cwd: this.projectRoot,
-      env: process.env,
-      execPath: process.env.NEXPLAY_NODE_BIN || "node",
+      env,
+      execPath,
       serialization: "advanced",
       stdio: ["ignore", "pipe", "pipe", "ipc"],
     });
@@ -94,6 +133,7 @@ class RenderBridge {
       const pending = this.pending.get(message?.id);
       if (!pending) return;
       this.pending.delete(message.id);
+      clearTimeout(pending.timer);
       if (message.ok) {
         pending.resolve(message.payload);
       } else {
@@ -116,9 +156,21 @@ class RenderBridge {
 
   rejectPending(error) {
     for (const pending of this.pending.values()) {
+      clearTimeout(pending.timer);
       pending.reject(error);
     }
     this.pending.clear();
+  }
+
+  restart(error) {
+    const child = this.renderDaemon;
+    if (!child) {
+      return;
+    }
+    this.renderDaemon = null;
+    this.info = null;
+    this.rejectPending(error);
+    child.kill();
   }
 
   shutdown() {

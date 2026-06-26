@@ -9,12 +9,20 @@ use crate::app::AppContext;
 use crate::backend_api::{
     CatalogSearchRequest, DanmakuTrackRequest, DownloadTaskActionRequest, EpisodeResourcesRequest,
     FrontendEditableSettings, MediaSourceRequest, OnlineSubjectRequest, OpenMediaRequest,
-    RefreshSubjectRequest, StartResourceDownloadRequest, control_download_task, danmaku_track,
-    download_tasks, episode_resources, frontend_event_from_app, media_source, online_subject,
-    open_media, refresh_subject_metadata, save_settings_config, scan, search_catalog,
-    settings_config, snapshot, start_resource_download, test_qbittorrent_connection,
+    PlaybackProgressRequest, RefreshSubjectRequest, StartResourceDownloadRequest,
+    bangumi_auth_status, batch_update_bangumi_episodes, complete_bangumi_oauth,
+    control_download_task, danmaku_track, download_tasks, episode_resources,
+    frontend_event_from_app, logout_bangumi, media_source, online_subject, open_media,
+    refresh_subject_metadata, report_playback_progress, save_settings_config, scan, search_catalog,
+    settings_config, snapshot, start_bangumi_login, start_resource_download, sync_bangumi_now,
+    sync_bangumi_subject, test_qbittorrent_connection, update_bangumi_collection,
+    update_bangumi_episode,
 };
 use crate::error::{AppError, AppResult, io_error};
+use crate::service::{
+    BangumiBatchUpdateEpisodesInput, BangumiCompleteOAuthInput, BangumiUpdateCollectionInput,
+    BangumiUpdateEpisodeInput,
+};
 use crate::task::AppEvent;
 
 #[derive(Debug, Deserialize)]
@@ -164,6 +172,34 @@ fn dispatch(context: &AppContext, method: &str, params: Option<Value>) -> AppRes
         "controlDownloadTask" => {
             let input: DownloadTaskActionRequest = from_params(params)?;
             to_value(control_download_task(context, input)?)
+        }
+        "bangumiAuthStatus" => to_value(bangumi_auth_status(context)?),
+        "startBangumiLogin" => to_value(start_bangumi_login(context)?),
+        "completeBangumiOAuth" => {
+            let input: BangumiCompleteOAuthInput = from_params(params)?;
+            to_value(complete_bangumi_oauth(context, input)?)
+        }
+        "logoutBangumi" => to_value(logout_bangumi(context)?),
+        "syncBangumiNow" => to_value(sync_bangumi_now(context)?),
+        "syncBangumiSubject" => {
+            let input: RefreshSubjectRequest = from_params(params)?;
+            to_value(sync_bangumi_subject(context, input)?)
+        }
+        "updateBangumiCollection" => {
+            let input: BangumiUpdateCollectionInput = from_params(params)?;
+            to_value(update_bangumi_collection(context, input)?)
+        }
+        "updateBangumiEpisode" => {
+            let input: BangumiUpdateEpisodeInput = from_params(params)?;
+            to_value(update_bangumi_episode(context, input)?)
+        }
+        "batchUpdateBangumiEpisodes" => {
+            let input: BangumiBatchUpdateEpisodesInput = from_params(params)?;
+            to_value(batch_update_bangumi_episodes(context, input)?)
+        }
+        "reportPlaybackProgress" => {
+            let input: PlaybackProgressRequest = from_params(params)?;
+            to_value(report_playback_progress(context, input)?)
         }
         "testQbittorrentConnection" => to_value(test_qbittorrent_connection(context)),
         other => Err(AppError::Api(format!("unknown JSON-RPC method: {other}"))),

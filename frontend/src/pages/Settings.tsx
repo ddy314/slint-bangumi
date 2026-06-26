@@ -1,5 +1,13 @@
 import { useEffect, useMemo, useState } from "react";
-import { testQbittorrentConnection, type EditableSettings } from "../backend";
+import {
+  bangumiAuthStatus,
+  logoutBangumi,
+  startBangumiLogin,
+  syncBangumiNow,
+  testQbittorrentConnection,
+  type BangumiAuthStatus,
+  type EditableSettings,
+} from "../backend";
 import { Button, Card, Switch } from "../ui";
 import { ChevronRight, KeyIcon } from "../icons";
 import { cn } from "../utils/cn";
@@ -20,7 +28,13 @@ const emptySettings: EditableSettings = {
   databasePath: "data/nexplay.sqlite3",
   bangumiEnabled: true,
   bangumiBaseUrl: "https://api.bgm.tv",
+  bangumiOauthBaseUrl: "https://bgm.tv",
+  bangumiClientId: "",
+  bangumiClientSecret: "",
+  bangumiClientSecretConfigured: false,
+  bangumiRedirectUri: "http://127.0.0.1:17654/bangumi/callback",
   bangumiAccessToken: "",
+  bangumiAccessTokenConfigured: false,
   bangumiUserAgent: "NexPlay/0.1.0",
   bangumiRequestTimeoutSecs: 20,
   bangumiAutoMatch: true,
@@ -52,6 +66,8 @@ export function SettingsPage({
   const [loading, setLoading] = useState(Boolean(window.nexplay));
   const [saving, setSaving] = useState(false);
   const [testingQbit, setTestingQbit] = useState(false);
+  const [bangumiAuth, setBangumiAuth] = useState<BangumiAuthStatus | null>(null);
+  const [bangumiBusy, setBangumiBusy] = useState<"login" | "sync" | "logout" | null>(null);
   const [showSecrets, setShowSecrets] = useState(false);
 
   useEffect(() => {
@@ -68,6 +84,9 @@ export function SettingsPage({
         if (!alive) return;
         setSettings(next);
         setLibrariesText(next.mediaLibraries.join("\n"));
+        void bangumiAuthStatus().then((status) => {
+          if (alive) setBangumiAuth(status);
+        });
       })
       .catch((caught) => {
         const message = caught instanceof Error ? caught.message : String(caught);
@@ -138,9 +157,78 @@ export function SettingsPage({
     }
   };
 
+  const startBangumiOAuth = async () => {
+    if (!window.nexplay) {
+      onSnack("当前不是 Electron 环境，无法启动 Bangumi 登录。", "danger");
+      return;
+    }
+    setBangumiBusy("login");
+    try {
+      const saved = await window.nexplay.saveSettings(normalizedSettings);
+      setSettings(saved);
+      setLibrariesText(saved.mediaLibraries.join("\n"));
+      const login = await startBangumiLogin();
+      onSnack(`已打开 Bangumi 登录页面，回调地址：${login.redirectUri}`, "success");
+    } catch (caught) {
+      const message = caught instanceof Error ? caught.message : String(caught);
+      onSnack(`启动 Bangumi 登录失败：${message}`, "danger");
+    } finally {
+      setBangumiBusy(null);
+    }
+  };
+
+  const refreshBangumiAuth = async () => {
+    try {
+      setBangumiAuth(await bangumiAuthStatus());
+    } catch {
+      // Auth status is best-effort in the settings view.
+    }
+  };
+
+  const syncBangumi = async () => {
+    setBangumiBusy("sync");
+    try {
+      const result = await syncBangumiNow();
+      await refreshBangumiAuth();
+      onSnack(result.message, "success");
+    } catch (caught) {
+      const message = caught instanceof Error ? caught.message : String(caught);
+      onSnack(`Bangumi 同步失败：${message}`, "danger");
+    } finally {
+      setBangumiBusy(null);
+    }
+  };
+
+  const logout = async () => {
+    setBangumiBusy("logout");
+    try {
+      const status = await logoutBangumi();
+      setBangumiAuth(status);
+      onSnack("已退出 Bangumi 账号。", "success");
+    } catch (caught) {
+      const message = caught instanceof Error ? caught.message : String(caught);
+      onSnack(`退出 Bangumi 失败：${message}`, "danger");
+    } finally {
+      setBangumiBusy(null);
+    }
+  };
+
+  useEffect(() => {
+    if (!window.nexplay?.onBackendEvent) return;
+    return window.nexplay.onBackendEvent((event) => {
+      if (event.type === "bangumiOAuthCompleted") {
+        void refreshBangumiAuth();
+        onSnack(`Bangumi 登录完成：${event.message ?? ""}`, "success");
+      }
+      if (event.type === "bangumiOAuthFailed") {
+        onSnack(`Bangumi 登录失败：${event.message ?? ""}`, "danger");
+      }
+    });
+  }, [onSnack]);
+
   return (
     <div className="page-shell h-full overflow-y-auto">
-      <div className="mb-10 flex items-end justify-between gap-6">
+      <div className="mb-8 flex flex-wrap items-end justify-between gap-5">
         <div>
           <h1 className="text-[44px] font-bold leading-[1] tracking-tight">设置</h1>
           <div className="mt-3 text-[17px] font-medium text-[var(--color-on-surface-muted)]">
@@ -152,8 +240,8 @@ export function SettingsPage({
         </Button>
       </div>
 
-      <div className="grid grid-cols-[240px_minmax(0,1fr)] items-start gap-8">
-        <Card className="p-2 settings-section-list">
+      <div className="grid grid-cols-1 items-start gap-6 lg:grid-cols-[220px_minmax(0,1fr)]">
+        <Card className="settings-section-list p-2 lg:sticky lg:top-6">
           {sections.map((item) => (
             <button
               key={item.id}
@@ -227,7 +315,57 @@ export function SettingsPage({
           )}
 
           {section === "bangumi" && (
-            <Group title="Bangumi" desc="控制条目查询、自动匹配和图片缓存。">
+            <Group title="Bangumi" desc="账号状态同步、条目查询、自动匹配和图片缓存。">
+              <div className="px-6 py-5">
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <div className="min-w-0">
+                    <div className="text-[14px] font-semibold">
+                      {bangumiAuth?.authenticated
+                        ? `已登录 ${bangumiAuth.nickname || bangumiAuth.username || "Bangumi"}`
+                        : "未登录 Bangumi"}
+                    </div>
+                    <div className="mt-1 text-[12px] font-medium text-[var(--color-on-surface-faint)]">
+                      {bangumiAuth?.pendingSyncCount
+                        ? `${bangumiAuth.pendingSyncCount} 个修改待同步`
+                        : bangumiAuth?.clientConfigured
+                          ? "OAuth 客户端已配置"
+                          : "需要先配置 Client ID 和 Client Secret"}
+                    </div>
+                    {bangumiAuth?.lastError && (
+                      <div className="mt-1 text-[12px] font-medium text-rose-600">
+                        {bangumiAuth.lastError}
+                      </div>
+                    )}
+                  </div>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <Button
+                      onClick={startBangumiOAuth}
+                      loading={bangumiBusy === "login"}
+                      className="h-9 px-4 text-[13px]"
+                    >
+                      {bangumiAuth?.authenticated ? "重新登录" : "登录"}
+                    </Button>
+                    <Button
+                      variant="tonal"
+                      onClick={syncBangumi}
+                      loading={bangumiBusy === "sync"}
+                      disabled={!bangumiAuth?.authenticated}
+                      className="h-9 px-4 text-[13px]"
+                    >
+                      立即同步
+                    </Button>
+                    <Button
+                      variant="text"
+                      onClick={logout}
+                      loading={bangumiBusy === "logout"}
+                      disabled={!bangumiAuth?.authenticated}
+                      className="h-9 px-3 text-[13px]"
+                    >
+                      退出
+                    </Button>
+                  </div>
+                </div>
+              </div>
               <SettingsRow
                 title="启用 Bangumi"
                 control={<Switch checked={settings.bangumiEnabled} onChange={(value) => update("bangumiEnabled", value)} />}
@@ -244,10 +382,56 @@ export function SettingsPage({
               />
               <SettingsRow
                 title="API 地址"
+                desc="Bangumi OpenAPI 主机。"
                 control={
                   <TextInput
                     value={settings.bangumiBaseUrl}
                     onChange={(value) => update("bangumiBaseUrl", value)}
+                    className="w-full font-mono"
+                  />
+                }
+              />
+              <SettingsRow
+                title="OAuth 地址"
+                desc="用于 authorize/access_token，默认 https://bgm.tv。"
+                control={
+                  <TextInput
+                    value={settings.bangumiOauthBaseUrl}
+                    onChange={(value) => update("bangumiOauthBaseUrl", value)}
+                    className="w-full font-mono"
+                  />
+                }
+              />
+              <SettingsRow
+                title="Client ID"
+                control={
+                  <TextInput
+                    value={settings.bangumiClientId}
+                    onChange={(value) => update("bangumiClientId", value)}
+                    className="w-full font-mono"
+                  />
+                }
+              />
+              <SettingsRow
+                title="Client Secret"
+                desc={settings.bangumiClientSecretConfigured ? "已配置；留空保存不会覆盖旧值。" : "本地保存，不会提交到仓库。"}
+                control={
+                  <SecretInput
+                    value={settings.bangumiClientSecret}
+                    show={showSecrets}
+                    onToggleShow={() => setShowSecrets((value) => !value)}
+                    placeholder={settings.bangumiClientSecretConfigured ? "已配置，输入新值以修改" : ""}
+                    onChange={(value) => update("bangumiClientSecret", value)}
+                  />
+                }
+              />
+              <SettingsRow
+                title="回调地址"
+                desc="Bangumi 应用后台需要登记同一个 redirect URI。"
+                control={
+                  <TextInput
+                    value={settings.bangumiRedirectUri}
+                    onChange={(value) => update("bangumiRedirectUri", value)}
                     className="w-full font-mono"
                   />
                 }
@@ -276,12 +460,14 @@ export function SettingsPage({
                 }
               />
               <SettingsRow
-                title="Access Token"
+                title="手动 Access Token"
+                desc={settings.bangumiAccessTokenConfigured ? "已配置；通常应使用 OAuth 登录，留空保存不会覆盖旧值。" : "可选。通常不需要手动填写。"}
                 control={
                   <SecretInput
                     value={settings.bangumiAccessToken}
                     show={showSecrets}
                     onToggleShow={() => setShowSecrets((value) => !value)}
+                    placeholder={settings.bangumiAccessTokenConfigured ? "已配置，输入新值以修改" : ""}
                     onChange={(value) => update("bangumiAccessToken", value)}
                   />
                 }
@@ -470,7 +656,7 @@ function SettingsRow({
   control: React.ReactNode;
 }) {
   return (
-    <div className="grid grid-cols-[180px_minmax(0,1fr)] items-center gap-5 px-6 py-4">
+    <div className="grid grid-cols-1 items-center gap-3 px-6 py-4 sm:grid-cols-[180px_minmax(0,1fr)] sm:gap-5">
       <div className="flex-1 min-w-0">
         <div className="text-[14px] font-semibold">{title}</div>
         {desc && <div className="mt-0.5 text-[12px] font-medium text-[var(--color-on-surface-faint)]">{desc}</div>}
@@ -506,11 +692,13 @@ function SecretInput({
   show,
   onToggleShow,
   onChange,
+  placeholder,
 }: {
   value: string;
   show: boolean;
   onToggleShow: () => void;
   onChange: (value: string) => void;
+  placeholder?: string;
 }) {
   return (
     <div className="flex items-center gap-2">
@@ -518,6 +706,7 @@ function SecretInput({
         <input
           type={show ? "text" : "password"}
           value={value}
+          placeholder={placeholder}
           onChange={(event) => onChange(event.target.value)}
           className="h-9 w-full rounded-[var(--radius-control)] bg-[var(--color-surface-3)] pl-9 pr-3 font-mono text-[13px] outline-none ring-1 ring-inset ring-[var(--color-outline-soft)] focus:ring-[var(--color-primary)]/40"
         />

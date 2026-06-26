@@ -14,6 +14,16 @@ interface Window {
     startResourceDownload: (payload: import("./generated/backend").StartResourceDownloadRequest) => Promise<import("./backend").DownloadTask>;
     downloadTasks: () => Promise<import("./backend").DownloadTasks>;
     controlDownloadTask: (payload: import("./generated/backend").DownloadTaskActionRequest) => Promise<import("./backend").DownloadTasks>;
+    bangumiAuthStatus: () => Promise<import("./backend").BangumiAuthStatus>;
+    startBangumiLogin: () => Promise<import("./backend").BangumiLoginStart>;
+    completeBangumiOAuth: (payload: import("./generated/backend").BangumiCompleteOAuthInput) => Promise<import("./backend").BangumiAuthStatus>;
+    logoutBangumi: () => Promise<import("./backend").BangumiAuthStatus>;
+    syncBangumiNow: () => Promise<import("./backend").BangumiSyncSummary>;
+    syncBangumiSubject: (payload: import("./generated/backend").RefreshSubjectRequest) => Promise<import("./backend").BangumiSyncSummary>;
+    updateBangumiCollection: (payload: import("./generated/backend").BangumiUpdateCollectionInput) => Promise<import("./backend").BangumiSyncSummary>;
+    updateBangumiEpisode: (payload: import("./generated/backend").BangumiUpdateEpisodeInput) => Promise<import("./backend").BangumiSyncSummary>;
+    batchUpdateBangumiEpisodes: (payload: import("./generated/backend").BangumiBatchUpdateEpisodesInput) => Promise<import("./backend").BangumiSyncSummary>;
+    reportPlaybackProgress: (payload: import("./generated/backend").PlaybackProgressRequest) => Promise<import("./backend").BangumiSyncSummary>;
     testQbittorrentConnection: () => Promise<import("./backend").ConnectionTest>;
     openMedia: (mediaId: number) => Promise<{ opened: boolean }>;
     getMediaSource: (mediaId: number) => Promise<import("./backend").MediaSource>;

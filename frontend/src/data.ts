@@ -17,6 +17,10 @@ export type PlaybackEpisode = {
   titleCn: string;
   airDate: string;
   cached: boolean;
+  bgmEpisodeId?: number;
+  bgmCollectionType?: number;
+  bgmCollectionLabel: string;
+  bgmPending: boolean;
   mediaId?: number;
   fileName?: string;
   fileSize?: string;
@@ -64,6 +68,10 @@ export function makePlaybackEpisodes(subject: Subject): PlaybackEpisode[] {
       titleCn: episode.titleCn,
       airDate: episode.airDate,
       cached: episode.cached,
+      bgmEpisodeId: episode.bgmEpisodeId,
+      bgmCollectionType: episode.bgmCollectionType,
+      bgmCollectionLabel: episode.bgmCollectionLabel,
+      bgmPending: episode.bgmPending,
       mediaId: episode.mediaId,
       fileName: episode.fileName,
       fileSize: episode.fileSize,
@@ -78,6 +86,8 @@ export function makePlaybackEpisodes(subject: Subject): PlaybackEpisode[] {
       titleCn: "",
       airDate: "",
       cached: true,
+      bgmCollectionLabel: "未标记",
+      bgmPending: false,
       mediaId: file.mediaId,
       fileName: file.fileName,
       fileSize: file.fileSize,
@@ -91,5 +101,7 @@ export function makePlaybackEpisodes(subject: Subject): PlaybackEpisode[] {
     titleCn: "",
     airDate: "",
     cached: false,
+    bgmCollectionLabel: "未标记",
+    bgmPending: false,
   }));
 }

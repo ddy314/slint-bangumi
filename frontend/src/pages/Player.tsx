@@ -24,7 +24,7 @@ import { appleSpringSoft } from "../motion";
 import { MpvWebglSurface } from "../MpvWebglSurface";
 import { resolveAssetUrl } from "../utils/assets";
 import { cn } from "../utils/cn";
-import type { MediaSource, MpvFrame, MpvRenderInfo, MpvState, MpvTrack } from "../backend";
+import { reportPlaybackProgress, type MediaSource, type MpvFrame, type MpvRenderInfo, type MpvState, type MpvTrack } from "../backend";
 
 const SEEK_COMMIT_DELAY_MS = 80;
 const SEEK_POSITION_SETTLE_MS = 3500;
@@ -66,6 +66,8 @@ export function PlayerPage({
   const danmakuSeekResetVersionRef = useRef(0);
   const seekCommitTimerRef = useRef<number | null>(null);
   const seekingRef = useRef(false);
+  const completedSyncKeyRef = useRef<string | null>(null);
+  const localProgressReportRef = useRef<{ key: string; position: number; reportedAt: number } | null>(null);
   const [currentKey, setCurrentKey] = useState(initialEpisode.key);
   const [source, setSource] = useState<MediaSource | null>(null);
   const [mpvState, setMpvState] = useState<MpvState | null>(null);
@@ -82,6 +84,7 @@ export function PlayerPage({
   const [scrubPosition, setScrubPosition] = useState<number | null>(null);
   const [danmakuSeekSuspended, setDanmakuSeekSuspended] = useState(false);
   const [danmakuSeekReset, setDanmakuSeekReset] = useState<{ version: number; position: number } | null>(null);
+  const [renderFrameGeneration, setRenderFrameGeneration] = useState(0);
   const heroAsset = subject.hero || subject.poster;
   const heroSrc = resolveAssetUrl(heroAsset);
   const playableEpisodes = useMemo(() => episodes.filter((episode) => episode.cached && episode.mediaId), [episodes]);
@@ -132,6 +135,7 @@ export function PlayerPage({
   const displayedPosition = scrubPosition ?? position;
   const volume = Math.round(mpvState?.volume ?? 100);
   const playbackControlsDisabled = loadingSource || Boolean(playbackError);
+  const bgmSubjectId = subject.provider === "bangumi" ? Number(subject.providerSubjectId) : NaN;
 
   const clearDanmakuSeekResetTimer = useCallback(() => {
     if (danmakuSeekResetTimerRef.current !== null) {
@@ -167,6 +171,68 @@ export function PlayerPage({
   useEffect(() => {
     setCurrentKey(initialEpisode.key);
   }, [initialEpisode.key, subject.id]);
+
+  useEffect(() => {
+    const episodeId = currentEpisode.bgmEpisodeId;
+    if (!Number.isFinite(bgmSubjectId) || !episodeId || !Number.isFinite(duration) || !Number.isFinite(position) || duration <= 0) {
+      return;
+    }
+    const threshold = Math.max(duration * 0.9, duration - 90);
+    if (position < threshold) {
+      return;
+    }
+    const syncKey = `${bgmSubjectId}:${episodeId}`;
+    if (completedSyncKeyRef.current === syncKey) {
+      return;
+    }
+    completedSyncKeyRef.current = syncKey;
+    reportPlaybackProgress({
+      subjectId: bgmSubjectId,
+      episodeId,
+      mediaId: currentEpisode.mediaId,
+      position,
+      duration,
+    })
+      .then((result) => {
+        if (result.episodes > 0 || result.queued > 0) {
+          onSnack(result.message, result.queued > 0 ? "neutral" : "success");
+        }
+      })
+      .catch((caught) => {
+        completedSyncKeyRef.current = null;
+        const message = caught instanceof Error ? caught.message : String(caught);
+        onSnack(`Bangumi 完播同步失败：${message}`, "danger");
+      });
+  }, [bgmSubjectId, currentEpisode.bgmEpisodeId, currentEpisode.mediaId, duration, onSnack, position]);
+
+  useEffect(() => {
+    if (!currentEpisode.mediaId || !Number.isFinite(duration) || !Number.isFinite(position) || duration <= 0 || position <= 0) {
+      return;
+    }
+    const threshold = Math.max(duration * 0.9, duration - 90);
+    if (position >= threshold) {
+      return;
+    }
+    const now = Date.now();
+    const last = localProgressReportRef.current;
+    if (
+      last?.key === currentEpisode.key
+      && now - last.reportedAt < 10_000
+      && Math.abs(position - last.position) < 5
+    ) {
+      return;
+    }
+    localProgressReportRef.current = { key: currentEpisode.key, position, reportedAt: now };
+    reportPlaybackProgress({
+      subjectId: Number.isFinite(bgmSubjectId) ? bgmSubjectId : 0,
+      episodeId: currentEpisode.bgmEpisodeId ?? 0,
+      mediaId: currentEpisode.mediaId,
+      position,
+      duration,
+    }).catch(() => {
+      localProgressReportRef.current = last;
+    });
+  }, [bgmSubjectId, currentEpisode.bgmEpisodeId, currentEpisode.key, currentEpisode.mediaId, duration, position]);
 
   useEffect(() => {
     let cancelled = false;
@@ -211,6 +277,7 @@ export function PlayerPage({
 
       setLoadingSource(true);
       setPlaybackError(null);
+      setRenderFrameGeneration((generation) => generation + 1);
       seekStabilizationRef.current = null;
       pendingSeekPositionRef.current = null;
       latestSeekPositionRef.current = null;
@@ -505,6 +572,7 @@ export function PlayerPage({
     }
 
     latestSeekPositionRef.current = nextPosition;
+    setRenderFrameGeneration((generation) => generation + 1);
     const startedAt = performance.now();
     seekStabilizationRef.current = {
       target: nextPosition,
@@ -570,7 +638,10 @@ export function PlayerPage({
     }
 
     lastFrameClockPublishAtRef.current = now;
-    setMpvState((current) => current ? { ...current, position: framePosition } : current);
+    setMpvState((current) => current ? {
+      ...current,
+      position: resolveStableMpvPosition(current, framePosition),
+    } : current);
   }, []);
 
   const handleDanmakuError = useCallback((message: string) => {
@@ -699,6 +770,7 @@ export function PlayerPage({
                     videoWidth={mpvState?.videoWidth}
                     videoHeight={mpvState?.videoHeight}
                     fps={mpvState?.fps}
+                    generation={renderFrameGeneration}
                     onError={handleRenderSurfaceError}
                     onFrame={handleMpvFrame}
                   />
@@ -712,17 +784,19 @@ export function PlayerPage({
                 ) : null}
                 {!browserVideoReady && !webglTextureReady && <div className="absolute inset-0 bg-black/62" />}
 
-                <DanmakuOverlay
-                  mediaId={currentEpisode.mediaId}
-                  visible={danmakuVisible && !loadingSource && !playbackError && !danmakuSeekSuspended}
-                  paused={paused}
-                  seeking={seeking}
-                  seekReset={danmakuSeekReset}
-                  position={position}
-                  duration={duration}
-                  area={danmakuArea}
-                  onError={handleDanmakuError}
-                />
+                {danmakuVisible && (
+                  <DanmakuOverlay
+                    mediaId={currentEpisode.mediaId}
+                    visible={!loadingSource && !playbackError}
+                    paused={paused}
+                    seeking={seeking || danmakuSeekSuspended}
+                    seekReset={danmakuSeekReset}
+                    position={position}
+                    duration={duration}
+                    area={danmakuArea}
+                    onError={handleDanmakuError}
+                  />
+                )}
 
                 {!browserVideoReady && !webglTextureReady && <div className="absolute inset-0 flex items-center justify-center px-6 text-center text-white">
                   {loadingSource ? (

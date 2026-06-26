@@ -251,6 +251,84 @@ CREATE INDEX IF NOT EXISTS idx_download_tasks_subject
     ON download_tasks(subject_provider, provider_subject_id, episode_number);
 "#;
 
+const BANGUMI_ACCOUNT_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS bangumi_accounts (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    username TEXT NOT NULL,
+    nickname TEXT,
+    avatar_url TEXT,
+    access_token TEXT NOT NULL,
+    refresh_token TEXT,
+    token_type TEXT,
+    scope TEXT,
+    expires_at INTEGER,
+    updated_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS bangumi_subject_collections (
+    subject_id INTEGER PRIMARY KEY,
+    subject_type INTEGER NOT NULL DEFAULT 2,
+    collection_type INTEGER NOT NULL,
+    rate INTEGER NOT NULL DEFAULT 0,
+    comment TEXT,
+    tags_json TEXT NOT NULL DEFAULT '[]',
+    ep_status INTEGER NOT NULL DEFAULT 0,
+    vol_status INTEGER NOT NULL DEFAULT 0,
+    private INTEGER NOT NULL DEFAULT 0,
+    subject_json TEXT,
+    updated_at INTEGER NOT NULL DEFAULT 0,
+    synced_at INTEGER NOT NULL,
+    pending INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_bangumi_subject_collections_type
+    ON bangumi_subject_collections(collection_type, rate);
+
+CREATE TABLE IF NOT EXISTS bangumi_episode_collections (
+    episode_id INTEGER PRIMARY KEY,
+    subject_id INTEGER NOT NULL,
+    sort_number REAL,
+    ep_number REAL,
+    title TEXT,
+    title_cn TEXT,
+    air_date TEXT,
+    collection_type INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL DEFAULT 0,
+    synced_at INTEGER NOT NULL,
+    pending INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_bangumi_episode_collections_subject
+    ON bangumi_episode_collections(subject_id, sort_number, episode_id);
+
+CREATE TABLE IF NOT EXISTS bangumi_sync_queue (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    action TEXT NOT NULL,
+    subject_id INTEGER,
+    episode_id INTEGER,
+    payload_json TEXT NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_bangumi_sync_queue_pending
+    ON bangumi_sync_queue(updated_at, id);
+
+CREATE TABLE IF NOT EXISTS bangumi_sync_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    level TEXT NOT NULL,
+    message TEXT NOT NULL,
+    subject_id INTEGER,
+    episode_id INTEGER,
+    created_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_bangumi_sync_logs_created
+    ON bangumi_sync_logs(created_at DESC);
+"#;
+
 pub fn init_database(conn: &mut Connection) -> AppResult<()> {
     conn.execute_batch("PRAGMA foreign_keys = ON;")?;
     let migrations = Migrations::new(vec![
@@ -266,6 +344,7 @@ pub fn init_database(conn: &mut Connection) -> AppResult<()> {
         .comment("baseline NexPlay media library schema"),
         M::up(DANMAKU_COMMENT_CACHE_SCHEMA).comment("cache normalized dandanplay comments"),
         M::up(ONLINE_CATALOG_SCHEMA).comment("cache online catalog resources and downloads"),
+        M::up(BANGUMI_ACCOUNT_SCHEMA).comment("store Bangumi account collections and sync queue"),
     ]);
     migrations.to_latest(conn)?;
     Ok(())
@@ -304,12 +383,16 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("read version");
-        assert_eq!(version, 3);
+        assert_eq!(version, 4);
         assert!(column_exists(&conn, "media_items", "match_ignored"));
         assert!(table_exists(&conn, "danmaku_comment_cache"));
         assert!(table_exists(&conn, "online_subjects"));
         assert!(table_exists(&conn, "resource_candidates"));
         assert!(table_exists(&conn, "download_tasks"));
+        assert!(table_exists(&conn, "bangumi_accounts"));
+        assert!(table_exists(&conn, "bangumi_subject_collections"));
+        assert!(table_exists(&conn, "bangumi_episode_collections"));
+        assert!(table_exists(&conn, "bangumi_sync_queue"));
     }
 
     #[test]
@@ -337,12 +420,47 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("read version");
-        assert_eq!(version, 3);
+        assert_eq!(version, 4);
         assert!(column_exists(&conn, "media_items", "match_ignored"));
         assert!(table_exists(&conn, "danmaku_comment_cache"));
         assert!(table_exists(&conn, "online_subjects"));
         assert!(table_exists(&conn, "resource_candidates"));
         assert!(table_exists(&conn, "download_tasks"));
+        assert!(table_exists(&conn, "bangumi_accounts"));
+        assert!(table_exists(&conn, "bangumi_subject_collections"));
+        assert!(table_exists(&conn, "bangumi_episode_collections"));
+    }
+
+    #[test]
+    fn upgrades_without_losing_watch_progress() {
+        let mut conn = Connection::open_in_memory().expect("open db");
+        Migrations::new(vec![M::up(BASELINE_SCHEMA)])
+            .to_latest(&mut conn)
+            .expect("baseline");
+        conn.execute(
+            "INSERT INTO media_items (path, file_name, file_size, modified_at, created_at, updated_at)
+             VALUES ('/tmp/a.mkv', 'a.mkv', 1, 1, 1, 1)",
+            [],
+        )
+        .expect("media");
+        conn.execute(
+            "INSERT INTO watch_progress (media_id, position_ms, duration_ms, updated_at)
+             VALUES (1, 1234, 5678, 9)",
+            [],
+        )
+        .expect("progress");
+
+        init_database(&mut conn).expect("migrate");
+
+        let progress: (i64, i64, i64) = conn
+            .query_row(
+                "SELECT media_id, position_ms, duration_ms FROM watch_progress WHERE media_id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read progress");
+        assert_eq!(progress, (1, 1234, 5678));
+        assert!(table_exists(&conn, "bangumi_subject_collections"));
     }
 
     fn column_exists(conn: &Connection, table: &str, column: &str) -> bool {

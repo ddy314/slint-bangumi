@@ -32,6 +32,64 @@ pub struct WatchProgress {
     pub updated_at: i64,
 }
 
+#[derive(Debug, Clone)]
+pub struct BangumiAccount {
+    pub username: String,
+    pub nickname: Option<String>,
+    pub avatar_url: Option<String>,
+    pub access_token: String,
+    pub refresh_token: Option<String>,
+    pub token_type: Option<String>,
+    pub scope: Option<String>,
+    pub expires_at: Option<i64>,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct BangumiSubjectCollection {
+    pub subject_id: i64,
+    pub subject_type: i64,
+    pub collection_type: i64,
+    pub rate: i64,
+    pub comment: Option<String>,
+    pub tags: Vec<String>,
+    pub ep_status: i64,
+    pub vol_status: i64,
+    pub private: bool,
+    pub subject_json: Option<String>,
+    pub updated_at: i64,
+    pub synced_at: i64,
+    pub pending: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct BangumiEpisodeCollection {
+    pub episode_id: i64,
+    pub subject_id: i64,
+    pub sort_number: Option<f64>,
+    pub ep_number: Option<f64>,
+    pub title: Option<String>,
+    pub title_cn: Option<String>,
+    pub air_date: Option<String>,
+    pub collection_type: i64,
+    pub updated_at: i64,
+    pub synced_at: i64,
+    pub pending: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct BangumiSyncQueueItem {
+    pub id: i64,
+    pub action: String,
+    pub subject_id: Option<i64>,
+    pub episode_id: Option<i64>,
+    pub payload_json: String,
+    pub attempts: i64,
+    pub last_error: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScanUpsertStatus {
     Added,
@@ -218,6 +276,8 @@ pub struct UiSeriesEpisodeData {
     pub media_id: Option<i64>,
     pub file_name: Option<String>,
     pub file_size: Option<u64>,
+    pub progress: f64,
+    pub watched: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]

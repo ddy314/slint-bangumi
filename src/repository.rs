@@ -1,8 +1,10 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::domain::{
+    BangumiAccount, BangumiEpisodeCollection, BangumiSubjectCollection, BangumiSyncQueueItem,
     DanmakuCommentCache, DanmakuMatch, DownloadTask, MediaFile, MediaItem, MetadataCandidate,
     ResourceCandidate, ScanUpsertStatus, Subject, SubjectEpisode, SubjectImageCache,
     UiCandidateData, UiMediaCardData, UiSeriesCardData, UiSeriesEpisodeData, UiSeriesFileData,
@@ -117,18 +119,34 @@ impl Repository {
             })
         })?;
         let mut cards = rows.collect::<Result<Vec<_>, _>>()?;
+        let mut files_by_subject = HashMap::<i64, Vec<UiSeriesFileData>>::new();
+        for (subject_id, file) in self.list_all_series_files()? {
+            files_by_subject.entry(subject_id).or_default().push(file);
+        }
+        let mut episodes_by_subject = HashMap::<i64, Vec<UiSeriesEpisodeData>>::new();
+        for (subject_id, episode) in self.list_all_series_episodes()? {
+            episodes_by_subject
+                .entry(subject_id)
+                .or_default()
+                .push(episode);
+        }
         for card in &mut cards {
-            card.local_files = self.list_series_files(card.subject_id)?;
-            card.episodes = self.list_series_episodes(card.subject_id)?;
+            card.local_files = files_by_subject
+                .remove(&card.subject_id)
+                .unwrap_or_default();
+            card.episodes = episodes_by_subject
+                .remove(&card.subject_id)
+                .unwrap_or_default();
         }
         Ok(cards)
     }
 
-    fn list_series_files(&self, subject_id: i64) -> AppResult<Vec<UiSeriesFileData>> {
+    fn list_all_series_files(&self) -> AppResult<Vec<(i64, UiSeriesFileData)>> {
         let conn = self.connect()?;
         let mut stmt = conn.prepare(
             r#"
             SELECT
+                l.subject_id,
                 m.id,
                 m.file_name,
                 m.file_size,
@@ -137,54 +155,69 @@ impl Repository {
             FROM media_items m
             JOIN media_subject_links l ON l.media_id = m.id
             LEFT JOIN media_episode_links mel ON mel.media_id = m.id
-            WHERE l.subject_id = ?1 AND m.deleted_at IS NULL
+            WHERE m.deleted_at IS NULL
             ORDER BY
+                l.subject_id,
                 mel.episode_number IS NULL,
                 mel.episode_number,
                 m.file_name COLLATE NOCASE
             "#,
         )?;
-        let rows = stmt.query_map(params![subject_id], |row| {
-            Ok(UiSeriesFileData {
-                media_id: row.get(0)?,
-                file_name: row.get(1)?,
-                file_size: row.get::<_, i64>(2)? as u64,
-                episode_number: row.get(3)?,
-                modified_at: row.get(4)?,
-            })
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                UiSeriesFileData {
+                    media_id: row.get(1)?,
+                    file_name: row.get(2)?,
+                    file_size: row.get::<_, i64>(3)? as u64,
+                    episode_number: row.get(4)?,
+                    modified_at: row.get(5)?,
+                },
+            ))
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
-    fn list_series_episodes(&self, subject_id: i64) -> AppResult<Vec<UiSeriesEpisodeData>> {
+    fn list_all_series_episodes(&self) -> AppResult<Vec<(i64, UiSeriesEpisodeData)>> {
         let conn = self.connect()?;
         let mut stmt = conn.prepare(
             r#"
             SELECT
+                e.subject_id,
                 e.sort_number,
                 COALESCE(e.title, ''),
                 COALESCE(e.title_cn, ''),
                 COALESCE(e.air_date, ''),
                 m.id,
                 m.file_name,
-                m.file_size
+                m.file_size,
+                COALESCE(
+                    CAST(wp.position_ms AS REAL) / NULLIF(CAST(wp.duration_ms AS REAL), 0),
+                    0
+                )
             FROM episodes e
             LEFT JOIN media_episode_links mel ON mel.episode_id = e.id
             LEFT JOIN media_items m ON m.id = mel.media_id AND m.deleted_at IS NULL
-            WHERE e.subject_id = ?1
-            ORDER BY e.sort_number, m.file_name COLLATE NOCASE
+            LEFT JOIN watch_progress wp ON wp.media_id = m.id
+            ORDER BY e.subject_id, e.sort_number, m.file_name COLLATE NOCASE
             "#,
         )?;
-        let rows = stmt.query_map(params![subject_id], |row| {
-            Ok(UiSeriesEpisodeData {
-                episode_number: row.get(0)?,
-                title: row.get(1)?,
-                title_cn: row.get(2)?,
-                air_date: row.get(3)?,
-                media_id: row.get(4)?,
-                file_name: row.get(5)?,
-                file_size: row.get::<_, Option<i64>>(6)?.map(|size| size as u64),
-            })
+        let rows = stmt.query_map([], |row| {
+            let progress = row.get::<_, f64>(8)?.clamp(0.0, 1.0);
+            Ok((
+                row.get(0)?,
+                UiSeriesEpisodeData {
+                    episode_number: row.get(1)?,
+                    title: row.get(2)?,
+                    title_cn: row.get(3)?,
+                    air_date: row.get(4)?,
+                    media_id: row.get(5)?,
+                    file_name: row.get(6)?,
+                    file_size: row.get::<_, Option<i64>>(7)?.map(|size| size as u64),
+                    progress,
+                    watched: progress >= 0.9,
+                },
+            ))
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
@@ -1628,6 +1661,337 @@ impl Repository {
         Ok(())
     }
 
+    pub fn bangumi_account(&self) -> AppResult<Option<BangumiAccount>> {
+        let conn = self.connect()?;
+        conn.query_row(
+            r#"
+            SELECT username, nickname, avatar_url, access_token, refresh_token, token_type,
+                   scope, expires_at, updated_at
+            FROM bangumi_accounts
+            WHERE id = 1
+            "#,
+            [],
+            map_bangumi_account,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn upsert_bangumi_account(&self, account: &BangumiAccount) -> AppResult<()> {
+        let conn = self.connect()?;
+        conn.execute(
+            r#"
+            INSERT INTO bangumi_accounts (
+                id, username, nickname, avatar_url, access_token, refresh_token,
+                token_type, scope, expires_at, updated_at
+            )
+            VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            ON CONFLICT(id) DO UPDATE SET
+                username = excluded.username,
+                nickname = excluded.nickname,
+                avatar_url = excluded.avatar_url,
+                access_token = excluded.access_token,
+                refresh_token = excluded.refresh_token,
+                token_type = excluded.token_type,
+                scope = excluded.scope,
+                expires_at = excluded.expires_at,
+                updated_at = excluded.updated_at
+            "#,
+            params![
+                account.username,
+                account.nickname,
+                account.avatar_url,
+                account.access_token,
+                account.refresh_token,
+                account.token_type,
+                account.scope,
+                account.expires_at,
+                account.updated_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn clear_bangumi_account(&self) -> AppResult<()> {
+        let conn = self.connect()?;
+        conn.execute_batch(
+            r#"
+            DELETE FROM bangumi_accounts;
+            DELETE FROM bangumi_subject_collections;
+            DELETE FROM bangumi_episode_collections;
+            DELETE FROM bangumi_sync_queue;
+            "#,
+        )?;
+        Ok(())
+    }
+
+    pub fn list_bangumi_subject_collections(&self) -> AppResult<Vec<BangumiSubjectCollection>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT subject_id, subject_type, collection_type, rate, comment, tags_json,
+                   ep_status, vol_status, private, subject_json, updated_at, synced_at, pending
+            FROM bangumi_subject_collections
+            ORDER BY updated_at DESC, synced_at DESC, subject_id DESC
+            "#,
+        )?;
+        let rows = stmt.query_map([], map_bangumi_subject_collection)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn bangumi_subject_collection(
+        &self,
+        subject_id: i64,
+    ) -> AppResult<Option<BangumiSubjectCollection>> {
+        let conn = self.connect()?;
+        conn.query_row(
+            r#"
+            SELECT subject_id, subject_type, collection_type, rate, comment, tags_json,
+                   ep_status, vol_status, private, subject_json, updated_at, synced_at, pending
+            FROM bangumi_subject_collections
+            WHERE subject_id = ?1
+            "#,
+            params![subject_id],
+            map_bangumi_subject_collection,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn upsert_bangumi_subject_collection(
+        &self,
+        collection: &BangumiSubjectCollection,
+    ) -> AppResult<()> {
+        let conn = self.connect()?;
+        let tags_json = serde_json::to_string(&collection.tags)?;
+        conn.execute(
+            r#"
+            INSERT INTO bangumi_subject_collections (
+                subject_id, subject_type, collection_type, rate, comment, tags_json,
+                ep_status, vol_status, private, subject_json, updated_at, synced_at, pending
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+            ON CONFLICT(subject_id) DO UPDATE SET
+                subject_type = excluded.subject_type,
+                collection_type = excluded.collection_type,
+                rate = excluded.rate,
+                comment = excluded.comment,
+                tags_json = excluded.tags_json,
+                ep_status = excluded.ep_status,
+                vol_status = excluded.vol_status,
+                private = excluded.private,
+                subject_json = excluded.subject_json,
+                updated_at = excluded.updated_at,
+                synced_at = excluded.synced_at,
+                pending = excluded.pending
+            "#,
+            params![
+                collection.subject_id,
+                collection.subject_type,
+                collection.collection_type,
+                collection.rate,
+                collection.comment,
+                tags_json,
+                collection.ep_status,
+                collection.vol_status,
+                collection.private as i64,
+                collection.subject_json,
+                collection.updated_at,
+                collection.synced_at,
+                collection.pending as i64,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn mark_bangumi_subject_pending(
+        &self,
+        subject_id: i64,
+        pending: bool,
+        now: i64,
+    ) -> AppResult<()> {
+        let conn = self.connect()?;
+        conn.execute(
+            r#"
+            UPDATE bangumi_subject_collections
+            SET pending = ?2, synced_at = CASE WHEN ?2 = 0 THEN ?3 ELSE synced_at END
+            WHERE subject_id = ?1
+            "#,
+            params![subject_id, pending as i64, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_bangumi_episode_collections(
+        &self,
+        subject_id: i64,
+    ) -> AppResult<Vec<BangumiEpisodeCollection>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT episode_id, subject_id, sort_number, ep_number, title, title_cn, air_date,
+                   collection_type, updated_at, synced_at, pending
+            FROM bangumi_episode_collections
+            WHERE subject_id = ?1
+            ORDER BY sort_number IS NULL, sort_number, episode_id
+            "#,
+        )?;
+        let rows = stmt.query_map(params![subject_id], map_bangumi_episode_collection)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn list_all_bangumi_episode_collections(&self) -> AppResult<Vec<BangumiEpisodeCollection>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT episode_id, subject_id, sort_number, ep_number, title, title_cn, air_date,
+                   collection_type, updated_at, synced_at, pending
+            FROM bangumi_episode_collections
+            ORDER BY subject_id, sort_number IS NULL, sort_number, episode_id
+            "#,
+        )?;
+        let rows = stmt.query_map([], map_bangumi_episode_collection)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn bangumi_episode_collection(
+        &self,
+        episode_id: i64,
+    ) -> AppResult<Option<BangumiEpisodeCollection>> {
+        let conn = self.connect()?;
+        conn.query_row(
+            r#"
+            SELECT episode_id, subject_id, sort_number, ep_number, title, title_cn, air_date,
+                   collection_type, updated_at, synced_at, pending
+            FROM bangumi_episode_collections
+            WHERE episode_id = ?1
+            "#,
+            params![episode_id],
+            map_bangumi_episode_collection,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn replace_bangumi_episode_collections(
+        &self,
+        subject_id: i64,
+        episodes: &[BangumiEpisodeCollection],
+    ) -> AppResult<()> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        tx.execute(
+            "DELETE FROM bangumi_episode_collections WHERE subject_id = ?1 AND pending = 0",
+            params![subject_id],
+        )?;
+        for episode in episodes {
+            upsert_bangumi_episode_collection_tx(&tx, episode)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn upsert_bangumi_episode_collection(
+        &self,
+        episode: &BangumiEpisodeCollection,
+    ) -> AppResult<()> {
+        let conn = self.connect()?;
+        upsert_bangumi_episode_collection_tx(&conn, episode)?;
+        Ok(())
+    }
+
+    pub fn mark_bangumi_episode_pending(
+        &self,
+        episode_id: i64,
+        pending: bool,
+        now: i64,
+    ) -> AppResult<()> {
+        let conn = self.connect()?;
+        conn.execute(
+            r#"
+            UPDATE bangumi_episode_collections
+            SET pending = ?2, synced_at = CASE WHEN ?2 = 0 THEN ?3 ELSE synced_at END
+            WHERE episode_id = ?1
+            "#,
+            params![episode_id, pending as i64, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn queue_bangumi_sync(
+        &self,
+        action: &str,
+        subject_id: Option<i64>,
+        episode_id: Option<i64>,
+        payload_json: &str,
+        now: i64,
+    ) -> AppResult<()> {
+        let conn = self.connect()?;
+        conn.execute(
+            r#"
+            INSERT INTO bangumi_sync_queue (
+                action, subject_id, episode_id, payload_json, attempts, created_at, updated_at
+            )
+            VALUES (?1, ?2, ?3, ?4, 0, ?5, ?5)
+            "#,
+            params![action, subject_id, episode_id, payload_json, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_bangumi_sync_queue(&self, limit: usize) -> AppResult<Vec<BangumiSyncQueueItem>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, action, subject_id, episode_id, payload_json, attempts,
+                   last_error, created_at, updated_at
+            FROM bangumi_sync_queue
+            ORDER BY updated_at, id
+            LIMIT ?1
+            "#,
+        )?;
+        let rows = stmt.query_map(params![limit as i64], map_bangumi_sync_queue_item)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn delete_bangumi_sync_queue_item(&self, id: i64) -> AppResult<()> {
+        let conn = self.connect()?;
+        conn.execute("DELETE FROM bangumi_sync_queue WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    pub fn mark_bangumi_sync_queue_error(&self, id: i64, error: &str, now: i64) -> AppResult<()> {
+        let conn = self.connect()?;
+        conn.execute(
+            r#"
+            UPDATE bangumi_sync_queue
+            SET attempts = attempts + 1, last_error = ?2, updated_at = ?3
+            WHERE id = ?1
+            "#,
+            params![id, error, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn insert_bangumi_sync_log(
+        &self,
+        level: &str,
+        message: &str,
+        subject_id: Option<i64>,
+        episode_id: Option<i64>,
+        now: i64,
+    ) -> AppResult<()> {
+        let conn = self.connect()?;
+        conn.execute(
+            r#"
+            INSERT INTO bangumi_sync_logs (level, message, subject_id, episode_id, created_at)
+            VALUES (?1, ?2, ?3, ?4, ?5)
+            "#,
+            params![level, message, subject_id, episode_id, now],
+        )?;
+        Ok(())
+    }
+
     fn connect(&self) -> AppResult<Connection> {
         if let Some(parent) = self
             .db_path
@@ -1736,6 +2100,114 @@ fn map_candidate(row: &rusqlite::Row<'_>) -> rusqlite::Result<MetadataCandidate>
         source: row.get(13)?,
         selected: row.get::<_, i64>(14)? != 0,
     })
+}
+
+fn map_bangumi_account(row: &rusqlite::Row<'_>) -> rusqlite::Result<BangumiAccount> {
+    Ok(BangumiAccount {
+        username: row.get(0)?,
+        nickname: row.get(1)?,
+        avatar_url: row.get(2)?,
+        access_token: row.get(3)?,
+        refresh_token: row.get(4)?,
+        token_type: row.get(5)?,
+        scope: row.get(6)?,
+        expires_at: row.get(7)?,
+        updated_at: row.get(8)?,
+    })
+}
+
+fn map_bangumi_subject_collection(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<BangumiSubjectCollection> {
+    let tags_json: String = row.get(5)?;
+    let tags = serde_json::from_str::<Vec<String>>(&tags_json).unwrap_or_default();
+    Ok(BangumiSubjectCollection {
+        subject_id: row.get(0)?,
+        subject_type: row.get(1)?,
+        collection_type: row.get(2)?,
+        rate: row.get(3)?,
+        comment: row.get(4)?,
+        tags,
+        ep_status: row.get(6)?,
+        vol_status: row.get(7)?,
+        private: row.get::<_, i64>(8)? != 0,
+        subject_json: row.get(9)?,
+        updated_at: row.get(10)?,
+        synced_at: row.get(11)?,
+        pending: row.get::<_, i64>(12)? != 0,
+    })
+}
+
+fn map_bangumi_episode_collection(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<BangumiEpisodeCollection> {
+    Ok(BangumiEpisodeCollection {
+        episode_id: row.get(0)?,
+        subject_id: row.get(1)?,
+        sort_number: row.get(2)?,
+        ep_number: row.get(3)?,
+        title: row.get(4)?,
+        title_cn: row.get(5)?,
+        air_date: row.get(6)?,
+        collection_type: row.get(7)?,
+        updated_at: row.get(8)?,
+        synced_at: row.get(9)?,
+        pending: row.get::<_, i64>(10)? != 0,
+    })
+}
+
+fn map_bangumi_sync_queue_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<BangumiSyncQueueItem> {
+    Ok(BangumiSyncQueueItem {
+        id: row.get(0)?,
+        action: row.get(1)?,
+        subject_id: row.get(2)?,
+        episode_id: row.get(3)?,
+        payload_json: row.get(4)?,
+        attempts: row.get(5)?,
+        last_error: row.get(6)?,
+        created_at: row.get(7)?,
+        updated_at: row.get(8)?,
+    })
+}
+
+fn upsert_bangumi_episode_collection_tx(
+    conn: &Connection,
+    episode: &BangumiEpisodeCollection,
+) -> AppResult<()> {
+    conn.execute(
+        r#"
+        INSERT INTO bangumi_episode_collections (
+            episode_id, subject_id, sort_number, ep_number, title, title_cn, air_date,
+            collection_type, updated_at, synced_at, pending
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+        ON CONFLICT(episode_id) DO UPDATE SET
+            subject_id = excluded.subject_id,
+            sort_number = excluded.sort_number,
+            ep_number = excluded.ep_number,
+            title = excluded.title,
+            title_cn = excluded.title_cn,
+            air_date = excluded.air_date,
+            collection_type = excluded.collection_type,
+            updated_at = excluded.updated_at,
+            synced_at = excluded.synced_at,
+            pending = excluded.pending
+        "#,
+        params![
+            episode.episode_id,
+            episode.subject_id,
+            episode.sort_number,
+            episode.ep_number,
+            episode.title,
+            episode.title_cn,
+            episode.air_date,
+            episode.collection_type,
+            episode.updated_at,
+            episode.synced_at,
+            episode.pending as i64,
+        ],
+    )?;
+    Ok(())
 }
 
 #[cfg(test)]

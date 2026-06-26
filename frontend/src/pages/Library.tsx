@@ -1,6 +1,6 @@
-import { memo, useDeferredValue, useEffect, useMemo, useState } from "react";
+import { memo, useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
-import { Calendar, LayoutGrid, List, RefreshCw, Search, Sparkles, Star } from "lucide-react";
+import { Calendar, Cloud, HardDrive, LayoutGrid, List, RefreshCw, Search, Sparkles, Star } from "lucide-react";
 import { loadOnlineSubject, searchCatalog, type BackendLogEntry, type ScanStatus } from "../backend";
 import type { Subject } from "../data";
 import type { Route } from "../NavRail";
@@ -15,6 +15,7 @@ type CatalogRoute = Extract<Route, "search" | "home" | "library">;
 type SearchSort = "year" | "rating" | "title";
 type LibrarySort = "default" | "title" | "year" | "rating";
 type LibraryLayout = "grid" | "list";
+type LibrarySource = "local" | "cloud";
 type SearchResult = {
   subject: Subject;
 };
@@ -29,13 +30,14 @@ const pageCopy: Record<CatalogRoute, { title: string; subtitle?: string }> = {
   },
   library: {
     title: "媒体库",
-    subtitle: "你的本地番剧收藏",
+    subtitle: "本地文件和 Bangumi 云端条目",
   },
 };
 
 export function LibraryPage({
   route,
   subjects,
+  cloudSubjects = [],
   searchQuery,
   onSearchQueryChange,
   scanStatus,
@@ -48,6 +50,7 @@ export function LibraryPage({
 }: {
   route: CatalogRoute;
   subjects: Subject[];
+  cloudSubjects?: Subject[];
   searchQuery: string;
   onSearchQueryChange: (query: string) => void;
   scanStatus: ScanStatus;
@@ -65,25 +68,29 @@ export function LibraryPage({
   const [searchSort, setSearchSort] = useState<SearchSort>("year");
   const [librarySort, setLibrarySort] = useState<LibrarySort>("default");
   const [libraryLayout, setLibraryLayout] = useState<LibraryLayout>("grid");
+  const [librarySource, setLibrarySource] = useState<LibrarySource>("local");
+  const searchRequestIdRef = useRef(0);
   const deferredQuery = useDeferredValue(searchQuery);
+  const librarySubjects = route === "library" && librarySource === "cloud" ? cloudSubjects : subjects;
 
   const watching = useMemo(
     () => subjects.filter((subject) => subject.progress > 0 && subject.progress < 1),
     [subjects]
   );
   const recent = useMemo(() => {
-    const sorted = librarySort !== "default" ? [...subjects].sort(librarySorter(librarySort)) : subjects;
+    const sorted = librarySort !== "default" ? [...librarySubjects].sort(librarySorter(librarySort)) : librarySubjects;
     return sorted.slice(0, 18);
-  }, [subjects, librarySort]);
+  }, [librarySubjects, librarySort]);
   const heroSubject = watching[heroIndex % Math.max(1, watching.length)] ?? subjects[0];
 
   const sortedSubjects = useMemo(() => {
-    if (librarySort === "default") return subjects;
-    return [...subjects].sort(librarySorter(librarySort));
-  }, [subjects, librarySort]);
+    if (librarySort === "default") return librarySubjects;
+    return [...librarySubjects].sort(librarySorter(librarySort));
+  }, [librarySubjects, librarySort]);
 
   useEffect(() => {
     if (route !== "search") {
+      searchRequestIdRef.current += 1;
       setOnlineResults([]);
       setOnlineError(null);
       setOnlineLoading(false);
@@ -92,6 +99,7 @@ export function LibraryPage({
 
     const q = deferredQuery.trim();
     if (!q) {
+      searchRequestIdRef.current += 1;
       setOnlineResults([]);
       setOnlineError(null);
       setOnlineLoading(false);
@@ -99,22 +107,24 @@ export function LibraryPage({
     }
 
     let cancelled = false;
+    const requestId = searchRequestIdRef.current + 1;
+    searchRequestIdRef.current = requestId;
     setOnlineLoading(true);
     const timer = window.setTimeout(() => {
       searchCatalog(q, 36)
         .then((response) => {
-          if (cancelled) return;
+          if (cancelled || searchRequestIdRef.current !== requestId) return;
           setOnlineResults(response.subjects);
           setOnlineError(null);
         })
         .catch((caught) => {
-          if (cancelled) return;
+          if (cancelled || searchRequestIdRef.current !== requestId) return;
           const message = caught instanceof Error ? caught.message : String(caught);
           setOnlineResults([]);
           setOnlineError(message);
         })
         .finally(() => {
-          if (!cancelled) setOnlineLoading(false);
+          if (!cancelled && searchRequestIdRef.current === requestId) setOnlineLoading(false);
         });
     }, 240);
 
@@ -131,9 +141,12 @@ export function LibraryPage({
       .sort(searchResultSorter(searchSort));
   }, [onlineResults, route, searchSort]);
 
-  const displayItems = route === "search"
-    ? mergedSearchResults
-    : (route === "library" ? sortedSubjects : subjects).map((subject) => ({ subject }));
+  const displayItems = useMemo(
+    () => route === "search"
+      ? mergedSearchResults
+      : (route === "library" ? sortedSubjects : subjects).map((subject) => ({ subject })),
+    [mergedSearchResults, route, sortedSubjects, subjects]
+  );
   const {
     hasMore,
     loadMore,
@@ -143,23 +156,29 @@ export function LibraryPage({
   } = useIncrementalItems(displayItems, {
     initialCount: route === "library" ? 72 : 36,
     step: 36,
-    resetKey: `${route}:${deferredQuery}:${displayItems.length}:${searchSort}`,
+    resetKey: `${route}:${librarySource}:${deferredQuery}:${displayItems.length}:${searchSort}:${librarySort}`,
   });
   const remainingCount = Math.max(0, displayItems.length - visibleCount);
   const copy = pageCopy[route];
-  const openSubject = async (subject: Subject) => {
+  const visibleSubjects = useMemo(() => visibleItems.map((item) => item.subject), [visibleItems]);
+  const openSubject = useCallback(async (subject: Subject) => {
     if (subject.local) {
       onOpen(subject);
       return;
     }
     try {
       const detail = await loadOnlineSubject(subject.provider, subject.providerSubjectId);
-      onOpen(detail);
+      onOpen(subject.source === "bangumiCollection" ? mergeCloudSubjectDetail(subject, detail) : detail);
     } catch (caught) {
       const message = caught instanceof Error ? caught.message : String(caught);
+      if (subject.source === "bangumiCollection") {
+        onOpen(subject);
+        onSnack(`读取完整简介失败，先打开云端缓存：${message}`, "neutral");
+        return;
+      }
       onSnack(`读取在线详情失败：${message}`, "danger");
     }
-  };
+  }, [onOpen, onSnack]);
 
   return (
     <div className="h-full overflow-y-auto overflow-x-hidden">
@@ -189,6 +208,36 @@ export function LibraryPage({
                 <div className="flex items-center gap-2">
                   {route === "library" && (
                     <>
+                      <div className="flex items-center rounded-[var(--radius-control)] bg-[var(--color-surface-elevated)] p-0.5">
+                        <button
+                          type="button"
+                          onClick={() => setLibrarySource("local")}
+                          className={cn(
+                            "flex h-8 items-center gap-1.5 rounded-[var(--radius-sm)] px-3 text-[12px] font-semibold transition-colors",
+                            librarySource === "local"
+                              ? "bg-[var(--color-primary)] text-white"
+                              : "text-[var(--color-text-secondary)] hover:text-[var(--color-text-primary)]"
+                          )}
+                          title="仅本地"
+                        >
+                          <HardDrive size={14} />
+                          本地
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setLibrarySource("cloud")}
+                          className={cn(
+                            "flex h-8 items-center gap-1.5 rounded-[var(--radius-sm)] px-3 text-[12px] font-semibold transition-colors",
+                            librarySource === "cloud"
+                              ? "bg-[var(--color-primary)] text-white"
+                              : "text-[var(--color-text-secondary)] hover:text-[var(--color-text-primary)]"
+                          )}
+                          title="云端条目"
+                        >
+                          <Cloud size={14} />
+                          云端
+                        </button>
+                      </div>
                       <div className="search-filter-row">
                         <label>
                           <select
@@ -262,10 +311,10 @@ export function LibraryPage({
               onLoadMore={loadMore}
               onOpen={(subject) => void openSubject(subject)}
             />
-          ) : !subjects.length ? (
+          ) : !librarySubjects.length ? (
             <EmptyState
-              title={loading ? "正在读取媒体库" : "这里还没有番剧"}
-              desc={error ?? "请先在设置页确认媒体目录，然后到媒体库执行扫描。"}
+              title={loading ? "正在读取媒体库" : (librarySource === "cloud" ? "这里还没有云端条目" : "这里还没有番剧")}
+              desc={error ?? (librarySource === "cloud" ? "登录并同步 Bangumi 后，可以在媒体库切到云端查看条目状态。" : "请先在设置页确认媒体目录，然后到媒体库执行扫描。")}
             />
           ) : route === "home" ? (
             <>
@@ -295,11 +344,11 @@ export function LibraryPage({
                     <ScanPanel status={scanStatus} logs={logs} />
                   </div>
                 )}
-                <Section title="最近更新">
+                <Section title={librarySource === "cloud" ? "云端条目" : "最近更新"}>
                   {libraryLayout === "list" ? (
-                    <SubjectList subjects={visibleItems.map((item) => item.subject)} onOpen={(subject) => void openSubject(subject)} />
+                    <SubjectList subjects={visibleSubjects} onOpen={(subject) => void openSubject(subject)} />
                   ) : (
-                    <CardGrid subjects={visibleItems.map((item) => item.subject)} onOpen={(subject) => void openSubject(subject)} />
+                    <CardGrid subjects={visibleSubjects} onOpen={(subject) => void openSubject(subject)} />
                   )}
                   {hasMore && (
                     <LoadMore
@@ -320,6 +369,43 @@ export function LibraryPage({
       </AnimatePresence>
     </div>
   );
+}
+
+function mergeCloudSubjectDetail(cached: Subject, detail: Subject): Subject {
+  return {
+    ...detail,
+    id: cached.id,
+    source: cached.source,
+    local: false,
+    title: detail.title || cached.title,
+    titleCn: detail.titleCn || cached.titleCn,
+    summary: detail.summary || cached.summary,
+    poster: detail.poster || cached.poster,
+    hero: detail.hero || cached.hero,
+    bgmCollectionType: cached.bgmCollectionType,
+    bgmCollectionLabel: cached.bgmCollectionLabel,
+    bgmRate: cached.bgmRate,
+    bgmPending: cached.bgmPending,
+    watchedEpisodes: cached.watchedEpisodes,
+    currentEpisode: cached.currentEpisode,
+    progress: cached.progress,
+    files: cached.files,
+    totalSize: cached.totalSize,
+    fileSummary: cached.fileSummary,
+    localFiles: cached.localFiles,
+    episodesDetail: detail.episodesDetail.length ? detail.episodesDetail.map((episode) => {
+      const cachedEpisode = cached.episodesDetail.find((item) => (
+        (episode.bgmEpisodeId && item.bgmEpisodeId === episode.bgmEpisodeId)
+        || item.episode === episode.episode
+      ));
+      return cachedEpisode ? {
+        ...episode,
+        bgmCollectionType: cachedEpisode.bgmCollectionType,
+        bgmCollectionLabel: cachedEpisode.bgmCollectionLabel,
+        bgmPending: cachedEpisode.bgmPending,
+      } : episode;
+    }) : cached.episodesDetail,
+  };
 }
 
 function SearchHeader({

@@ -3,16 +3,43 @@ const path = require("node:path");
 const { Readable } = require("node:stream");
 const { protocol } = require("electron");
 
-function registerAssetProtocol() {
+function registerAssetProtocol({ getAllowedRoots = () => [] } = {}) {
   protocol.handle("nexplay-asset", async (request) => {
     const url = new URL(request.url);
     if (url.hostname !== "local") {
       return new Response("unsupported asset host", { status: 400 });
     }
 
-    const filePath = decodeURIComponent(url.pathname.slice(1));
+    const filePath = path.resolve(decodeURIComponent(url.pathname.slice(1)));
+    if (!isAllowedAssetPath(filePath, getAllowedRoots())) {
+      return new Response("asset path is not allowed", { status: 403 });
+    }
     return streamLocalFile(filePath, request);
   });
+}
+
+function isAllowedAssetPath(filePath, roots) {
+  const resolvedFilePath = path.resolve(filePath);
+  return normalizeRoots(roots).some((root) => (
+    resolvedFilePath === root || resolvedFilePath.startsWith(`${root}${path.sep}`)
+  ));
+}
+
+function normalizeRoots(roots) {
+  const seen = new Set();
+  const normalized = [];
+  for (const root of roots) {
+    if (typeof root !== "string" || !root.trim()) {
+      continue;
+    }
+    const resolved = path.resolve(root);
+    if (seen.has(resolved)) {
+      continue;
+    }
+    seen.add(resolved);
+    normalized.push(resolved);
+  }
+  return normalized;
 }
 
 function streamLocalFile(filePath, request) {
@@ -47,8 +74,18 @@ function streamLocalFile(filePath, request) {
       });
     }
 
-    const start = match[1] ? Number(match[1]) : 0;
-    const end = match[2] ? Math.min(Number(match[2]), stat.size - 1) : stat.size - 1;
+    const parsed = parseByteRange(match, stat.size);
+    if (!parsed) {
+      return new Response("range not satisfiable", {
+        status: 416,
+        headers: {
+          ...baseHeaders,
+          "Content-Range": `bytes */${stat.size}`,
+        },
+      });
+    }
+
+    const { start, end } = parsed;
     if (!Number.isFinite(start) || !Number.isFinite(end) || start > end || start >= stat.size) {
       return new Response("range not satisfiable", {
         status: 416,
@@ -78,6 +115,27 @@ function streamLocalFile(filePath, request) {
       "Content-Length": String(stat.size),
     },
   });
+}
+
+function parseByteRange(match, size) {
+  const rawStart = match[1];
+  const rawEnd = match[2];
+  if (!rawStart && !rawEnd) {
+    return null;
+  }
+  if (!rawStart) {
+    const suffixLength = Number(rawEnd);
+    if (!Number.isFinite(suffixLength) || suffixLength <= 0 || size <= 0) {
+      return null;
+    }
+    return {
+      start: Math.max(size - suffixLength, 0),
+      end: size - 1,
+    };
+  }
+  const start = Number(rawStart);
+  const end = rawEnd ? Math.min(Number(rawEnd), size - 1) : size - 1;
+  return { start, end };
 }
 
 function contentTypeForPath(filePath) {

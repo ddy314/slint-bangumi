@@ -2,6 +2,9 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type {
   BackendEvent as GeneratedBackendEvent,
   BackendSnapshot as GeneratedBackendSnapshot,
+  BangumiAuthStatusData,
+  BangumiLoginStartData,
+  BangumiSyncSummaryData,
   FrontendEditableSettings,
   DanmakuTrackResponse as GeneratedDanmakuTrackResponse,
   CatalogSearchResponse,
@@ -26,6 +29,9 @@ export type EpisodeResources = EpisodeResourcesResponse;
 export type DownloadTask = DownloadTaskData;
 export type DownloadTasks = DownloadTasksResponse;
 export type ConnectionTest = ConnectionTestResponse;
+export type BangumiAuthStatus = BangumiAuthStatusData;
+export type BangumiLoginStart = BangumiLoginStartData;
+export type BangumiSyncSummary = BangumiSyncSummaryData;
 export type { OpenMediaResponse };
 
 export type MpvTrack = {
@@ -126,8 +132,29 @@ export type ScanStatus = {
   total: number;
 };
 
+export type BangumiSyncStatus = {
+  running: boolean;
+  message: string;
+  processed: number;
+  total: number;
+  lastSyncedAt?: number;
+  lastError?: string | null;
+};
+
 const fallbackSnapshot: BackendSnapshot = {
   subjects: [],
+  bangumiCollections: [],
+  bangumiAuth: {
+    configured: false,
+    authenticated: false,
+    username: null,
+    nickname: null,
+    avatarUrl: null,
+    clientConfigured: false,
+    redirectUri: "http://127.0.0.1:17654/bangumi/callback",
+    pendingSyncCount: 0,
+    lastError: null,
+  },
   stats: {
     total: 0,
     matched: 0,
@@ -178,6 +205,13 @@ export function useBackendSnapshot() {
     indexed: 0,
     processed: 0,
     total: 0,
+  });
+  const [bangumiSyncStatus, setBangumiSyncStatus] = useState<BangumiSyncStatus>({
+    running: false,
+    message: "",
+    processed: 0,
+    total: 0,
+    lastError: null,
   });
   const pendingLogsRef = useRef<BackendLogEntry[]>([]);
   const logFlushTimerRef = useRef<number | null>(null);
@@ -377,6 +411,55 @@ export function useBackendSnapshot() {
           }));
           autoScanGuardRef.current = false;
           break;
+        case "bangumiOAuthCompleted":
+          setBangumiSyncStatus((current) => ({
+            ...current,
+            running: true,
+            message: event.message ? `Bangumi 登录完成：${event.message}` : "Bangumi 登录完成，正在刷新",
+            lastError: null,
+          }));
+          void refresh();
+          break;
+        case "bangumiSyncStarted":
+          setBangumiSyncStatus({
+            running: true,
+            message: event.message || "正在同步 Bangumi",
+            processed: 0,
+            total: event.total ?? 0,
+            lastError: null,
+          });
+          break;
+        case "bangumiSyncProgress":
+          setBangumiSyncStatus((current) => ({
+            ...current,
+            running: true,
+            message: event.message || "正在同步 Bangumi",
+            processed: event.processed ?? current.processed,
+            total: event.total ?? current.total,
+            lastError: null,
+          }));
+          break;
+        case "bangumiSyncFinished":
+          setBangumiSyncStatus((current) => ({
+            ...current,
+            running: false,
+            message: event.message || "Bangumi 同步完成",
+            processed: event.processed ?? current.processed,
+            total: event.total ?? current.total,
+            lastSyncedAt: Date.now(),
+            lastError: null,
+          }));
+          void refresh();
+          break;
+        case "bangumiSyncFailed":
+          setBangumiSyncStatus((current) => ({
+            ...current,
+            running: false,
+            message: event.message || "Bangumi 同步失败",
+            lastError: event.message || "Bangumi 同步失败",
+          }));
+          void refresh();
+          break;
         case "downloadCompleted":
           if (!autoScanGuardRef.current) {
             autoScanGuardRef.current = true;
@@ -387,7 +470,7 @@ export function useBackendSnapshot() {
           break;
       }
     });
-  }, [appendLog, commitScanStatus, queueScanStatus, scanLibrary]);
+  }, [appendLog, commitScanStatus, queueScanStatus, refresh, scanLibrary]);
 
   useEffect(() => () => {
     if (logFlushTimerRef.current !== null) {
@@ -408,6 +491,7 @@ export function useBackendSnapshot() {
     error,
     logs,
     scanStatus,
+    bangumiSyncStatus,
     refresh,
     scanLibrary,
   };
@@ -477,6 +561,91 @@ export async function controlDownloadTask(input: {
     return { tasks: [] };
   }
   return window.nexplay.controlDownloadTask({ ...input, deleteFiles: input.deleteFiles ?? false });
+}
+
+export async function bangumiAuthStatus(): Promise<BangumiAuthStatus> {
+  if (!window.nexplay) {
+    return fallbackSnapshot.bangumiAuth;
+  }
+  return window.nexplay.bangumiAuthStatus();
+}
+
+export async function startBangumiLogin(): Promise<BangumiLoginStart> {
+  if (!window.nexplay) {
+    throw new Error("当前页面没有连接到 NexPlay 后端。");
+  }
+  return window.nexplay.startBangumiLogin();
+}
+
+export async function logoutBangumi(): Promise<BangumiAuthStatus> {
+  if (!window.nexplay) {
+    return fallbackSnapshot.bangumiAuth;
+  }
+  return window.nexplay.logoutBangumi();
+}
+
+export async function syncBangumiNow(): Promise<BangumiSyncSummary> {
+  if (!window.nexplay) {
+    throw new Error("当前页面没有连接到 NexPlay 后端。");
+  }
+  return window.nexplay.syncBangumiNow();
+}
+
+export async function syncBangumiSubject(subjectId: number): Promise<BangumiSyncSummary> {
+  if (!window.nexplay) {
+    throw new Error("当前页面没有连接到 NexPlay 后端。");
+  }
+  return window.nexplay.syncBangumiSubject({ subjectId });
+}
+
+export async function updateBangumiCollection(input: {
+  subjectId: number;
+  collectionType: number;
+  rate?: number | null;
+}): Promise<BangumiSyncSummary> {
+  if (!window.nexplay) {
+    throw new Error("当前页面没有连接到 NexPlay 后端。");
+  }
+  return window.nexplay.updateBangumiCollection({
+    subjectId: input.subjectId,
+    collectionType: input.collectionType,
+    rate: input.rate ?? null,
+  });
+}
+
+export async function updateBangumiEpisode(input: {
+  subjectId: number;
+  episodeId: number;
+  collectionType: number;
+}): Promise<BangumiSyncSummary> {
+  if (!window.nexplay) {
+    throw new Error("当前页面没有连接到 NexPlay 后端。");
+  }
+  return window.nexplay.updateBangumiEpisode(input);
+}
+
+export async function batchUpdateBangumiEpisodes(input: {
+  subjectId: number;
+  episodeIds: number[];
+  collectionType: number;
+}): Promise<BangumiSyncSummary> {
+  if (!window.nexplay) {
+    throw new Error("当前页面没有连接到 NexPlay 后端。");
+  }
+  return window.nexplay.batchUpdateBangumiEpisodes(input);
+}
+
+export async function reportPlaybackProgress(input: {
+  subjectId: number;
+  episodeId: number;
+  mediaId?: number;
+  position: number;
+  duration: number;
+}): Promise<BangumiSyncSummary> {
+  if (!window.nexplay) {
+    throw new Error("当前页面没有连接到 NexPlay 后端。");
+  }
+  return window.nexplay.reportPlaybackProgress(input);
 }
 
 export async function testQbittorrentConnection(): Promise<ConnectionTest> {

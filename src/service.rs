@@ -14,10 +14,17 @@ use crate::metadata::provider::{MetadataProvider, SubjectDetail};
 use crate::repository::Repository;
 use crate::task::{self, AppEvent};
 
+mod bangumi;
 mod catalog;
 mod danmaku;
 mod watch_history;
 
+pub use bangumi::{
+    BangumiAuthStatusData, BangumiBatchUpdateEpisodesInput, BangumiCompleteOAuthInput,
+    BangumiLoginStartData, BangumiService, BangumiSyncSummaryData, BangumiUpdateCollectionInput,
+    BangumiUpdateEpisodeInput, episode_collection_label, playback_completion_reached,
+    subject_collection_label, subject_json_to_summary,
+};
 pub use catalog::{CatalogService, CatalogSubjectData, DownloadTaskData, EpisodeResourceData};
 pub use danmaku::DanmakuService;
 pub use watch_history::WatchHistoryService;

@@ -11,13 +11,13 @@ export type FrontendMatchStatus = "matched" | "tentative" | "unmatched" | "faile
 
 export type FrontendLocalFile = { mediaId: number, fileName: string, fileSize: string, episode?: number, modifiedAt: number, };
 
-export type FrontendEpisode = { episode: number, title: string, titleCn: string, airDate: string, cached: boolean, mediaId?: number, fileName?: string, fileSize?: string, };
+export type FrontendEpisode = { episode: number, bgmEpisodeId?: number, title: string, titleCn: string, airDate: string, cached: boolean, bgmCollectionType?: number, bgmCollectionLabel: string, bgmPending: boolean, mediaId?: number, fileName?: string, fileSize?: string, };
 
-export type FrontendSubject = { id: string, mediaId: number, subjectId: number, source: string, provider: string, providerSubjectId: string, local: boolean, aliases: Array<string>, title: string, titleCn: string, year: number, airDate: string, rating: number, rank: number, tags: Array<string>, summary: string, poster: string, hero: string, status: FrontendMatchStatus, episodes: number, watchedEpisodes: number, currentEpisode?: number, progress: number, files: number, totalSize: string, lastPlayed?: string, newEpisode: boolean, metadataReady: boolean, fileSummary: string, localFiles: Array<FrontendLocalFile>, episodesDetail: Array<FrontendEpisode>, };
+export type FrontendSubject = { id: string, mediaId: number, subjectId: number, source: string, provider: string, providerSubjectId: string, local: boolean, aliases: Array<string>, title: string, titleCn: string, year: number, airDate: string, rating: number, rank: number, tags: Array<string>, summary: string, poster: string, hero: string, status: FrontendMatchStatus, episodes: number, watchedEpisodes: number, currentEpisode?: number, progress: number, bgmCollectionType?: number, bgmCollectionLabel: string, bgmRate: number, bgmPending: boolean, files: number, totalSize: string, lastPlayed?: string, newEpisode: boolean, metadataReady: boolean, fileSummary: string, localFiles: Array<FrontendLocalFile>, episodesDetail: Array<FrontendEpisode>, };
 
-export type BackendSnapshot = { subjects: Array<FrontendSubject>, stats: LibraryStats, settings: FrontendSettings, };
+export type BackendSnapshot = { subjects: Array<FrontendSubject>, bangumiCollections: Array<FrontendSubject>, bangumiAuth: BangumiAuthStatusData, stats: LibraryStats, settings: FrontendSettings, };
 
-export type FrontendEditableSettings = { mediaLibraries: Array<string>, databasePath: string, bangumiEnabled: boolean, bangumiBaseUrl: string, bangumiAccessToken: string, bangumiUserAgent: string, bangumiRequestTimeoutSecs: number, bangumiAutoMatch: boolean, bangumiCacheImages: boolean, dandanplayAppId: string, dandanplayAppSecret: string, dandanplayApiKey: string, nyaaEnabled: boolean, nyaaBaseUrl: string, nyaaCategory: string, qbittorrentEnabled: boolean, qbittorrentBaseUrl: string, qbittorrentUsername: string, qbittorrentPassword: string, qbittorrentSavePath: string, qbittorrentCategory: string, qbittorrentTags: string, loggingLevel: string, };
+export type FrontendEditableSettings = { mediaLibraries: Array<string>, databasePath: string, bangumiEnabled: boolean, bangumiBaseUrl: string, bangumiOauthBaseUrl: string, bangumiClientId: string, bangumiClientSecret: string, bangumiClientSecretConfigured: boolean, bangumiRedirectUri: string, bangumiAccessToken: string, bangumiAccessTokenConfigured: boolean, bangumiUserAgent: string, bangumiRequestTimeoutSecs: number, bangumiAutoMatch: boolean, bangumiCacheImages: boolean, dandanplayAppId: string, dandanplayAppSecret: string, dandanplayApiKey: string, nyaaEnabled: boolean, nyaaBaseUrl: string, nyaaCategory: string, qbittorrentEnabled: boolean, qbittorrentBaseUrl: string, qbittorrentUsername: string, qbittorrentPassword: string, qbittorrentSavePath: string, qbittorrentCategory: string, qbittorrentTags: string, loggingLevel: string, };
 
 export type ScanResponse = { summary: ScanSummary, scraped: number, snapshot: BackendSnapshot, };
 
@@ -61,6 +61,24 @@ export type DownloadTasksResponse = { tasks: Array<DownloadTaskData>, };
 
 export type DownloadTaskActionRequest = { taskId: number, action: string, deleteFiles: boolean, };
 
+export type BangumiAuthStatusData = { configured: boolean, authenticated: boolean, username: string | null, nickname: string | null, avatarUrl: string | null, clientConfigured: boolean, redirectUri: string, pendingSyncCount: number, lastError: string | null, };
+
+export type BangumiLoginStartData = { authorizeUrl: string, state: string, redirectUri: string, };
+
+export type BangumiSyncSummaryData = { subjects: number, episodes: number, queued: number, message: string, };
+
+export type BangumiCompleteOAuthInput = { code: string, state: string, };
+
+export type BangumiUpdateCollectionInput = { subjectId: number, collectionType: number, rate: number | null, };
+
+export type BangumiUpdateEpisodeInput = { subjectId: number, episodeId: number, collectionType: number, };
+
+export type BangumiBatchUpdateEpisodesInput = { subjectId: number, episodeIds: Array<number>, collectionType: number, };
+
+export type PlaybackProgressRequest = { subjectId: number, episodeId: number, mediaId?: number, position: number, duration: number, };
+
 export type ConnectionTestResponse = { ok: boolean, message: string, };
 
-export type BackendEvent = { type: string, message?: string, scanned?: number, indexed?: number, processed?: number, total?: number, summary?: ScanSummary, mediaId?: number, subjectId?: number, imageKind?: string, targetId?: number, };
+export type BackendEventType = "log" | "scanStarted" | "scanProgress" | "scanFinished" | "scanFailed" | "danmakuMatched" | "metadataStarted" | "metadataProgress" | "metadataFinished" | "subjectUpdated" | "imageCached" | "metadataFailed" | "metadataStatus" | "bangumiSyncStarted" | "bangumiSyncProgress" | "bangumiSyncFinished" | "bangumiSyncFailed" | "bangumiOAuthCompleted" | "bangumiOAuthFailed" | "downloadCompleted";
+
+export type BackendEvent = { type: BackendEventType, message?: string, scanned?: number, indexed?: number, processed?: number, total?: number, summary?: ScanSummary, mediaId?: number, subjectId?: number, imageKind?: string, targetId?: number, };

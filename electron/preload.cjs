@@ -4,7 +4,7 @@ const { contextBridge, ipcRenderer } = require("electron");
 
 const { RenderBridge } = require("./render-bridge.cjs");
 
-const projectRoot = path.join(__dirname, "..");
+const projectRoot = process.env.NEXPLAY_PROJECT_ROOT || path.join(__dirname, "..");
 const renderBridge = new RenderBridge({ projectRoot });
 let activeMpvMode = null;
 let activeTextureProbe = null;
@@ -114,6 +114,16 @@ contextBridge.exposeInMainWorld("nexplay", {
   startResourceDownload: (payload) => ipcRenderer.invoke("backend:start-resource-download", payload),
   downloadTasks: () => ipcRenderer.invoke("backend:download-tasks"),
   controlDownloadTask: (payload) => ipcRenderer.invoke("backend:control-download-task", payload),
+  bangumiAuthStatus: () => ipcRenderer.invoke("backend:bangumi-auth-status"),
+  startBangumiLogin: () => ipcRenderer.invoke("backend:start-bangumi-login"),
+  completeBangumiOAuth: (payload) => ipcRenderer.invoke("backend:complete-bangumi-oauth", payload),
+  logoutBangumi: () => ipcRenderer.invoke("backend:logout-bangumi"),
+  syncBangumiNow: () => ipcRenderer.invoke("backend:sync-bangumi-now"),
+  syncBangumiSubject: (payload) => ipcRenderer.invoke("backend:sync-bangumi-subject", payload),
+  updateBangumiCollection: (payload) => ipcRenderer.invoke("backend:update-bangumi-collection", payload),
+  updateBangumiEpisode: (payload) => ipcRenderer.invoke("backend:update-bangumi-episode", payload),
+  batchUpdateBangumiEpisodes: (payload) => ipcRenderer.invoke("backend:batch-update-bangumi-episodes", payload),
+  reportPlaybackProgress: (payload) => ipcRenderer.invoke("backend:report-playback-progress", payload),
   testQbittorrentConnection: () => ipcRenderer.invoke("backend:test-qbittorrent"),
   openMedia: (mediaId) => ipcRenderer.invoke("backend:open-media", mediaId),
   getMediaSource: async (mediaId) => {

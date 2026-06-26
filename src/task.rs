@@ -60,6 +60,23 @@ pub enum AppEvent {
         error: String,
     },
     MetadataStatus(String),
+    BangumiSyncStarted {
+        total: usize,
+        message: String,
+    },
+    BangumiSyncProgress {
+        processed: usize,
+        total: usize,
+        message: String,
+    },
+    BangumiSyncFinished {
+        subjects: usize,
+        episodes: usize,
+        message: String,
+    },
+    BangumiSyncFailed {
+        error: String,
+    },
     DownloadCompleted {
         task_id: i64,
         title: String,
