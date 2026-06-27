@@ -1,4 +1,4 @@
-const { ipcMain } = require("electron");
+const { BrowserWindow, dialog, ipcMain } = require("electron");
 const { spawn } = require("node:child_process");
 
 const { backendArgs } = require("./backend-rpc-client.cjs");
@@ -37,6 +37,7 @@ class PlayerControl {
     ipcMain.handle("mpv:set-volume", () => this.rejectExternalMpvFallback());
     ipcMain.handle("mpv:stop", () => this.externalMpvDisabledState());
     ipcMain.handle("mpv:state", () => this.externalMpvDisabledState());
+    ipcMain.handle("dialog:select-subtitle", (event) => this.selectSubtitleFile(event));
     ipcMain.handle("mpv-render:info", () => this.renderBridge.getInfo());
     ipcMain.handle("mpv-render:probe-webgl-texture", () => (
       this.renderBridge.probeWebglTextureRenderer()
@@ -70,6 +71,22 @@ class PlayerControl {
       paused: true,
       volume: 100,
     };
+  }
+
+  async selectSubtitleFile(event) {
+    const window = BrowserWindow.fromWebContents(event.sender);
+    const result = await dialog.showOpenDialog(window || undefined, {
+      title: "选择字幕文件",
+      properties: ["openFile"],
+      filters: [
+        { name: "字幕文件", extensions: ["ass", "ssa", "srt", "vtt", "sub", "idx", "sup"] },
+        { name: "所有文件", extensions: ["*"] },
+      ],
+    });
+    if (result.canceled || !result.filePaths.length) {
+      return null;
+    }
+    return result.filePaths[0];
   }
 
   shutdownExternalMpvFallback() {

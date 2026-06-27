@@ -10,7 +10,7 @@ use crate::domain::{
 use crate::error::{AppError, AppResult};
 use crate::metadata::bangumi::BangumiProvider;
 use crate::metadata::cache::ImageCache;
-use crate::metadata::provider::{MetadataProvider, SubjectDetail};
+use crate::metadata::provider::{MetadataProvider, SubjectDetail, SubjectSearchResult};
 use crate::repository::Repository;
 use crate::task::{self, AppEvent};
 
@@ -25,7 +25,9 @@ pub use bangumi::{
     BangumiUpdateEpisodeInput, episode_collection_label, playback_completion_reached,
     subject_collection_label, subject_json_to_summary,
 };
-pub use catalog::{CatalogService, CatalogSubjectData, DownloadTaskData, EpisodeResourceData};
+pub use catalog::{
+    CatalogService, CatalogSubjectData, DownloadTaskData, EpisodeResourceData, TorrentFileData,
+};
 pub use danmaku::DanmakuService;
 pub use watch_history::WatchHistoryService;
 
@@ -915,26 +917,36 @@ fn strip_episode_prefix(value: &str) -> String {
 
 fn choose_bangumi_candidate<'a>(
     keyword: &str,
-    candidates: &'a [crate::metadata::provider::SubjectSearchResult],
-) -> Option<&'a crate::metadata::provider::SubjectSearchResult> {
+    candidates: &'a [SubjectSearchResult],
+) -> Option<&'a SubjectSearchResult> {
     let normalized_keyword = normalize_title(keyword);
+    let loose_keyword = normalize_title_loose(keyword);
     let tokens = significant_title_tokens(keyword);
     let keyword_has_3d = normalized_keyword.contains("3d");
 
     candidates
         .iter()
         .filter_map(|candidate| {
-            let title = normalize_title(&candidate.title);
-            let title_cn = candidate
-                .title_cn
-                .as_deref()
-                .map(normalize_title)
-                .unwrap_or_default();
-            let combined = format!("{title}{title_cn}");
-            if title == normalized_keyword || title_cn == normalized_keyword {
+            let titles = candidate_match_titles(candidate);
+            if titles
+                .iter()
+                .any(|title| normalize_title(title) == normalized_keyword)
+            {
                 return Some((candidate, 10_000));
             }
 
+            if !loose_keyword.is_empty()
+                && titles
+                    .iter()
+                    .any(|title| normalize_title_loose(title) == loose_keyword)
+            {
+                return Some((candidate, 9_000));
+            }
+
+            let combined = titles
+                .iter()
+                .map(|title| normalize_title(title))
+                .collect::<String>();
             let matched = tokens
                 .iter()
                 .filter(|token| combined.contains(token.as_str()))
@@ -951,6 +963,14 @@ fn choose_bangumi_candidate<'a>(
             if combined.contains("3d") && !keyword_has_3d {
                 score -= 250;
             }
+            let loose_combined = titles
+                .iter()
+                .map(|title| normalize_title_loose(title))
+                .collect::<String>();
+            let similarity = title_char_similarity(&loose_keyword, &loose_combined);
+            if similarity >= 0.72 {
+                score += (similarity * 200.0) as i32;
+            }
             Some((candidate, score))
         })
         .max_by_key(|(_, score)| *score)
@@ -964,12 +984,72 @@ fn choose_bangumi_candidate<'a>(
         })
 }
 
+fn candidate_match_titles(candidate: &SubjectSearchResult) -> Vec<&str> {
+    let mut titles = Vec::new();
+    if !candidate.title.trim().is_empty() {
+        titles.push(candidate.title.as_str());
+    }
+    if let Some(title_cn) = candidate
+        .title_cn
+        .as_deref()
+        .filter(|title| !title.trim().is_empty())
+    {
+        titles.push(title_cn);
+    }
+    titles.extend(
+        candidate
+            .aliases
+            .iter()
+            .map(String::as_str)
+            .filter(|title| !title.trim().is_empty()),
+    );
+    titles
+}
+
 fn normalize_title(value: &str) -> String {
     value
         .chars()
         .filter(|ch| !ch.is_whitespace())
         .collect::<String>()
         .to_ascii_lowercase()
+}
+
+fn normalize_title_loose(value: &str) -> String {
+    normalize_title(value)
+        .chars()
+        .filter(|ch| {
+            !matches!(
+                ch,
+                '的' | '之'
+                    | '和'
+                    | '与'
+                    | '與'
+                    | 'の'
+                    | 'と'
+                    | ':'
+                    | '：'
+                    | '-'
+                    | '－'
+                    | 'ー'
+                    | ' '
+            ) && !ch.is_ascii_punctuation()
+        })
+        .collect()
+}
+
+fn title_char_similarity(left: &str, right: &str) -> f64 {
+    if left.is_empty() || right.is_empty() {
+        return 0.0;
+    }
+    let left_chars = left.chars().collect::<std::collections::HashSet<_>>();
+    let right_chars = right.chars().collect::<std::collections::HashSet<_>>();
+    let intersection = left_chars.intersection(&right_chars).count() as f64;
+    let denominator = left_chars.len().max(right_chars.len()) as f64;
+    if denominator == 0.0 {
+        0.0
+    } else {
+        intersection / denominator
+    }
 }
 
 fn significant_title_tokens(value: &str) -> Vec<String> {
@@ -1031,6 +1111,72 @@ fn cache_subject_images_once<'a>(
         repository.upsert_image_cache(subject_id, kind, &url, &path, task::unix_timestamp_ms())?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn search_result(
+        id: &str,
+        title: &str,
+        title_cn: &str,
+        aliases: &[&str],
+    ) -> SubjectSearchResult {
+        SubjectSearchResult {
+            provider: "bangumi".to_string(),
+            provider_subject_id: id.to_string(),
+            title: title.to_string(),
+            title_cn: (!title_cn.is_empty()).then(|| title_cn.to_string()),
+            summary: None,
+            air_date: None,
+            rating: None,
+            rank: None,
+            image_large: None,
+            image_common: None,
+            aliases: aliases.iter().map(|alias| alias.to_string()).collect(),
+            episode_count: None,
+        }
+    }
+
+    #[test]
+    fn chooses_bangumi_candidate_with_chinese_particle_variants() {
+        let candidates = vec![
+            search_result(
+                "56093",
+                "ダンガンロンパ 希望の学園と絶望の高校生 THE ANIMATION",
+                "弹丸论破 希望学园与绝望高中生",
+                &["弹丸论破：希望的学园和绝望高中生"],
+            ),
+            search_result(
+                "158415",
+                "ダンガンロンパ3 -The End of 希望ヶ峰学園- 未来編",
+                "弹丸论破3 -The End of 希望之峰学园- 未来篇",
+                &[],
+            ),
+        ];
+
+        let selected = choose_bangumi_candidate("弹丸论破 希望的学园和绝望高中生", &candidates);
+
+        assert_eq!(
+            selected.map(|candidate| candidate.provider_subject_id.as_str()),
+            Some("56093")
+        );
+    }
+
+    #[test]
+    fn does_not_choose_unrelated_candidate_for_tokenized_keyword() {
+        let candidates = vec![search_result(
+            "295318",
+            "名探偵コナン 緋色の弾丸",
+            "名侦探柯南 绯色的子弹",
+            &["Meitantei Konan Hiiro no Dangan"],
+        )];
+
+        let selected = choose_bangumi_candidate("弹丸论破 希望的学园和绝望高中生", &candidates);
+
+        assert!(selected.is_none());
+    }
 }
 
 fn open_with_default_player(path: &PathBuf) -> AppResult<()> {

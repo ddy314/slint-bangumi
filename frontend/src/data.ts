@@ -17,6 +17,7 @@ export type PlaybackEpisode = {
   titleCn: string;
   airDate: string;
   cached: boolean;
+  watched: boolean;
   bgmEpisodeId?: number;
   bgmCollectionType?: number;
   bgmCollectionLabel: string;
@@ -68,6 +69,7 @@ export function makePlaybackEpisodes(subject: Subject): PlaybackEpisode[] {
       titleCn: episode.titleCn,
       airDate: episode.airDate,
       cached: episode.cached,
+      watched: episode.bgmCollectionType === 2 || (episode.cached && episode.episode <= subject.watchedEpisodes),
       bgmEpisodeId: episode.bgmEpisodeId,
       bgmCollectionType: episode.bgmCollectionType,
       bgmCollectionLabel: episode.bgmCollectionLabel,
@@ -96,12 +98,20 @@ export function makePlaybackEpisodes(subject: Subject): PlaybackEpisode[] {
       attachLocalFile(rows[0], remainingFiles.shift()!);
     }
 
-    rows.push(...remainingFiles.map((file, index) => playbackEpisodeFromLocalFile(file, rows.length + index)));
+    rows.push(...remainingFiles.map((file, index) => playbackEpisodeFromLocalFile(
+      file,
+      rows.length + index,
+      (file.episode || rows.length + index + 1) <= subject.watchedEpisodes,
+    )));
     return rows;
   }
 
   if (subject.localFiles?.length) {
-    return subject.localFiles.map(playbackEpisodeFromLocalFile);
+    return subject.localFiles.map((file, index) => playbackEpisodeFromLocalFile(
+      file,
+      index,
+      (file.episode || index + 1) <= subject.watchedEpisodes,
+    ));
   }
 
   return Array.from({ length: subject.episodes || subject.files }, (_, index) => ({
@@ -111,6 +121,7 @@ export function makePlaybackEpisodes(subject: Subject): PlaybackEpisode[] {
     titleCn: "",
     airDate: "",
     cached: false,
+    watched: index + 1 <= subject.watchedEpisodes,
     bgmCollectionLabel: "未标记",
     bgmPending: false,
   }));
@@ -124,7 +135,7 @@ function attachLocalFile(row: PlaybackEpisode, file: FrontendLocalFile) {
   row.fileSize = file.fileSize;
 }
 
-function playbackEpisodeFromLocalFile(file: FrontendLocalFile, index: number): PlaybackEpisode {
+function playbackEpisodeFromLocalFile(file: FrontendLocalFile, index: number, watched = false): PlaybackEpisode {
   const episode = file.episode || index + 1;
   return {
     key: String(file.mediaId || `${file.fileName}-${index}`),
@@ -133,6 +144,7 @@ function playbackEpisodeFromLocalFile(file: FrontendLocalFile, index: number): P
     titleCn: "",
     airDate: "",
     cached: true,
+    watched,
     bgmCollectionLabel: "未标记",
     bgmPending: false,
     mediaId: file.mediaId,

@@ -16,7 +16,7 @@ use crate::service::{
     BangumiAuthStatusData, BangumiBatchUpdateEpisodesInput, BangumiCompleteOAuthInput,
     BangumiLoginStartData, BangumiSyncSummaryData, BangumiUpdateCollectionInput,
     BangumiUpdateEpisodeInput, CatalogSubjectData, DownloadTaskData, EpisodeResourceData,
-    episode_collection_label, subject_collection_label, subject_json_to_summary,
+    TorrentFileData, episode_collection_label, subject_collection_label, subject_json_to_summary,
 };
 use crate::task::AppEvent;
 
@@ -200,6 +200,10 @@ pub struct MediaSourceResponse {
     pub file_name: String,
     pub file_size: String,
     pub source_url: String,
+    #[ts(optional)]
+    pub playback_position: Option<f64>,
+    #[ts(optional)]
+    pub playback_duration: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -261,6 +265,30 @@ pub struct StartResourceDownloadRequest {
     pub provider_subject_id: String,
     #[ts(optional)]
     pub episode_number: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct PrepareResourceDownloadRequest {
+    pub resource: EpisodeResourceData,
+    pub subject_provider: String,
+    pub provider_subject_id: String,
+    #[ts(optional)]
+    pub episode_number: Option<f64>,
+}
+
+#[derive(Debug, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct PreparedResourceDownloadResponse {
+    pub task: DownloadTaskData,
+    pub files: Vec<TorrentFileData>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct ConfirmResourceDownloadRequest {
+    pub task_id: i64,
+    pub selected_file_indexes: Vec<i64>,
 }
 
 #[derive(Debug, Serialize, TS)]
@@ -499,11 +527,18 @@ pub fn media_source(
     input: MediaSourceRequest,
 ) -> AppResult<MediaSourceResponse> {
     let media = context.media.playback_media_by_id(input.media_id)?;
+    let progress = context.watch_history.load(input.media_id)?;
     Ok(MediaSourceResponse {
         media_id: media.id,
         file_name: media.file_name,
         file_size: format_bytes(media.file_size),
         source_url: normalize_asset_path(&media.path.to_string_lossy()),
+        playback_position: progress
+            .as_ref()
+            .map(|progress| progress.position_ms.max(0) as f64 / 1000.0),
+        playback_duration: progress
+            .as_ref()
+            .map(|progress| progress.duration_ms.max(0) as f64 / 1000.0),
     })
 }
 
@@ -604,6 +639,28 @@ pub fn start_resource_download(
     )
 }
 
+pub fn prepare_resource_download(
+    context: &AppContext,
+    input: PrepareResourceDownloadRequest,
+) -> AppResult<PreparedResourceDownloadResponse> {
+    let (task, files) = context.catalog.prepare_resource_download(
+        &input.resource,
+        &input.subject_provider,
+        &input.provider_subject_id,
+        input.episode_number,
+    )?;
+    Ok(PreparedResourceDownloadResponse { task, files })
+}
+
+pub fn confirm_resource_download(
+    context: &AppContext,
+    input: ConfirmResourceDownloadRequest,
+) -> AppResult<DownloadTaskData> {
+    context
+        .catalog
+        .confirm_resource_download(input.task_id, &input.selected_file_indexes)
+}
+
 pub fn download_tasks(context: &AppContext) -> AppResult<DownloadTasksResponse> {
     Ok(DownloadTasksResponse {
         tasks: context.catalog.list_download_tasks()?,
@@ -684,13 +741,26 @@ pub fn report_playback_progress(
             )?;
         }
     }
+    let started_summary =
+        if input.subject_id > 0 && playback_start_reached(input.position, input.duration) {
+            context.bangumi.mark_playback_started(input.subject_id)?
+        } else {
+            None
+        };
     if input.subject_id > 0
         && input.episode_id > 0
         && crate::service::playback_completion_reached(input.position, input.duration)
     {
-        context
+        let mut summary = context
             .bangumi
-            .mark_playback_completed(input.subject_id, input.episode_id)
+            .mark_playback_completed(input.subject_id, input.episode_id)?;
+        if let Some(started) = started_summary {
+            summary.subjects += started.subjects;
+            summary.queued = summary.queued.max(started.queued);
+        }
+        Ok(summary)
+    } else if let Some(summary) = started_summary {
+        Ok(summary)
     } else {
         Ok(BangumiSyncSummaryData {
             subjects: 0,
@@ -699,6 +769,16 @@ pub fn report_playback_progress(
             message: "播放进度尚未达到 Bangumi 完播阈值".to_string(),
         })
     }
+}
+
+fn playback_start_reached(position: f64, duration: f64) -> bool {
+    if !duration.is_finite() || !position.is_finite() || duration <= 0.0 || position <= 0.0 {
+        return false;
+    }
+    if crate::service::playback_completion_reached(position, duration) {
+        return true;
+    }
+    position >= (duration * 0.02).clamp(10.0, 30.0)
 }
 
 pub fn test_qbittorrent_connection(context: &AppContext) -> ConnectionTestResponse {
@@ -1254,6 +1334,7 @@ pub fn export_types(output_path: impl AsRef<Path>) -> AppResult<()> {
         CatalogSubjectData::decl(&ts_config),
         EpisodeResourceData::decl(&ts_config),
         DownloadTaskData::decl(&ts_config),
+        TorrentFileData::decl(&ts_config),
         CatalogSearchRequest::decl(&ts_config),
         CatalogSearchResponse::decl(&ts_config),
         OnlineSubjectRequest::decl(&ts_config),
@@ -1261,6 +1342,9 @@ pub fn export_types(output_path: impl AsRef<Path>) -> AppResult<()> {
         EpisodeResourcesRequest::decl(&ts_config),
         EpisodeResourcesResponse::decl(&ts_config),
         StartResourceDownloadRequest::decl(&ts_config),
+        PrepareResourceDownloadRequest::decl(&ts_config),
+        PreparedResourceDownloadResponse::decl(&ts_config),
+        ConfirmResourceDownloadRequest::decl(&ts_config),
         DownloadTasksResponse::decl(&ts_config),
         DownloadTaskActionRequest::decl(&ts_config),
         BangumiAuthStatusData::decl(&ts_config),

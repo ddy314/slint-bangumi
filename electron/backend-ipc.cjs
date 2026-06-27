@@ -161,6 +161,12 @@ function registerBackendIpc(backendClient, options = {}) {
   ipcMain.handle("backend:start-resource-download", (_event, payload) => (
     backendClient.request("startResourceDownload", payload)
   ));
+  ipcMain.handle("backend:prepare-resource-download", (_event, payload) => (
+    backendClient.request("prepareResourceDownload", payload)
+  ));
+  ipcMain.handle("backend:confirm-resource-download", (_event, payload) => (
+    backendClient.request("confirmResourceDownload", payload)
+  ));
   ipcMain.handle("backend:download-tasks", () => backendClient.request("downloadTasks"));
   ipcMain.handle("backend:control-download-task", (_event, payload) => (
     backendClient.request("controlDownloadTask", payload)

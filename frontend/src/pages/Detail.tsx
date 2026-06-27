@@ -56,6 +56,11 @@ export function DetailPage({
   const detailFrame = "mx-auto w-full max-w-[1120px] px-6 sm:px-8";
   const bgmSubjectId = subject.provider === "bangumi" ? Number(subject.providerSubjectId) : NaN;
   const canUseBangumi = Number.isFinite(bgmSubjectId) && bgmSubjectId > 0;
+  const episodeTotal = subject.episodes || rows.length || subject.files;
+  const hasLocalWatchProgress = subject.watchedEpisodes > 0;
+  const localWatchLabel = subject.progress >= 1
+    ? `本地看完 ${subject.watchedEpisodes}/${episodeTotal || "?"}`
+    : `本地在看 ${subject.watchedEpisodes}/${episodeTotal || "?"}`;
 
   useEffect(() => {
     setSubject(initialSubject);
@@ -369,12 +374,16 @@ export function DetailPage({
                         <Badge tone="warning"><CloudOff size={11} /> 待同步</Badge>
                       ) : subject.bgmCollectionType ? (
                         <Badge tone="success"><Check size={11} /> 已同步</Badge>
+                      ) : hasLocalWatchProgress ? (
+                        <Badge tone="primary">{localWatchLabel}</Badge>
                       ) : (
                         <Badge tone="neutral">未标记</Badge>
                       )}
                     </div>
                     <p className="mt-1.5 max-w-xl text-[12px] leading-relaxed text-[var(--color-text-tertiary)]">
-                      看完一集（进度 ≥ 90%）会自动标记为「看过」并回写 Bangumi；离线时进入待同步队列，下次打开或同步时自动重试。
+                      {hasLocalWatchProgress && !subject.bgmCollectionType
+                        ? "已检测到本地观看进度；继续播放会自动把 Bangumi 条目标记为「在看」，看完一集后同步单集「看过」。"
+                        : "看完一集（进度 ≥ 90%）会自动标记为「看过」并回写 Bangumi；离线时进入待同步队列，下次打开或同步时自动重试。"}
                     </p>
                   </div>
                   {busyAction && (
@@ -550,6 +559,9 @@ const EpisodeRow = memo(function EpisodeRow({
   busy: boolean;
 }) {
   const title = row.titleCn || row.title || `Episode ${row.episode}`;
+  const collectionLabel = row.watched && row.bgmCollectionType !== 2
+    ? "本地看过"
+    : row.bgmCollectionLabel;
   return (
     <div
       className={cn(
@@ -579,9 +591,9 @@ const EpisodeRow = memo(function EpisodeRow({
         </div>
       </button>
       <div className="flex items-center gap-2">
-        {row.bgmCollectionLabel && (
+        {collectionLabel && (
           <span className="hidden rounded-full bg-[var(--color-primary-soft)] px-2.5 py-[3px] text-[11px] font-medium text-[var(--color-primary)] sm:inline-flex">
-            {row.bgmCollectionLabel}{row.bgmPending ? " · 待同步" : ""}
+            {collectionLabel}{row.bgmPending ? " · 待同步" : ""}
           </span>
         )}
         {row.cached ? (
@@ -605,7 +617,7 @@ const EpisodeRow = memo(function EpisodeRow({
             disabled={busy}
             className="rounded-full bg-black/[0.055] px-2.5 py-[3px] text-[11px] font-semibold text-[var(--color-text-secondary)] hover:text-[var(--color-text-primary)]"
           >
-            {busy ? "同步中" : "看过"}
+            {busy ? "同步中" : row.watched ? "同步看过" : "看过"}
           </button>
         )}
       </div>

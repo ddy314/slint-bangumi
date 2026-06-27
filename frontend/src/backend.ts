@@ -8,6 +8,7 @@ import type {
   FrontendEditableSettings,
   DanmakuTrackResponse as GeneratedDanmakuTrackResponse,
   CatalogSearchResponse,
+  ConfirmResourceDownloadRequest,
   ConnectionTestResponse,
   DownloadTaskData,
   DownloadTasksResponse,
@@ -15,7 +16,10 @@ import type {
   EpisodeResourcesResponse,
   MediaSourceResponse,
   OpenMediaResponse,
+  PreparedResourceDownloadResponse,
+  PrepareResourceDownloadRequest,
   ScanResponse as GeneratedScanResponse,
+  TorrentFileData,
 } from "./generated/backend";
 
 export type BackendSnapshot = GeneratedBackendSnapshot;
@@ -28,6 +32,8 @@ export type EpisodeResource = EpisodeResourceData;
 export type EpisodeResources = EpisodeResourcesResponse;
 export type DownloadTask = DownloadTaskData;
 export type DownloadTasks = DownloadTasksResponse;
+export type TorrentFile = TorrentFileData;
+export type PreparedResourceDownload = PreparedResourceDownloadResponse;
 export type ConnectionTest = ConnectionTestResponse;
 export type BangumiAuthStatus = BangumiAuthStatusData;
 export type BangumiLoginStart = BangumiLoginStartData;
@@ -543,6 +549,20 @@ export async function startResourceDownload(input: {
     throw new Error("当前页面没有连接到 NexPlay 后端。");
   }
   return window.nexplay.startResourceDownload(input);
+}
+
+export async function prepareResourceDownload(input: PrepareResourceDownloadRequest): Promise<PreparedResourceDownload> {
+  if (!window.nexplay) {
+    throw new Error("当前页面没有连接到 NexPlay 后端。");
+  }
+  return window.nexplay.prepareResourceDownload(input);
+}
+
+export async function confirmResourceDownload(input: ConfirmResourceDownloadRequest): Promise<DownloadTask> {
+  if (!window.nexplay) {
+    throw new Error("当前页面没有连接到 NexPlay 后端。");
+  }
+  return window.nexplay.confirmResourceDownload(input);
 }
 
 export async function downloadTasks(): Promise<DownloadTasks> {

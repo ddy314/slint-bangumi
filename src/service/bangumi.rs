@@ -596,6 +596,29 @@ impl BangumiService {
         })
     }
 
+    pub fn mark_playback_started(
+        &self,
+        subject_id: i64,
+    ) -> AppResult<Option<BangumiSyncSummaryData>> {
+        if subject_id <= 0 {
+            return Ok(None);
+        }
+        let existing = self.repository.bangumi_subject_collection(subject_id)?;
+        if let Some(collection) = existing.as_ref() {
+            if collection.collection_type != BANGUMI_SUBJECT_WISH {
+                return Ok(None);
+            }
+        }
+        self.update_collection(BangumiUpdateCollectionInput {
+            subject_id,
+            collection_type: BANGUMI_SUBJECT_DOING,
+            rate: existing
+                .as_ref()
+                .and_then(|collection| (collection.rate > 0).then_some(collection.rate)),
+        })
+        .map(Some)
+    }
+
     fn retry_queue_best_effort(&self) {
         let Ok(items) = self.repository.list_bangumi_sync_queue(20) else {
             return;

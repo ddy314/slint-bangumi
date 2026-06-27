@@ -27,7 +27,7 @@ export type OpenMediaResponse = { opened: boolean, };
 
 export type MediaSourceRequest = { mediaId: number, };
 
-export type MediaSourceResponse = { mediaId: number, fileName: string, fileSize: string, sourceUrl: string, };
+export type MediaSourceResponse = { mediaId: number, fileName: string, fileSize: string, sourceUrl: string, playbackPosition?: number, playbackDuration?: number, };
 
 export type DanmakuTrackRequest = { mediaId: number, };
 
@@ -43,6 +43,8 @@ export type EpisodeResourceData = { id: number, provider: string, title: string,
 
 export type DownloadTaskData = { id: number, resourceId?: number, subjectProvider: string, providerSubjectId: string, episodeNumber?: number, title: string, torrentUrl: string, infoHash: string, qbittorrentHash: string, status: string, progress: number, savePath: string, error: string, updatedAt: number, state: string, size: number, downloaded: number, dlspeed: number, eta: number, stale: boolean, };
 
+export type TorrentFileData = { index: number, name: string, size: number, progress: number, priority: number, availability: number, };
+
 export type CatalogSearchRequest = { query: string, limit: number, };
 
 export type CatalogSearchResponse = { subjects: Array<FrontendSubject>, };
@@ -56,6 +58,12 @@ export type EpisodeResourcesRequest = { subjectProvider: string, providerSubject
 export type EpisodeResourcesResponse = { resources: Array<EpisodeResourceData>, };
 
 export type StartResourceDownloadRequest = { resource: EpisodeResourceData, subjectProvider: string, providerSubjectId: string, episodeNumber?: number, };
+
+export type PrepareResourceDownloadRequest = { resource: EpisodeResourceData, subjectProvider: string, providerSubjectId: string, episodeNumber?: number, };
+
+export type PreparedResourceDownloadResponse = { task: DownloadTaskData, files: Array<TorrentFileData>, };
+
+export type ConfirmResourceDownloadRequest = { taskId: number, selectedFileIndexes: Array<number>, };
 
 export type DownloadTasksResponse = { tasks: Array<DownloadTaskData>, };
 

@@ -5,6 +5,7 @@ import {
   Check,
   ChevronDown,
   Clock3,
+  FilePlus2,
   ListVideo,
   Maximize2,
   MessageCircle,
@@ -33,6 +34,9 @@ const SEEK_POSITION_ACCEPT_BEFORE_SECONDS = 1.25;
 const SEEK_POSITION_ACCEPT_AFTER_SECONDS = 2.5;
 const FRAME_CLOCK_PUBLISH_INTERVAL_MS = 250;
 const DANMAKU_SEEK_RESET_DELAY_MS = 650;
+const CONTROLS_IDLE_HIDE_MS = 1400;
+const KEYBOARD_SEEK_STEP_SECONDS = 5;
+const KEYBOARD_VOLUME_STEP = 5;
 const DANMAKU_AREAS = [
   { label: "1/4屏", value: 0.25 },
   { label: "半屏", value: 0.5 },
@@ -43,11 +47,13 @@ export function PlayerPage({
   subject,
   initialEpisode,
   onBack,
+  onSubjectUpdated,
   onSnack,
 }: {
   subject: Subject;
   initialEpisode: PlaybackEpisode;
   onBack: () => void;
+  onSubjectUpdated?: (subject: Subject) => void | Promise<void>;
   onSnack: (text: string, tone?: "neutral" | "success" | "danger") => void;
 }) {
   const episodes = useMemo(() => makePlaybackEpisodes(subject), [subject]);
@@ -70,9 +76,18 @@ export function PlayerPage({
   const seekingRef = useRef(false);
   const completedSyncKeyRef = useRef<string | null>(null);
   const localProgressReportRef = useRef<{ key: string; position: number; reportedAt: number } | null>(null);
+  const playbackProgressContextRef = useRef<{
+    subjectId: number;
+    episodeId: number;
+    mediaId?: number;
+    episodeKey: string;
+    position: number;
+    duration: number;
+  } | null>(null);
   const controlsIdleTimerRef = useRef<number | null>(null);
   const pointerOverControlsRef = useRef(false);
   const previousVolumeRef = useRef(100);
+  const latestVolumeRef = useRef(100);
   const [currentKey, setCurrentKey] = useState(initialEpisode.key);
   const [source, setSource] = useState<MediaSource | null>(null);
   const [mpvState, setMpvState] = useState<MpvState | null>(null);
@@ -144,6 +159,47 @@ export function PlayerPage({
   const playbackControlsDisabled = loadingSource || Boolean(playbackError);
   const bgmSubjectId = subject.provider === "bangumi" ? Number(subject.providerSubjectId) : NaN;
 
+  useEffect(() => {
+    latestVolumeRef.current = volume;
+  }, [volume]);
+
+  useEffect(() => {
+    playbackProgressContextRef.current = {
+      subjectId: Number.isFinite(bgmSubjectId) ? bgmSubjectId : 0,
+      episodeId: currentEpisode.bgmEpisodeId ?? 0,
+      mediaId: currentEpisode.mediaId,
+      episodeKey: currentEpisode.key,
+      position,
+      duration,
+    };
+  });
+
+  const flushPlaybackProgress = useCallback((positionOverride?: number, durationOverride?: number) => {
+    const context = playbackProgressContextRef.current;
+    if (!context?.mediaId || !window.nexplay) {
+      return;
+    }
+    const nextPosition = Number.isFinite(positionOverride) ? Math.max(0, positionOverride ?? 0) : context.position;
+    const nextDuration = Number.isFinite(durationOverride) ? Math.max(0, durationOverride ?? 0) : context.duration;
+    if (!Number.isFinite(nextPosition) || !Number.isFinite(nextDuration) || nextDuration <= 0 || nextPosition <= 0) {
+      return;
+    }
+    localProgressReportRef.current = {
+      key: context.episodeKey,
+      position: nextPosition,
+      reportedAt: Date.now(),
+    };
+    void reportPlaybackProgress({
+      subjectId: context.subjectId,
+      episodeId: context.episodeId,
+      mediaId: context.mediaId,
+      position: nextPosition,
+      duration: nextDuration,
+    }).catch(() => {
+      // Best-effort persistence; the periodic reporter will retry while playback continues.
+    });
+  }, []);
+
   const clearDanmakuSeekResetTimer = useCallback(() => {
     if (danmakuSeekResetTimerRef.current !== null) {
       window.clearTimeout(danmakuSeekResetTimerRef.current);
@@ -203,26 +259,30 @@ export function PlayerPage({
 
   useEffect(() => {
     const episodeId = currentEpisode.bgmEpisodeId;
-    if (!Number.isFinite(bgmSubjectId) || !episodeId || !Number.isFinite(duration) || !Number.isFinite(position) || duration <= 0) {
+    const hasBangumiCompletionTarget = Number.isFinite(bgmSubjectId) && episodeId;
+    if (!currentEpisode.mediaId || !Number.isFinite(duration) || !Number.isFinite(position) || duration <= 0) {
       return;
     }
     const threshold = Math.max(duration * 0.9, duration - 90);
     if (position < threshold) {
       return;
     }
-    const syncKey = `${bgmSubjectId}:${episodeId}`;
+    const syncKey = hasBangumiCompletionTarget
+      ? `${bgmSubjectId}:${episodeId}`
+      : `local:${currentEpisode.key}:${currentEpisode.mediaId}`;
     if (completedSyncKeyRef.current === syncKey) {
       return;
     }
     completedSyncKeyRef.current = syncKey;
     reportPlaybackProgress({
-      subjectId: bgmSubjectId,
-      episodeId,
+      subjectId: hasBangumiCompletionTarget ? bgmSubjectId : 0,
+      episodeId: episodeId ?? 0,
       mediaId: currentEpisode.mediaId,
       position,
       duration,
     })
       .then((result) => {
+        void onSubjectUpdated?.(subject);
         if (result.episodes > 0 || result.queued > 0) {
           onSnack(result.message, result.queued > 0 ? "neutral" : "success");
         }
@@ -230,9 +290,9 @@ export function PlayerPage({
       .catch((caught) => {
         completedSyncKeyRef.current = null;
         const message = caught instanceof Error ? caught.message : String(caught);
-        onSnack(`Bangumi 完播同步失败：${message}`, "danger");
+        onSnack(hasBangumiCompletionTarget ? `Bangumi 完播同步失败：${message}` : `保存播放进度失败：${message}`, "danger");
       });
-  }, [bgmSubjectId, currentEpisode.bgmEpisodeId, currentEpisode.mediaId, duration, onSnack, position]);
+  }, [bgmSubjectId, currentEpisode.bgmEpisodeId, currentEpisode.key, currentEpisode.mediaId, duration, onSnack, onSubjectUpdated, position, subject]);
 
   useEffect(() => {
     if (!currentEpisode.mediaId || !Number.isFinite(duration) || !Number.isFinite(position) || duration <= 0 || position <= 0) {
@@ -323,6 +383,7 @@ export function PlayerPage({
       setMpvState(null);
       try {
         const nextSource = await window.nexplay.getMediaSource(currentEpisode.mediaId);
+        const resumePosition = resumePositionFromSource(nextSource);
         if (canUseBrowserVideoSource(nextSource)) {
           if (!cancelled) {
             setSource(nextSource);
@@ -332,7 +393,7 @@ export function PlayerPage({
               audioTracks: [],
               subtitleTracks: [],
               duration: 0,
-              position: 0,
+              position: resumePosition,
               paused: false,
               volume: 100,
               source: nextSource,
@@ -343,10 +404,52 @@ export function PlayerPage({
           return;
         }
 
-        const nextState = await window.nexplay.mpvLoad(currentEpisode.mediaId);
+        let nextState = await window.nexplay.mpvLoad(currentEpisode.mediaId);
+        const loadedRenderMode = nextState.renderMode;
+        const loadedTextureProbe = nextState.textureProbe;
+        const rememberedSubtitlePath = readRememberedSubtitlePath(currentEpisode.mediaId);
+        if (rememberedSubtitlePath && window.nexplay.mpvAddSubtitlePath) {
+          try {
+            const restoredSubtitle = await window.nexplay.mpvAddSubtitlePath(rememberedSubtitlePath);
+            nextState = {
+              ...restoredSubtitle.state,
+              source: nextSource,
+              renderMode: loadedRenderMode,
+              textureProbe: loadedTextureProbe,
+            };
+          } catch {
+            forgetRememberedSubtitlePath(currentEpisode.mediaId);
+          }
+        }
+        if (resumePosition > 1) {
+          try {
+            const seekState = await window.nexplay.mpvSeek(resumePosition);
+            nextState = {
+              ...seekState,
+              source: nextSource,
+              renderMode: loadedRenderMode,
+              textureProbe: loadedTextureProbe,
+            };
+            latestSeekPositionRef.current = resumePosition;
+            seekStabilizationRef.current = {
+              target: resumePosition,
+              startedAt: performance.now(),
+              until: performance.now() + SEEK_POSITION_SETTLE_MS,
+            };
+            scheduleDanmakuSeekReset(resumePosition);
+          } catch {
+            // Resume is opportunistic; playback should still start if the seek fails.
+          }
+        }
         if (!cancelled) {
-          setMpvState(nextState);
-          setSource(nextState.source ?? null);
+          setMpvState({
+            ...nextState,
+            position: resumePosition > 1 ? resumePosition : nextState.position,
+            source: nextSource,
+            renderMode: loadedRenderMode,
+            textureProbe: loadedTextureProbe,
+          });
+          setSource(nextSource);
           setPaused(false);
         }
       } catch (caught) {
@@ -368,7 +471,7 @@ export function PlayerPage({
     return () => {
       cancelled = true;
     };
-  }, [cancelDanmakuSeekReset, currentEpisode.mediaId, onSnack]);
+  }, [cancelDanmakuSeekReset, currentEpisode.mediaId, onSnack, scheduleDanmakuSeekReset]);
 
   useEffect(() => {
     if (loadingSource || playbackError || !window.nexplay?.mpvState || mpvState?.renderMode === "browserVideo") {
@@ -408,13 +511,14 @@ export function PlayerPage({
 
   useEffect(() => {
     return () => {
+      flushPlaybackProgress();
       if (seekCommitTimerRef.current !== null) {
         window.clearTimeout(seekCommitTimerRef.current);
       }
       clearDanmakuSeekResetTimer();
       void window.nexplay?.mpvStop();
     };
-  }, [clearDanmakuSeekResetTimer]);
+  }, [clearDanmakuSeekResetTimer, flushPlaybackProgress]);
 
   useEffect(() => {
     const handleFullscreenChange = () => {
@@ -472,10 +576,11 @@ export function PlayerPage({
     if (!episode?.mediaId) {
       return;
     }
+    flushPlaybackProgress();
     setSettingsMenuOpen(false);
     setPlaybackError(null);
     setCurrentKey(episode.key);
-  }, []);
+  }, [flushPlaybackProgress]);
 
   const openEpisodeDrawer = useCallback(() => {
     setSettingsMenuOpen(false);
@@ -499,6 +604,27 @@ export function PlayerPage({
     }
   }, [onSnack, source]);
 
+  const addSubtitle = useCallback(async () => {
+    if (!window.nexplay || !currentEpisode.mediaId) return;
+    try {
+      const result = await window.nexplay.mpvAddSubtitle();
+      if (!result) {
+        return;
+      }
+      rememberSubtitlePath(currentEpisode.mediaId, result.path);
+      setMpvState((current) => ({
+        ...result.state,
+        source: current?.source ?? source ?? undefined,
+        renderMode: current?.renderMode,
+        textureProbe: current?.textureProbe,
+      }));
+      onSnack("已添加外部字幕", "success");
+    } catch (caught) {
+      const message = caught instanceof Error ? caught.message : String(caught);
+      onSnack(`添加字幕失败：${message}`, "danger");
+    }
+  }, [currentEpisode.mediaId, onSnack, source]);
+
   const togglePause = useCallback(async () => {
     if (loadingSource || playbackError || !window.nexplay) return;
     const nextPaused = !paused;
@@ -514,6 +640,7 @@ export function PlayerPage({
         const nextPosition = video.currentTime || 0;
         if (nextPaused) {
           settleDanmakuClockAtPosition(nextPosition);
+          flushPlaybackProgress(nextPosition, Number.isFinite(video.duration) ? video.duration : duration);
         }
         setPaused(nextPaused);
         setMpvState((current) => current ? { ...current, paused: nextPaused, position: nextPosition } : current);
@@ -529,6 +656,7 @@ export function PlayerPage({
       const nextPosition = Number.isFinite(nextState.position) ? Math.max(0, nextState.position ?? 0) : null;
       if (nextPaused && nextPosition !== null) {
         settleDanmakuClockAtPosition(nextPosition);
+        flushPlaybackProgress(nextPosition, nextState.duration ?? duration);
       }
       setPaused(nextPaused);
       setMpvState((current) => ({
@@ -542,7 +670,7 @@ export function PlayerPage({
       const message = caught instanceof Error ? caught.message : String(caught);
       onSnack(`播放控制失败：${message}`, "danger");
     }
-  }, [loadingSource, mpvState?.renderMode, onSnack, paused, playbackError, settleDanmakuClockAtPosition, source]);
+  }, [duration, flushPlaybackProgress, loadingSource, mpvState?.renderMode, onSnack, paused, playbackError, settleDanmakuClockAtPosition, source]);
 
   const flushPendingSeek = useCallback(async () => {
     if (!window.nexplay || seekInFlightRef.current) return;
@@ -741,69 +869,103 @@ export function PlayerPage({
     }
   }, [setVolume, volume]);
 
-  // Auto-hide the on-stage controls after the pointer goes idle while playing.
-  const keepControlsRef = useRef(false);
-  useEffect(() => {
-    keepControlsRef.current =
-      paused || loadingSource || Boolean(playbackError) || settingsMenuOpen || volumeOpen || episodeDrawerOpen;
-    if (keepControlsRef.current) {
-      setControlsVisible(true);
-      if (controlsIdleTimerRef.current !== null) {
-        window.clearTimeout(controlsIdleTimerRef.current);
-        controlsIdleTimerRef.current = null;
-      }
-    }
-  }, [paused, loadingSource, playbackError, settingsMenuOpen, volumeOpen, episodeDrawerOpen]);
+  const seekByKeyboard = useCallback((deltaSeconds: number) => {
+    const pendingPosition = pendingSeekPositionRef.current;
+    const basePosition = pendingPosition
+      ?? (seekingRef.current ? latestSeekPositionRef.current : null)
+      ?? scrubPosition
+      ?? position;
+    const limit = duration > 0 ? duration : Number.POSITIVE_INFINITY;
+    const nextPosition = Math.min(limit, Math.max(0, basePosition + deltaSeconds));
+    commitSeek(nextPosition);
+  }, [commitSeek, duration, position, scrubPosition]);
 
-  const revealControls = useCallback(() => {
-    setControlsVisible(true);
+  const adjustVolumeByKeyboard = useCallback((delta: number) => {
+    const nextVolume = Math.max(0, Math.min(100, latestVolumeRef.current + delta));
+    latestVolumeRef.current = nextVolume;
+    void setVolume(nextVolume);
+  }, [setVolume]);
+
+  // Auto-hide the on-stage controls after the pointer goes idle.
+  const keepControlsRef = useRef(false);
+  const clearControlsIdleTimer = useCallback(() => {
     if (controlsIdleTimerRef.current !== null) {
       window.clearTimeout(controlsIdleTimerRef.current);
+      controlsIdleTimerRef.current = null;
     }
+  }, []);
+
+  const scheduleControlsHide = useCallback(() => {
+    clearControlsIdleTimer();
     controlsIdleTimerRef.current = window.setTimeout(() => {
       controlsIdleTimerRef.current = null;
       if (keepControlsRef.current || pointerOverControlsRef.current) return;
       setControlsVisible(false);
-    }, 2600);
-  }, []);
+    }, CONTROLS_IDLE_HIDE_MS);
+  }, [clearControlsIdleTimer]);
+
+  useEffect(() => {
+    keepControlsRef.current =
+      loadingSource || Boolean(playbackError) || settingsMenuOpen || volumeOpen || episodeDrawerOpen;
+    if (keepControlsRef.current) {
+      setControlsVisible(true);
+      clearControlsIdleTimer();
+    } else {
+      scheduleControlsHide();
+    }
+  }, [clearControlsIdleTimer, loadingSource, playbackError, scheduleControlsHide, settingsMenuOpen, volumeOpen, episodeDrawerOpen]);
+
+  const revealControls = useCallback(() => {
+    setControlsVisible(true);
+    if (keepControlsRef.current) {
+      clearControlsIdleTimer();
+      return;
+    }
+    scheduleControlsHide();
+  }, [clearControlsIdleTimer, scheduleControlsHide]);
 
   useEffect(() => {
     return () => {
-      if (controlsIdleTimerRef.current !== null) {
-        window.clearTimeout(controlsIdleTimerRef.current);
-      }
+      clearControlsIdleTimer();
     };
-  }, []);
+  }, [clearControlsIdleTimer]);
 
   // Keyboard shortcuts: space play/pause, arrows seek/volume, F fullscreen, M mute, D danmaku.
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
-      if (isEditableTarget(event.target)) return;
+      if (isEditableTarget(event.target)) {
+        if (event.code === "Space" && event.target instanceof HTMLButtonElement) {
+          event.preventDefault();
+          event.stopPropagation();
+          event.target.blur();
+          void togglePause();
+        }
+        return;
+      }
       switch (event.code) {
         case "Space":
           event.preventDefault();
-          revealControls();
           void togglePause();
           break;
         case "ArrowLeft":
           event.preventDefault();
           revealControls();
-          commitSeek(Math.max(0, (scrubPosition ?? position) - 5));
+          seekByKeyboard(-KEYBOARD_SEEK_STEP_SECONDS);
           break;
         case "ArrowRight":
           event.preventDefault();
           revealControls();
-          commitSeek(Math.min(duration || Infinity, (scrubPosition ?? position) + 5));
+          seekByKeyboard(KEYBOARD_SEEK_STEP_SECONDS);
           break;
         case "ArrowUp":
           event.preventDefault();
           revealControls();
-          void setVolume(Math.min(100, volume + 5));
+          adjustVolumeByKeyboard(KEYBOARD_VOLUME_STEP);
           break;
         case "ArrowDown":
           event.preventDefault();
           revealControls();
-          void setVolume(Math.max(0, volume - 5));
+          adjustVolumeByKeyboard(-KEYBOARD_VOLUME_STEP);
           break;
         case "KeyF":
           event.preventDefault();
@@ -825,7 +987,7 @@ export function PlayerPage({
     };
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [commitSeek, duration, position, revealControls, scrubPosition, setVolume, toggleMute, togglePause, toggleStageFullscreen, volume]);
+  }, [adjustVolumeByKeyboard, revealControls, seekByKeyboard, toggleMute, togglePause, toggleStageFullscreen]);
 
   return (
     <div className="relative h-full overflow-hidden bg-[var(--color-bg)]">
@@ -875,10 +1037,14 @@ export function PlayerPage({
                     preload="auto"
                     onLoadedMetadata={(event) => {
                       const video = event.currentTarget;
+                      const resumePosition = source ? resumePositionFromSource(source) : 0;
+                      if (resumePosition > 1 && Number.isFinite(video.duration)) {
+                        video.currentTime = Math.min(resumePosition, Math.max(0, video.duration - 2));
+                      }
                       setMpvState((current) => current ? {
                         ...current,
                         duration: Number.isFinite(video.duration) ? video.duration : 0,
-                        position: video.currentTime || 0,
+                        position: video.currentTime || resumePosition,
                         paused: video.paused,
                         volume: Math.round(video.volume * 100),
                       } : current);
@@ -900,6 +1066,10 @@ export function PlayerPage({
                     }}
                     onPause={() => {
                       setPaused(true);
+                      const video = browserVideoRef.current;
+                      if (video) {
+                        flushPlaybackProgress(video.currentTime || 0, Number.isFinite(video.duration) ? video.duration : duration);
+                      }
                       setMpvState((current) => current ? { ...current, paused: true } : current);
                     }}
                     onError={(event) => {
@@ -975,6 +1145,14 @@ export function PlayerPage({
                   onClick={() => void togglePause()}
                   aria-label={paused ? "播放" : "暂停"}
                 />
+                {paused && !loadingSource && !playbackError && (
+                  <div className="player-paused-indicator" aria-hidden>
+                    <span>
+                      <Pause size={22} fill="currentColor" />
+                    </span>
+                    <strong>已暂停</strong>
+                  </div>
+                )}
               </div>
 
               {playbackError && !loadingSource && (
@@ -1003,6 +1181,7 @@ export function PlayerPage({
                 }}
                 onMouseLeave={() => {
                   pointerOverControlsRef.current = false;
+                  if (!keepControlsRef.current) scheduleControlsHide();
                 }}
               >
                 <div className="player-control-timeline">
@@ -1162,6 +1341,7 @@ export function PlayerPage({
                               allowOff
                               emptyLabel="无字幕"
                               onChange={(value) => void setTrack("subtitle", value)}
+                              onAddSubtitle={() => void addSubtitle()}
                             />
 
                             <div className="player-settings-section">
@@ -1450,6 +1630,48 @@ function canUseBrowserVideoSource(source: MediaSource) {
   return video.canPlayType(mime) !== "";
 }
 
+function resumePositionFromSource(source: MediaSource | null | undefined) {
+  const position = source?.playbackPosition;
+  const duration = source?.playbackDuration;
+  if (!Number.isFinite(position) || !Number.isFinite(duration) || !position || !duration) {
+    return 0;
+  }
+  if (duration <= 0 || position < 3 || position >= duration - 10) {
+    return 0;
+  }
+  return Math.max(0, position);
+}
+
+function subtitleMemoryKey(mediaId: number) {
+  return `nexplay.subtitle.${mediaId}`;
+}
+
+function readRememberedSubtitlePath(mediaId: number | undefined) {
+  if (!mediaId) return null;
+  try {
+    return window.localStorage.getItem(subtitleMemoryKey(mediaId));
+  } catch {
+    return null;
+  }
+}
+
+function rememberSubtitlePath(mediaId: number, path: string) {
+  try {
+    window.localStorage.setItem(subtitleMemoryKey(mediaId), path);
+  } catch {
+    // ignore storage failures
+  }
+}
+
+function forgetRememberedSubtitlePath(mediaId: number | undefined) {
+  if (!mediaId) return;
+  try {
+    window.localStorage.removeItem(subtitleMemoryKey(mediaId));
+  } catch {
+    // ignore storage failures
+  }
+}
+
 function formatTime(value: number) {
   if (!Number.isFinite(value) || value <= 0) {
     return "0:00";
@@ -1471,7 +1693,7 @@ function isEditableTarget(target: EventTarget | null) {
   if (target.isContentEditable) {
     return true;
   }
-  return ["INPUT", "TEXTAREA", "SELECT", "BUTTON"].includes(target.tagName);
+  return ["INPUT", "TEXTAREA", "SELECT"].includes(target.tagName);
 }
 
 function TrackOptionGroup({
@@ -1481,6 +1703,7 @@ function TrackOptionGroup({
   allowOff = false,
   emptyLabel,
   onChange,
+  onAddSubtitle,
 }: {
   label: string;
   value?: string;
@@ -1488,6 +1711,7 @@ function TrackOptionGroup({
   allowOff?: boolean;
   emptyLabel: string;
   onChange: (value: string) => void;
+  onAddSubtitle?: () => void;
 }) {
   const selected = tracks.find((track) => String(track.id) === value);
   const summary = selected
@@ -1505,6 +1729,16 @@ function TrackOptionGroup({
         <span>{summary}</span>
       </div>
       <div className="player-track-options">
+        {onAddSubtitle && (
+          <button
+            type="button"
+            className="player-track-option"
+            onClick={onAddSubtitle}
+          >
+            <FilePlus2 size={14} />
+            添加字幕
+          </button>
+        )}
         {allowOff && (
           <button
             type="button"

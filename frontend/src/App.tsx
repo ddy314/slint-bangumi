@@ -87,9 +87,52 @@ export default function App() {
     setViewStack((current) => current.length > 1 ? current.slice(0, -1) : current);
   }, []);
 
-  const replaceTop = useCallback((view: AppView) => {
-    setViewStack((current) => [...current.slice(0, -1), view]);
+  const mergeFreshSubject = useCallback((current: Subject, updated: Subject): Subject => ({
+    ...current,
+    ...updated,
+    summary: updated.summary || current.summary,
+    poster: updated.poster || current.poster,
+    hero: updated.hero || current.hero,
+    episodesDetail: updated.episodesDetail.length ? updated.episodesDetail : current.episodesDetail,
+  }), []);
+
+  const sameSubject = useCallback((left: Subject, right: Subject) => {
+    if (left.provider === right.provider && left.providerSubjectId && right.providerSubjectId) {
+      return left.providerSubjectId === right.providerSubjectId;
+    }
+    return left.id === right.id;
   }, []);
+
+  const refreshSubjectInStack = useCallback(async (baseSubject: Subject) => {
+    const next = await backend.refresh();
+    const candidates = [...next.subjects, ...next.bangumiCollections];
+    const updated = candidates.find((candidate) => sameSubject(candidate, baseSubject));
+    if (!updated) return;
+    setViewStack((current) => current.map((view) => {
+      if (view.kind === "detail" && sameSubject(view.subject, updated)) {
+        return { ...view, subject: mergeFreshSubject(view.subject, updated) };
+      }
+      if (view.kind === "playback" && sameSubject(view.playback.subject, updated)) {
+        return {
+          ...view,
+          playback: {
+            ...view.playback,
+            subject: mergeFreshSubject(view.playback.subject, updated),
+          },
+        };
+      }
+      if (view.kind === "resources" && view.prefill?.subject && sameSubject(view.prefill.subject, updated)) {
+        return {
+          ...view,
+          prefill: {
+            ...view.prefill,
+            subject: mergeFreshSubject(view.prefill.subject, updated),
+          },
+        };
+      }
+      return view;
+    }));
+  }, [backend, mergeFreshSubject, sameSubject]);
 
   useEffect(() => {
     window.localStorage.setItem("nexplay.theme", theme);
@@ -138,6 +181,7 @@ export default function App() {
                   subject={currentView.playback.subject}
                   initialEpisode={currentView.playback.episode}
                   onBack={goBack}
+                  onSubjectUpdated={refreshSubjectInStack}
                   onSnack={snack.show}
                 />
               ) : currentView.kind === "detail" ? (
@@ -147,20 +191,7 @@ export default function App() {
                   onPlay={(subject, episode) => setViewStack((current) => [...current, { kind: "playback", playback: { subject, episode } }])}
                   onFindResources={openResourceSearch}
                   onSubjectUpdated={async () => {
-                    const next = await backend.refresh();
-                    const candidates = [...next.subjects, ...next.bangumiCollections];
-                    const updated = candidates.find((subject) => subject.providerSubjectId === currentView.subject.providerSubjectId);
-                    if (updated) replaceTop({
-                      kind: "detail",
-                      subject: {
-                        ...currentView.subject,
-                        ...updated,
-                        summary: updated.summary || currentView.subject.summary,
-                        poster: updated.poster || currentView.subject.poster,
-                        hero: updated.hero || currentView.subject.hero,
-                        episodesDetail: updated.episodesDetail.length ? updated.episodesDetail : currentView.subject.episodesDetail,
-                      },
-                    });
+                    await refreshSubjectInStack(currentView.subject);
                   }}
                   onSnack={snack.show}
                 />

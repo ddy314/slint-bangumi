@@ -91,6 +91,7 @@ export function MpvWebglSurface({
     let inFlight = false;
     let lastSubmitAt = 0;
     let hasFrame = false;
+    let pausedFrameCaptured = false;
     let lastError = "";
     let adaptiveFrameInterval = 0;
     let observedGeneration = generationRef.current;
@@ -102,15 +103,17 @@ export function MpvWebglSurface({
       if (observedGeneration !== generationRef.current) {
         observedGeneration = generationRef.current;
         hasFrame = false;
+        pausedFrameCaptured = false;
         lastSubmitAt = 0;
       }
 
       const { fps: currentFps } = dimensionsRef.current;
       const targetFps = Math.max(1, Math.min(MAX_TEXTURE_RENDER_FPS, currentFps || 30));
       const frameInterval = 1000 / targetFps;
-      const fetchInterval = pausedRef.current ? 250 : Math.max(frameInterval, adaptiveFrameInterval);
+      const isPaused = pausedRef.current;
+      const fetchInterval = Math.max(frameInterval, adaptiveFrameInterval);
       const shouldFetch = activeRef.current && !inFlight && (
-        !hasFrame || now - lastSubmitAt >= fetchInterval
+        !hasFrame || (!isPaused && now - lastSubmitAt >= fetchInterval) || (isPaused && !pausedFrameCaptured)
       );
 
       const resized = resizeCanvasToDisplaySize(canvas);
@@ -128,6 +131,7 @@ export function MpvWebglSurface({
             uploadFrame(glState, frame);
             onFrameRef.current?.(frame);
             hasFrame = true;
+            pausedFrameCaptured = pausedRef.current;
             lastError = "";
           })
           .catch((caught) => {
@@ -143,6 +147,9 @@ export function MpvWebglSurface({
             adaptiveFrameInterval = adaptiveFrameInterval <= 0
               ? nextAdaptiveInterval
               : adaptiveFrameInterval * 0.82 + nextAdaptiveInterval * 0.18;
+            if (!pausedRef.current) {
+              pausedFrameCaptured = false;
+            }
             inFlight = false;
           });
       } else if (resized && hasFrame) {

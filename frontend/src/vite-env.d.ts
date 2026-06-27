@@ -12,6 +12,8 @@ interface Window {
     refreshSubjectMetadata: (payload: import("./generated/backend").RefreshSubjectRequest) => Promise<import("./data").Subject>;
     episodeResources: (payload: import("./generated/backend").EpisodeResourcesRequest) => Promise<import("./backend").EpisodeResources>;
     startResourceDownload: (payload: import("./generated/backend").StartResourceDownloadRequest) => Promise<import("./backend").DownloadTask>;
+    prepareResourceDownload: (payload: import("./generated/backend").PrepareResourceDownloadRequest) => Promise<import("./backend").PreparedResourceDownload>;
+    confirmResourceDownload: (payload: import("./generated/backend").ConfirmResourceDownloadRequest) => Promise<import("./backend").DownloadTask>;
     downloadTasks: () => Promise<import("./backend").DownloadTasks>;
     controlDownloadTask: (payload: import("./generated/backend").DownloadTaskActionRequest) => Promise<import("./backend").DownloadTasks>;
     bangumiAuthStatus: () => Promise<import("./backend").BangumiAuthStatus>;
@@ -30,6 +32,8 @@ interface Window {
     danmakuTrack: (mediaId: number) => Promise<import("./backend").DanmakuTrack>;
     mpvLoad: (mediaId: number) => Promise<import("./backend").MpvState>;
     mpvSetTrack: (kind: "audio" | "subtitle", id: number | null) => Promise<import("./backend").MpvState>;
+    mpvAddSubtitle: () => Promise<{ state: import("./backend").MpvState; path: string } | null>;
+    mpvAddSubtitlePath: (path: string) => Promise<{ state: import("./backend").MpvState; path: string }>;
     mpvSetPause: (paused: boolean) => Promise<import("./backend").MpvState>;
     mpvSeek: (position: number) => Promise<import("./backend").MpvState>;
     mpvSetVolume: (volume: number) => Promise<import("./backend").MpvState>;

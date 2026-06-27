@@ -7,16 +7,17 @@ use serde_json::Value;
 
 use crate::app::AppContext;
 use crate::backend_api::{
-    CatalogSearchRequest, DanmakuTrackRequest, DownloadTaskActionRequest, EpisodeResourcesRequest,
-    FrontendEditableSettings, MediaSourceRequest, OnlineSubjectRequest, OpenMediaRequest,
-    PlaybackProgressRequest, RefreshSubjectRequest, StartResourceDownloadRequest,
+    CatalogSearchRequest, ConfirmResourceDownloadRequest, DanmakuTrackRequest,
+    DownloadTaskActionRequest, EpisodeResourcesRequest, FrontendEditableSettings,
+    MediaSourceRequest, OnlineSubjectRequest, OpenMediaRequest, PlaybackProgressRequest,
+    PrepareResourceDownloadRequest, RefreshSubjectRequest, StartResourceDownloadRequest,
     bangumi_auth_status, batch_update_bangumi_episodes, complete_bangumi_oauth,
-    control_download_task, danmaku_track, download_tasks, episode_resources,
-    frontend_event_from_app, logout_bangumi, media_source, online_subject, open_media,
-    refresh_subject_metadata, report_playback_progress, save_settings_config, scan, search_catalog,
-    settings_config, snapshot, start_bangumi_login, start_resource_download, sync_bangumi_now,
-    sync_bangumi_subject, test_qbittorrent_connection, update_bangumi_collection,
-    update_bangumi_episode,
+    confirm_resource_download, control_download_task, danmaku_track, download_tasks,
+    episode_resources, frontend_event_from_app, logout_bangumi, media_source, online_subject,
+    open_media, prepare_resource_download, refresh_subject_metadata, report_playback_progress,
+    save_settings_config, scan, search_catalog, settings_config, snapshot, start_bangumi_login,
+    start_resource_download, sync_bangumi_now, sync_bangumi_subject, test_qbittorrent_connection,
+    update_bangumi_collection, update_bangumi_episode,
 };
 use crate::error::{AppError, AppResult, io_error};
 use crate::service::{
@@ -167,6 +168,14 @@ fn dispatch(context: &AppContext, method: &str, params: Option<Value>) -> AppRes
         "startResourceDownload" => {
             let input: StartResourceDownloadRequest = from_params(params)?;
             to_value(start_resource_download(context, input)?)
+        }
+        "prepareResourceDownload" => {
+            let input: PrepareResourceDownloadRequest = from_params(params)?;
+            to_value(prepare_resource_download(context, input)?)
+        }
+        "confirmResourceDownload" => {
+            let input: ConfirmResourceDownloadRequest = from_params(params)?;
+            to_value(confirm_resource_download(context, input)?)
         }
         "downloadTasks" => to_value(download_tasks(context)?),
         "controlDownloadTask" => {

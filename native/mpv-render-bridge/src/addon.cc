@@ -467,6 +467,33 @@ napi_value SetTrack(napi_env env, napi_callback_info info) {
   return PlayerState(env);
 }
 
+napi_value AddSubtitle(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value args[1];
+  napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+  if (argc < 1) {
+    return ErrorObject(env, "addSubtitle", "path is required");
+  }
+
+  std::string error;
+  if (!EnsurePlayer(error)) {
+    return ErrorObject(env, "ensurePlayer", error);
+  }
+  if (!g_player->loaded) {
+    return ErrorObject(env, "addSubtitle", "no media loaded");
+  }
+
+  const std::string path = GetStringArg(env, args[0]);
+  if (path.empty()) {
+    return ErrorObject(env, "addSubtitle", "path is empty");
+  }
+  if (!Command(*g_player, {"sub-add", path, "select"}, error)) {
+    return ErrorObject(env, "sub-add", error);
+  }
+  std::this_thread::sleep_for(std::chrono::milliseconds(120));
+  return PlayerState(env);
+}
+
 napi_value Seek(napi_env env, napi_callback_info info) {
   size_t argc = 1;
   napi_value args[1];
@@ -581,13 +608,14 @@ napi_value Init(napi_env env, napi_value exports) {
     {"stop", nullptr, Stop, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"setPause", nullptr, SetPause, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"setTrack", nullptr, SetTrack, nullptr, nullptr, nullptr, napi_default, nullptr},
+    {"addSubtitle", nullptr, AddSubtitle, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"seek", nullptr, Seek, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"setVolume", nullptr, SetVolume, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"getState", nullptr, GetState, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"renderFrame", nullptr, RenderFrame, nullptr, nullptr, nullptr, napi_default, nullptr},
     {"shutdown", nullptr, Shutdown, nullptr, nullptr, nullptr, napi_default, nullptr},
   };
-  napi_define_properties(env, exports, 12, descriptors);
+  napi_define_properties(env, exports, 13, descriptors);
   return exports;
 }
 

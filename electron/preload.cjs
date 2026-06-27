@@ -111,6 +111,11 @@ async function loadMpvMedia(mediaId) {
   };
 }
 
+async function addSubtitleToMpv(path) {
+  const state = await controlMpv({ type: "addSubtitle", path });
+  return { state, path };
+}
+
 async function controlMpv(command) {
   if (activeMpvMode !== "webglTexture") {
     throw embeddedMpvUnavailableError(activeTextureProbe?.error);
@@ -138,6 +143,8 @@ contextBridge.exposeInMainWorld("nexplay", {
   refreshSubjectMetadata: (payload) => ipcRenderer.invoke("backend:refresh-subject-metadata", payload),
   episodeResources: (payload) => ipcRenderer.invoke("backend:episode-resources", payload),
   startResourceDownload: (payload) => ipcRenderer.invoke("backend:start-resource-download", payload),
+  prepareResourceDownload: (payload) => ipcRenderer.invoke("backend:prepare-resource-download", payload),
+  confirmResourceDownload: (payload) => ipcRenderer.invoke("backend:confirm-resource-download", payload),
   downloadTasks: () => ipcRenderer.invoke("backend:download-tasks"),
   controlDownloadTask: (payload) => ipcRenderer.invoke("backend:control-download-task", payload),
   bangumiAuthStatus: () => ipcRenderer.invoke("backend:bangumi-auth-status"),
@@ -159,6 +166,14 @@ contextBridge.exposeInMainWorld("nexplay", {
   danmakuTrack: (mediaId) => ipcRenderer.invoke("backend:danmaku-track", mediaId),
   mpvLoad: (mediaId) => loadMpvMedia(mediaId),
   mpvSetTrack: (kind, id) => controlMpv({ type: "setTrack", kind, id }),
+  mpvAddSubtitle: async () => {
+    const path = await ipcRenderer.invoke("dialog:select-subtitle");
+    if (!path) {
+      return null;
+    }
+    return addSubtitleToMpv(path);
+  },
+  mpvAddSubtitlePath: (path) => addSubtitleToMpv(path),
   mpvSetPause: (paused) => controlMpv({ type: "setPause", paused }),
   mpvSeek: (position) => controlMpv({ type: "seek", position }),
   mpvSetVolume: (volume) => controlMpv({ type: "setVolume", volume }),

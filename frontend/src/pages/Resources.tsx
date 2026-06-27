@@ -1,7 +1,15 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { motion } from "framer-motion";
-import { ArrowLeft, Download, Loader2, Search, ShieldCheck } from "lucide-react";
-import { searchEpisodeResources, startResourceDownload, type EpisodeResource } from "../backend";
+import { ArrowLeft, Check, Download, File, Loader2, Search, ShieldCheck, X } from "lucide-react";
+import {
+  confirmResourceDownload,
+  controlDownloadTask,
+  prepareResourceDownload,
+  searchEpisodeResources,
+  type DownloadTask,
+  type EpisodeResource,
+  type TorrentFile,
+} from "../backend";
 import type { Subject } from "../data";
 import { appleSpringBouncy, appleSpringSoft } from "../motion";
 import { Dropdown } from "../ui";
@@ -22,6 +30,16 @@ export type ResourceSearchPrefill = {
 type ResourceSort = "score" | "seeders" | "downloads" | "date" | "size";
 type ResolutionFilter = "all" | "2160p" | "1440p" | "1080p" | "720p";
 type BatchFilter = "all" | "batch" | "single";
+type DownloadPickerState = {
+  resource: EpisodeResource;
+  task: DownloadTask | null;
+  files: TorrentFile[];
+  selected: Set<number>;
+  loading: boolean;
+  confirming: boolean;
+  closing: boolean;
+  error: string | null;
+};
 
 export function ResourcesPage({
   prefill,
@@ -41,6 +59,7 @@ export function ResourcesPage({
   const [sort, setSort] = useState<ResourceSort>("score");
   const [resolution, setResolution] = useState<ResolutionFilter>("all");
   const [batchFilter, setBatchFilter] = useState<BatchFilter>("all");
+  const [downloadPicker, setDownloadPicker] = useState<DownloadPickerState | null>(null);
   const searchRequestIdRef = useRef(0);
 
   const keywordOptions = useMemo(() => {
@@ -110,26 +129,104 @@ export function ResourcesPage({
     .filter((resource) => batchFilter === "all" || (batchFilter === "batch" ? resource.batch : !resource.batch))
     .sort(resourceSorter(sort)), [batchFilter, resources, resolution, sort]);
 
-  const downloadResource = useCallback(async (resource: EpisodeResource) => {
+  const openDownloadPicker = useCallback(async (resource: EpisodeResource) => {
     setDownloadingId(resource.id);
+    setDownloadPicker({
+      resource,
+      task: null,
+      files: [],
+      selected: new Set(),
+      loading: true,
+      confirming: false,
+      closing: false,
+      error: null,
+    });
     try {
-      const task = await startResourceDownload({
+      const prepared = await prepareResourceDownload({
         resource,
         subjectProvider: context?.provider || "manual",
         providerSubjectId: context?.providerSubjectId || searchTitle,
       });
-      if (task.status === "failed") {
-        onSnack(`添加下载失败：${task.error || "qBittorrent 返回失败"}`, "danger");
-      } else {
-        onSnack("已添加到 qBittorrent 下载队列。", "success");
-      }
+      setDownloadPicker({
+        resource,
+        task: prepared.task,
+        files: prepared.files,
+        selected: new Set(prepared.files.map((file) => file.index)),
+        loading: false,
+        confirming: false,
+        closing: false,
+        error: prepared.files.length ? null : "qBittorrent 没有返回文件列表。",
+      });
     } catch (caught) {
       const message = caught instanceof Error ? caught.message : String(caught);
-      onSnack(`添加下载失败：${message}`, "danger");
+      setDownloadPicker((current) => current && current.resource.id === resource.id
+        ? { ...current, loading: false, error: message }
+        : current);
+      onSnack(`读取种子文件失败：${message}`, "danger");
     } finally {
       setDownloadingId(null);
     }
   }, [context, onSnack, searchTitle]);
+
+  const closeDownloadPicker = useCallback(async () => {
+    const taskId = downloadPicker?.task?.id;
+    setDownloadPicker((current) => current ? { ...current, closing: true } : current);
+    try {
+      if (taskId) {
+        await controlDownloadTask({ taskId, action: "cancel", deleteFiles: false });
+      }
+    } catch (caught) {
+      const message = caught instanceof Error ? caught.message : String(caught);
+      onSnack(`取消下载任务失败：${message}`, "danger");
+    } finally {
+      setDownloadPicker(null);
+    }
+  }, [downloadPicker?.task?.id, onSnack]);
+
+  const confirmDownloadPicker = useCallback(async () => {
+    if (!downloadPicker?.task) return;
+    const selectedFileIndexes = Array.from(downloadPicker.selected).sort((left, right) => left - right);
+    if (!selectedFileIndexes.length) {
+      setDownloadPicker((current) => current ? { ...current, error: "至少选择一个文件。" } : current);
+      return;
+    }
+    setDownloadPicker((current) => current ? { ...current, confirming: true, error: null } : current);
+    try {
+      const task = await confirmResourceDownload({
+        taskId: downloadPicker.task.id,
+        selectedFileIndexes,
+      });
+      if (task.status === "failed") {
+        onSnack(`添加下载失败：${task.error || "qBittorrent 返回失败"}`, "danger");
+      } else {
+        onSnack(`已添加 ${selectedFileIndexes.length} 个文件到 qBittorrent 下载队列。`, "success");
+      }
+      setDownloadPicker(null);
+    } catch (caught) {
+      const message = caught instanceof Error ? caught.message : String(caught);
+      onSnack(`添加下载失败：${message}`, "danger");
+      setDownloadPicker((current) => current ? { ...current, confirming: false, error: message } : current);
+    }
+  }, [downloadPicker, onSnack]);
+
+  const toggleDownloadFile = useCallback((index: number) => {
+    setDownloadPicker((current) => {
+      if (!current) return current;
+      const selected = new Set(current.selected);
+      if (selected.has(index)) {
+        selected.delete(index);
+      } else {
+        selected.add(index);
+      }
+      return { ...current, selected, error: null };
+    });
+  }, []);
+
+  const selectAllDownloadFiles = useCallback((checked: boolean) => {
+    setDownloadPicker((current) => current
+      ? { ...current, selected: checked ? new Set(current.files.map((file) => file.index)) : new Set(), error: null }
+      : current);
+  }, []);
 
   const subtitle = loading ? "正在搜索 Nyaa RSS" : `${visibleResources.length}/${resources.length} 个资源`;
 
@@ -280,7 +377,7 @@ export function ResourcesPage({
               resource={resource}
               downloading={downloadingId === resource.id}
               disabled={downloadingId !== null}
-              onDownload={() => void downloadResource(resource)}
+              onDownload={() => void openDownloadPicker(resource)}
             />
           ))}
           {!loading && !error && visibleResources.length === 0 && (
@@ -290,6 +387,15 @@ export function ResourcesPage({
           )}
         </div>
       </motion.div>
+      {downloadPicker && (
+        <DownloadFilePicker
+          state={downloadPicker}
+          onClose={() => void closeDownloadPicker()}
+          onConfirm={() => void confirmDownloadPicker()}
+          onToggleFile={toggleDownloadFile}
+          onSelectAll={selectAllDownloadFiles}
+        />
+      )}
     </div>
   );
 }
@@ -363,6 +469,129 @@ function Badge({
   return <span className={`inline-flex items-center gap-1 rounded-full px-2 py-[2px] ${toneClass}`}>{children}</span>;
 }
 
+function DownloadFilePicker({
+  state,
+  onClose,
+  onConfirm,
+  onToggleFile,
+  onSelectAll,
+}: {
+  state: DownloadPickerState;
+  onClose: () => void;
+  onConfirm: () => void;
+  onToggleFile: (index: number) => void;
+  onSelectAll: (checked: boolean) => void;
+}) {
+  const selectedCount = state.selected.size;
+  const selectedSize = state.files
+    .filter((file) => state.selected.has(file.index))
+    .reduce((total, file) => total + file.size, 0);
+  const allSelected = state.files.length > 0 && selectedCount === state.files.length;
+  const busy = state.loading || state.confirming || state.closing;
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/35 px-5 py-6 backdrop-blur-sm">
+      <motion.div
+        className="flex max-h-[86vh] w-full max-w-[760px] flex-col overflow-hidden rounded-[20px] bg-[var(--color-surface)] shadow-2xl ring-1 ring-black/10"
+        initial={{ opacity: 0, y: 10, scale: 0.98 }}
+        animate={{ opacity: 1, y: 0, scale: 1 }}
+        transition={appleSpringSoft}
+      >
+        <div className="flex items-start justify-between gap-4 border-b border-black/10 px-5 py-4">
+          <div className="min-w-0">
+            <div className="text-[18px] font-bold text-[var(--color-text-primary)]">选择下载文件</div>
+            <div className="mt-1 line-clamp-2 text-[12px] font-medium text-[var(--color-text-secondary)]">
+              {state.resource.title}
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={onClose}
+            disabled={busy}
+            className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-black/[0.055] text-[var(--color-text-secondary)] disabled:opacity-50"
+          >
+            {state.closing ? <Loader2 size={16} className="animate-spin" /> : <X size={17} />}
+          </button>
+        </div>
+
+        <div className="flex items-center justify-between gap-3 border-b border-black/10 px-5 py-3">
+          <label className="flex min-w-0 items-center gap-3 text-[12px] font-semibold text-[var(--color-text-primary)]">
+            <input
+              type="checkbox"
+              checked={allSelected}
+              disabled={busy || state.files.length === 0}
+              onChange={(event) => onSelectAll(event.target.checked)}
+              className="h-4 w-4 accent-[var(--color-primary)]"
+            />
+            全选
+          </label>
+          <div className="shrink-0 text-[12px] font-semibold text-[var(--color-text-tertiary)]">
+            {selectedCount}/{state.files.length} · {formatBytes(selectedSize)}
+          </div>
+        </div>
+
+        <div className="min-h-[260px] flex-1 overflow-y-auto px-3 py-2">
+          {state.loading && (
+            <div className="flex h-[260px] items-center justify-center gap-2 text-[13px] font-semibold text-[var(--color-text-secondary)]">
+              <Loader2 size={17} className="animate-spin" />
+              正在读取种子文件
+            </div>
+          )}
+          {!state.loading && state.files.map((file) => (
+            <button
+              key={file.index}
+              type="button"
+              onClick={() => onToggleFile(file.index)}
+              disabled={busy}
+              className="grid w-full grid-cols-[24px_minmax(0,1fr)_auto] items-center gap-3 rounded-[12px] px-3 py-2.5 text-left transition-colors hover:bg-black/[0.045] disabled:opacity-60"
+            >
+              <span className={`flex h-5 w-5 items-center justify-center rounded border text-white ${state.selected.has(file.index) ? "border-[var(--color-primary)] bg-[var(--color-primary)]" : "border-black/20 bg-transparent"}`}>
+                {state.selected.has(file.index) && <Check size={14} strokeWidth={2.4} />}
+              </span>
+              <span className="flex min-w-0 items-center gap-2">
+                <File size={15} className="shrink-0 text-[var(--color-text-tertiary)]" />
+                <span className="min-w-0 truncate text-[13px] font-semibold text-[var(--color-text-primary)]">{file.name}</span>
+              </span>
+              <span className="text-[12px] font-semibold text-[var(--color-text-tertiary)]">{formatBytes(file.size)}</span>
+            </button>
+          ))}
+          {!state.loading && !state.files.length && (
+            <div className="flex h-[260px] items-center justify-center text-[13px] font-semibold text-[var(--color-text-tertiary)]">
+              没有可选择的文件
+            </div>
+          )}
+        </div>
+
+        {state.error && (
+          <div className="mx-5 mb-3 rounded-[12px] bg-rose-500/8 px-3 py-2 text-[12px] font-semibold text-rose-600">
+            {state.error}
+          </div>
+        )}
+
+        <div className="flex justify-end gap-2 border-t border-black/10 px-5 py-4">
+          <button
+            type="button"
+            onClick={onClose}
+            disabled={busy}
+            className="flex h-10 items-center justify-center rounded-full bg-black/[0.055] px-4 text-[13px] font-semibold text-[var(--color-text-primary)] disabled:opacity-50"
+          >
+            取消
+          </button>
+          <button
+            type="button"
+            onClick={onConfirm}
+            disabled={busy || selectedCount === 0}
+            className="flex h-10 items-center justify-center gap-2 rounded-full bg-[var(--color-primary)] px-5 text-[13px] font-semibold text-white disabled:opacity-55"
+          >
+            {state.confirming ? <Loader2 size={16} className="animate-spin" /> : <Download size={16} />}
+            开始下载
+          </button>
+        </div>
+      </motion.div>
+    </div>
+  );
+}
+
 function resourceSorter(sort: ResourceSort) {
   return (left: EpisodeResource, right: EpisodeResource) => {
     if (sort === "seeders") return right.seeders - left.seeders || right.score - left.score;
@@ -389,6 +618,18 @@ function parseSize(value: string) {
     tib: 1024 ** 4,
   };
   return amount * (multipliers[unit] || 1);
+}
+
+function formatBytes(value: number) {
+  if (!Number.isFinite(value) || value <= 0) return "0 B";
+  const units = ["B", "KiB", "MiB", "GiB", "TiB"];
+  let size = value;
+  let index = 0;
+  while (size >= 1024 && index < units.length - 1) {
+    size /= 1024;
+    index += 1;
+  }
+  return `${size >= 10 || index === 0 ? size.toFixed(0) : size.toFixed(1)} ${units[index]}`;
 }
 
 function normalizeOption(value: string) {
