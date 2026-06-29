@@ -2,7 +2,26 @@
   "name": "nexplay",
   "version": "0.1.0",
   "private": true,
-  "description": "NexPlay local anime media library",
+  "description": "Desktop anime media library with local playback, Bangumi metadata, danmaku, and download integration.",
+  "license": "MIT",
+  "homepage": "https://github.com/ddy314/NexPlay#readme",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ddy314/NexPlay.git"
+  },
+  "bugs": {
+    "url": "https://github.com/ddy314/NexPlay/issues"
+  },
+  "keywords": [
+    "anime",
+    "bangumi",
+    "danmaku",
+    "electron",
+    "media-library",
+    "mpv",
+    "react",
+    "rust"
+  ],
   "type": "module",
   "main": "electron/main.cjs",
   "scripts": {

@@ -112,6 +112,12 @@
   outline: none !important;
 }
 
+button,
+[role="button"] {
+  -webkit-tap-highlight-color: transparent;
+  user-select: none;
+}
+
 html,
 body,
 #root {
@@ -179,6 +185,9 @@ body {
 
 .media-card {
   opacity: 0;
+  display: block;
+  align-self: start;
+  width: 100%;
   contain: layout paint style;
   animation: media-card-enter 180ms ease-out var(--media-card-enter-delay, 0ms) both;
 }
@@ -645,6 +654,13 @@ body {
     inset 0 0 0 1px rgba(255, 255, 255, 0.08);
 }
 
+.player-watch-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(300px, 352px);
+  gap: 18px;
+  min-height: 0;
+}
+
 .player-stage:fullscreen {
   width: 100vw;
   height: 100vh;
@@ -660,6 +676,11 @@ body {
   left: 24px;
   right: 24px;
   bottom: 24px;
+}
+
+.player-stage:fullscreen .player-episode-popover {
+  width: min(430px, calc(100vw - 48px));
+  max-height: min(58vh, 560px);
 }
 
 .player-stage:fullscreen .player-pill {
@@ -963,6 +984,16 @@ body {
   -webkit-backdrop-filter: blur(30px) saturate(160%);
 }
 
+.player-episode-popover {
+  position: absolute;
+  right: 0;
+  bottom: calc(100% + 14px);
+  z-index: 37;
+  width: min(420px, calc(100vw - 64px));
+  max-height: min(62vh, 560px);
+  transform-origin: bottom right;
+}
+
 .player-settings-section + .player-settings-section {
   margin-top: 14px;
   padding-top: 14px;
@@ -1193,11 +1224,33 @@ body {
   mask-image: linear-gradient(90deg, transparent, #000 7%, #000 93%, transparent);
 }
 
-.player-episode-overlay {
-  isolation: isolate;
+.player-episode-panel {
+  display: flex;
+  min-height: 0;
+  flex-direction: column;
+  color: var(--color-text-primary);
 }
 
-.player-episode-rail {
+.player-episode-panel.is-sidebar {
+  height: 100%;
+  min-height: 0;
+  border-radius: 24px;
+  padding: 18px;
+  background: var(--color-surface-1);
+  box-shadow:
+    inset 0 0 0 0.5px var(--color-outline-soft),
+    0 20px 60px rgba(0, 0, 0, 0.12);
+}
+
+.player-episode-panel.is-overlay {
+  max-height: inherit;
+  padding: 18px;
+  border-radius: 22px;
+  color: #fff;
+  background: rgba(18, 18, 20, 0.9);
+  box-shadow:
+    inset 0 0 0 0.5px rgba(255, 255, 255, 0.13),
+    0 22px 64px rgba(0, 0, 0, 0.34);
   backdrop-filter: blur(34px) saturate(160%);
   -webkit-backdrop-filter: blur(34px) saturate(160%);
 }
@@ -1209,6 +1262,10 @@ body {
   padding: 4px;
   border-radius: 999px;
   background: rgba(0, 0, 0, 0.045);
+}
+
+.player-episode-panel.is-overlay .player-episode-filter {
+  background: rgba(255, 255, 255, 0.08);
 }
 
 .player-episode-filter button {
@@ -1228,8 +1285,27 @@ body {
   background: var(--color-surface-1);
 }
 
+.player-episode-panel.is-overlay .player-episode-filter button {
+  color: rgba(255, 255, 255, 0.62);
+}
+
+.player-episode-panel.is-overlay .player-episode-filter button:hover,
+.player-episode-panel.is-overlay .player-episode-filter button.is-selected {
+  color: #fff;
+  background: rgba(255, 255, 255, 0.16);
+}
+
 .player-episode-row.is-selected {
+  background: var(--color-primary-soft);
   box-shadow: inset 0 0 0 1px rgba(0, 122, 255, 0.22);
+}
+
+.player-episode-panel.is-overlay .player-episode-row.is-selected {
+  background: rgba(10, 132, 255, 0.18);
+}
+
+.player-episode-panel.is-overlay .player-episode-row:hover {
+  background: rgba(255, 255, 255, 0.09);
 }
 
 .player-episode-list::-webkit-scrollbar {
@@ -1242,6 +1318,14 @@ body {
 }
 
 @media (max-width: 900px) {
+  .player-watch-layout {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .player-episode-panel.is-sidebar {
+    display: none;
+  }
+
   .nexplay-control-bar {
     left: 12px;
     right: 12px;
@@ -1288,6 +1372,11 @@ body {
 
   .player-settings-popover {
     right: -52px;
+  }
+
+  .player-episode-popover {
+    right: -76px;
+    width: min(360px, calc(100vw - 28px));
   }
 }
 

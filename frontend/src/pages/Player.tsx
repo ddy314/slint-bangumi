@@ -17,7 +17,6 @@ import {
   SkipForward,
   Volume2,
   VolumeX,
-  X,
 } from "lucide-react";
 import { makePlaybackEpisodes, type PlaybackEpisode, type Subject } from "../data";
 import { DanmakuOverlay } from "../DanmakuOverlay";
@@ -94,7 +93,7 @@ export function PlayerPage({
   const [loadingSource, setLoadingSource] = useState(true);
   const [danmakuVisible, setDanmakuVisible] = useState(() => readDanmakuPref(subject.id));
   const [danmakuArea, setDanmakuArea] = useState<(typeof DANMAKU_AREAS)[number]["value"]>(0.5);
-  const [episodeDrawerOpen, setEpisodeDrawerOpen] = useState(false);
+  const [episodePanelOpen, setEpisodePanelOpen] = useState(false);
   const [settingsMenuOpen, setSettingsMenuOpen] = useState(false);
   const [volumeOpen, setVolumeOpen] = useState(false);
   const [controlsVisible, setControlsVisible] = useState(true);
@@ -554,37 +553,21 @@ export function PlayerPage({
     };
   }, [settingsMenuOpen]);
 
-  useEffect(() => {
-    if (!volumeOpen) return;
-    const handlePointerDown = (event: PointerEvent) => {
-      const menu = volumeMenuRef.current;
-      if (!menu || !(event.target instanceof Node) || menu.contains(event.target)) return;
-      setVolumeOpen(false);
-    };
-    const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") setVolumeOpen(false);
-    };
-    window.addEventListener("pointerdown", handlePointerDown, true);
-    window.addEventListener("keydown", handleKeyDown);
-    return () => {
-      window.removeEventListener("pointerdown", handlePointerDown, true);
-      window.removeEventListener("keydown", handleKeyDown);
-    };
-  }, [volumeOpen]);
-
   const switchEpisode = useCallback((episode: PlaybackEpisode | undefined) => {
     if (!episode?.mediaId) {
       return;
     }
     flushPlaybackProgress();
     setSettingsMenuOpen(false);
+    setEpisodePanelOpen(false);
     setPlaybackError(null);
     setCurrentKey(episode.key);
   }, [flushPlaybackProgress]);
 
-  const openEpisodeDrawer = useCallback(() => {
+  const toggleEpisodePanel = useCallback(() => {
     setSettingsMenuOpen(false);
-    setEpisodeDrawerOpen(true);
+    setVolumeOpen(false);
+    setEpisodePanelOpen((current) => !current);
   }, []);
 
   const setTrack = useCallback(async (kind: "audio" | "subtitle", value: string) => {
@@ -900,20 +883,23 @@ export function PlayerPage({
     controlsIdleTimerRef.current = window.setTimeout(() => {
       controlsIdleTimerRef.current = null;
       if (keepControlsRef.current || pointerOverControlsRef.current) return;
+      setSettingsMenuOpen(false);
+      setVolumeOpen(false);
+      setEpisodePanelOpen(false);
       setControlsVisible(false);
     }, CONTROLS_IDLE_HIDE_MS);
   }, [clearControlsIdleTimer]);
 
   useEffect(() => {
     keepControlsRef.current =
-      loadingSource || Boolean(playbackError) || settingsMenuOpen || volumeOpen || episodeDrawerOpen;
+      loadingSource || Boolean(playbackError);
     if (keepControlsRef.current) {
       setControlsVisible(true);
       clearControlsIdleTimer();
     } else {
       scheduleControlsHide();
     }
-  }, [clearControlsIdleTimer, loadingSource, playbackError, scheduleControlsHide, settingsMenuOpen, volumeOpen, episodeDrawerOpen]);
+  }, [clearControlsIdleTimer, loadingSource, playbackError, scheduleControlsHide]);
 
   const revealControls = useCallback(() => {
     setControlsVisible(true);
@@ -933,6 +919,7 @@ export function PlayerPage({
   // Keyboard shortcuts: space play/pause, arrows seek/volume, F fullscreen, M mute, D danmaku.
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
+      blurActiveNonTextControl();
       if (isEditableTarget(event.target)) {
         if (event.code === "Space" && event.target instanceof HTMLButtonElement) {
           event.preventDefault();
@@ -949,22 +936,18 @@ export function PlayerPage({
           break;
         case "ArrowLeft":
           event.preventDefault();
-          revealControls();
           seekByKeyboard(-KEYBOARD_SEEK_STEP_SECONDS);
           break;
         case "ArrowRight":
           event.preventDefault();
-          revealControls();
           seekByKeyboard(KEYBOARD_SEEK_STEP_SECONDS);
           break;
         case "ArrowUp":
           event.preventDefault();
-          revealControls();
           adjustVolumeByKeyboard(KEYBOARD_VOLUME_STEP);
           break;
         case "ArrowDown":
           event.preventDefault();
-          revealControls();
           adjustVolumeByKeyboard(-KEYBOARD_VOLUME_STEP);
           break;
         case "KeyF":
@@ -1014,17 +997,18 @@ export function PlayerPage({
           </header>
 
           <div className="grid min-h-0 flex-1 grid-rows-[minmax(0,1fr)_auto]">
-            <div
-              ref={stageRef}
-              className={cn(
-                "player-stage relative min-h-0 overflow-hidden rounded-[28px]",
-                !controlsVisible && "cursor-none"
-              )}
-              onMouseMove={revealControls}
-              onMouseLeave={() => {
-                if (!keepControlsRef.current) setControlsVisible(false);
-              }}
-            >
+            <div className="player-watch-layout min-h-0">
+              <div
+                ref={stageRef}
+                className={cn(
+                  "player-stage relative min-h-0 overflow-hidden rounded-[28px]",
+                  !controlsVisible && "cursor-none"
+                )}
+                onMouseMove={revealControls}
+                onMouseLeave={() => {
+                  if (!keepControlsRef.current) setControlsVisible(false);
+                }}
+              >
               <div className="absolute inset-0 bg-black" />
               <div className="player-video-layer absolute inset-0 overflow-hidden rounded-[28px] bg-black">
                 {browserVideoReady ? (
@@ -1250,12 +1234,23 @@ export function PlayerPage({
                   </div>
 
                   <div className="player-secondary-actions">
-                    <div className={cn("player-volume-menu", playbackControlsDisabled && "is-disabled")} ref={volumeMenuRef}>
+                    <div
+                      className={cn("player-volume-menu", playbackControlsDisabled && "is-disabled")}
+                      ref={volumeMenuRef}
+                      onMouseEnter={() => {
+                        if (!playbackControlsDisabled) {
+                          setSettingsMenuOpen(false);
+                          setEpisodePanelOpen(false);
+                          setVolumeOpen(true);
+                        }
+                      }}
+                      onMouseLeave={() => setVolumeOpen(false)}
+                    >
                       <button
                         type="button"
                         className={cn("player-icon-control", volumeOpen && "is-active")}
                         disabled={playbackControlsDisabled}
-                        onClick={() => setVolumeOpen((current) => !current)}
+                        onClick={toggleMute}
                         aria-label={`音量 ${volume}%`}
                         aria-expanded={volumeOpen}
                         title={`音量 ${volume}%`}
@@ -1291,9 +1286,10 @@ export function PlayerPage({
 
                     <button
                       type="button"
-                      className="player-icon-control player-episode-control"
-                      onClick={openEpisodeDrawer}
+                      className={cn("player-icon-control player-episode-control", episodePanelOpen && "is-active")}
+                      onClick={toggleEpisodePanel}
                       aria-label="选集"
+                      aria-expanded={episodePanelOpen}
                       title="选集"
                     >
                       <ListVideo size={17} />
@@ -1304,7 +1300,11 @@ export function PlayerPage({
                       <button
                         type="button"
                         className={cn("player-icon-control", settingsMenuOpen && "is-active")}
-                        onClick={() => setSettingsMenuOpen((current) => !current)}
+                        onClick={() => {
+                          setVolumeOpen(false);
+                          setEpisodePanelOpen(false);
+                          setSettingsMenuOpen((current) => !current);
+                        }}
                         aria-label="播放设置"
                         aria-expanded={settingsMenuOpen}
                         title="播放设置"
@@ -1378,7 +1378,36 @@ export function PlayerPage({
                     </button>
                   </div>
                 </div>
+
+                <AnimatePresence>
+                  {episodePanelOpen && (
+                    <motion.div
+                      className="player-episode-popover"
+                      initial={{ opacity: 0, y: 12, scale: 0.98 }}
+                      animate={{ opacity: 1, y: 0, scale: 1 }}
+                      exit={{ opacity: 0, y: 8, scale: 0.98 }}
+                      transition={appleSpringSoft}
+                    >
+                      <EpisodeListPanel
+                        episodes={episodes}
+                        playableCount={playableEpisodes.length}
+                        currentKey={currentEpisode.key}
+                        variant="overlay"
+                        onSelect={switchEpisode}
+                      />
+                    </motion.div>
+                  )}
+                </AnimatePresence>
               </div>
+              </div>
+
+              <EpisodeListPanel
+                episodes={episodes}
+                playableCount={playableEpisodes.length}
+                currentKey={currentEpisode.key}
+                variant="sidebar"
+                onSelect={switchEpisode}
+              />
             </div>
 
             <div
@@ -1407,35 +1436,22 @@ export function PlayerPage({
           </div>
         </section>
 
-        <EpisodeRail
-          open={episodeDrawerOpen}
-          episodes={episodes}
-          playableCount={playableEpisodes.length}
-          currentKey={currentEpisode.key}
-          onClose={() => setEpisodeDrawerOpen(false)}
-          onSelect={(episode) => {
-            switchEpisode(episode);
-            setEpisodeDrawerOpen(false);
-          }}
-        />
       </div>
     </div>
   );
 }
 
-function EpisodeRail({
-  open,
+function EpisodeListPanel({
   episodes,
   playableCount,
   currentKey,
-  onClose,
+  variant,
   onSelect,
 }: {
-  open: boolean;
   episodes: PlaybackEpisode[];
   playableCount: number;
   currentKey: string;
-  onClose: () => void;
+  variant: "sidebar" | "overlay";
   onSelect: (episode: PlaybackEpisode) => void;
 }) {
   const [onlyPlayable, setOnlyPlayable] = useState(false);
@@ -1448,150 +1464,113 @@ function EpisodeRail({
   );
 
   useEffect(() => {
-    if (!open) return;
     const frame = window.requestAnimationFrame(() => {
       selectedEpisodeRef.current?.scrollIntoView({ block: "center" });
     });
     return () => window.cancelAnimationFrame(frame);
-  }, [currentKey, onlyPlayable, open]);
-
-  useEffect(() => {
-    if (!open) return;
-    const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") {
-        onClose();
-      }
-    };
-    window.addEventListener("keydown", handleKeyDown);
-    return () => {
-      window.removeEventListener("keydown", handleKeyDown);
-    };
-  }, [onClose, open]);
+  }, [currentKey, onlyPlayable]);
 
   return (
-    <AnimatePresence>
-      {open && (
-        <motion.div
-          className="player-episode-overlay absolute inset-0 z-40"
-          initial={{ opacity: 0 }}
-          animate={{ opacity: 1 }}
-          exit={{ opacity: 0 }}
-          transition={{ duration: 0.18 }}
+    <aside
+      className={cn("player-episode-panel", variant === "overlay" ? "is-overlay" : "is-sidebar")}
+      aria-label="选集"
+    >
+      <div className="mb-4 flex items-start justify-between gap-4">
+        <div className="min-w-0">
+          <h2 className="text-[17px] font-bold tracking-tight">选集</h2>
+          <span className="mt-1 block text-[12px] opacity-60">
+            {playableCount} / {episodes.length} 集可播放
+          </span>
+        </div>
+      </div>
+
+      <div className="player-episode-filter mb-4">
+        <button
+          type="button"
+          className={cn(!onlyPlayable && "is-selected")}
+          onClick={() => setOnlyPlayable(false)}
         >
-          <button
-            type="button"
-            className="absolute inset-0 bg-black/[0.06]"
-            onClick={onClose}
-            aria-label="关闭选集"
-          />
-          <motion.aside
-            className="player-episode-rail material-overlay absolute bottom-5 right-5 top-5 flex w-[min(380px,calc(100vw-48px))] flex-col rounded-[24px] px-5 py-5 shadow-[0_30px_90px_rgba(0,0,0,0.28)]"
-            role="dialog"
-            aria-label="选集"
-            initial={{ opacity: 0, x: 36 }}
-            animate={{ opacity: 1, x: 0 }}
-            exit={{ opacity: 0, x: 36 }}
-            transition={appleSpringSoft}
-          >
-            <div className="mb-4 flex items-start justify-between gap-4">
-              <div className="min-w-0">
-                <h2 className="text-[17px] font-bold tracking-tight text-[var(--color-text-primary)]">选集</h2>
-                <span className="mt-1 block text-[12px] text-[var(--color-text-tertiary)]">
-                  {playableCount} / {episodes.length} 集可播放
-                </span>
-              </div>
-              <button
-                type="button"
-                className="flex size-9 items-center justify-center rounded-full bg-black/[0.05] text-[var(--color-text-secondary)] hover:text-[var(--color-text-primary)]"
-                onClick={onClose}
-                aria-label="关闭选集"
-              >
-                <X size={17} />
-              </button>
-            </div>
+          全部
+        </button>
+        <button
+          type="button"
+          className={cn(onlyPlayable && "is-selected")}
+          onClick={() => setOnlyPlayable(true)}
+        >
+          可播放
+        </button>
+      </div>
 
-            <div className="player-episode-filter mb-4">
-              <button
-                type="button"
-                className={cn(!onlyPlayable && "is-selected")}
-                onClick={() => setOnlyPlayable(false)}
-              >
-                全部
-              </button>
-              <button
-                type="button"
-                className={cn(onlyPlayable && "is-selected")}
-                onClick={() => setOnlyPlayable(true)}
-              >
-                可播放
-              </button>
-            </div>
-
-            <div className="player-episode-list -mx-1 min-h-0 flex-1 overflow-y-auto px-1 pr-1">
-              {visibleEpisodes.map((episode) => {
-                const selected = episode.key === currentKey;
-                const playable = Boolean(episode.cached && episode.mediaId);
-                const title = episodeTitle(episode);
-                return (
-                  <button
-                    key={episode.key}
-                    ref={selected ? selectedEpisodeRef : undefined}
-                    type="button"
-                    className={cn(
-                      "cv-episode-row player-episode-row group relative mb-2.5 flex w-full items-center gap-3 rounded-2xl px-3 py-2.5 text-left transition-colors",
-                      playable ? "hover:bg-black/[0.035]" : "cursor-default opacity-54",
-                      selected && "is-selected bg-[var(--color-primary-soft)] hover:bg-[var(--color-primary-soft)]"
-                    )}
-                    disabled={!playable}
-                    onClick={() => onSelect(episode)}
-                  >
-                    <span
-                      className={cn(
-                        "flex size-9 shrink-0 items-center justify-center rounded-full text-[13px] font-semibold tabular-nums",
-                        selected
-                          ? "bg-[var(--color-primary)] text-white"
-                          : playable
-                            ? "bg-black/[0.05] text-[var(--color-text-secondary)]"
-                            : "bg-black/[0.035] text-[var(--color-text-tertiary)]"
-                      )}
-                    >
-                      {selected ? <Play size={14} fill="currentColor" /> : playable ? <Check size={15} /> : episode.episode}
-                    </span>
-                    <span className="min-w-0 flex-1">
-                      <span className="flex min-w-0 items-center gap-2">
-                        <span className="truncate text-[13.5px] font-semibold text-[var(--color-text-primary)]">
-                          第 {episode.episode} 集
-                          {title && title !== `第 ${episode.episode} 集` ? ` · ${title}` : ""}
-                        </span>
-                        {selected && (
-                          <span className="shrink-0 rounded-full bg-[var(--color-primary)] px-2 py-0.5 text-[10px] font-bold text-white">
-                            正在播放
-                          </span>
-                        )}
-                      </span>
-                      <span className="mt-1 flex min-w-0 items-center gap-1.5 text-[11.5px] text-[var(--color-text-tertiary)]">
-                        <Clock3 size={12} />
-                        <span className="truncate">
-                          {playable
-                            ? episode.fileSize || episode.fileName || episode.airDate || "已缓存"
-                            : episode.airDate || "未缓存"}
-                        </span>
-                      </span>
-                    </span>
-                  </button>
-                );
-              })}
-              {!visibleEpisodes.length && (
-                <div className="flex h-28 items-center justify-center rounded-2xl bg-black/[0.035] text-[13px] font-semibold text-[var(--color-text-tertiary)]">
-                  没有可播放剧集
-                </div>
+      <div className="player-episode-list -mx-1 min-h-0 flex-1 overflow-y-auto px-1 pr-1">
+        {visibleEpisodes.map((episode) => {
+          const selected = episode.key === currentKey;
+          const playable = Boolean(episode.cached && episode.mediaId);
+          const title = episodeTitle(episode);
+          return (
+            <button
+              key={episode.key}
+              ref={selected ? selectedEpisodeRef : undefined}
+              type="button"
+              className={cn(
+                "cv-episode-row player-episode-row group relative mb-2.5 flex w-full items-center gap-3 rounded-2xl px-3 py-2.5 text-left transition-colors",
+                playable ? "hover:bg-black/[0.035] dark:hover:bg-white/[0.07]" : "cursor-default opacity-54",
+                selected && "is-selected"
               )}
-            </div>
-          </motion.aside>
-        </motion.div>
-      )}
-    </AnimatePresence>
+              disabled={!playable}
+              onClick={() => onSelect(episode)}
+            >
+              <span
+                className={cn(
+                  "flex size-9 shrink-0 items-center justify-center rounded-full text-[13px] font-semibold tabular-nums",
+                  selected
+                    ? "bg-[var(--color-primary)] text-white"
+                    : playable
+                      ? "bg-black/[0.05] text-[var(--color-text-secondary)] dark:bg-white/[0.08]"
+                      : "bg-black/[0.035] text-[var(--color-text-tertiary)] dark:bg-white/[0.05]"
+                )}
+              >
+                {selected ? <Play size={14} fill="currentColor" /> : playable ? <Check size={15} /> : episode.episode}
+              </span>
+              <span className="min-w-0 flex-1">
+                <span className="flex min-w-0 items-center gap-2">
+                  <span className="truncate text-[13.5px] font-semibold">
+                    第 {episode.episode} 集
+                    {title && title !== `第 ${episode.episode} 集` ? ` · ${title}` : ""}
+                  </span>
+                  {selected && (
+                    <span className="shrink-0 rounded-full bg-[var(--color-primary)] px-2 py-0.5 text-[10px] font-bold text-white">
+                      正在播放
+                    </span>
+                  )}
+                </span>
+                <span className="mt-1 flex min-w-0 items-center gap-1.5 text-[11.5px] opacity-55">
+                  <Clock3 size={12} />
+                  <span className="truncate">
+                    {playable
+                      ? episode.fileSize || episode.fileName || episode.airDate || "已缓存"
+                      : episode.airDate || "未缓存"}
+                  </span>
+                </span>
+              </span>
+            </button>
+          );
+        })}
+        {!visibleEpisodes.length && (
+          <div className="flex h-28 items-center justify-center rounded-2xl bg-black/[0.035] text-[13px] font-semibold opacity-60">
+            没有可播放剧集
+          </div>
+        )}
+      </div>
+    </aside>
   );
+}
+
+function blurActiveNonTextControl() {
+  const active = document.activeElement;
+  if (!(active instanceof HTMLElement) || isEditableTarget(active)) return;
+  if (active.matches("button, [role='button'], input[type='range'], [tabindex]")) {
+    active.blur();
+  }
 }
 
 function episodeTitle(episode: PlaybackEpisode) {
@@ -1693,7 +1672,10 @@ function isEditableTarget(target: EventTarget | null) {
   if (target.isContentEditable) {
     return true;
   }
-  return ["INPUT", "TEXTAREA", "SELECT"].includes(target.tagName);
+  if (target instanceof HTMLTextAreaElement || target instanceof HTMLSelectElement) {
+    return true;
+  }
+  return target instanceof HTMLInputElement && target.type !== "range";
 }
 
 function TrackOptionGroup({

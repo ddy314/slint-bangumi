@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState, type MouseEvent } from "react";
 import { AnimatePresence, MotionConfig, motion } from "framer-motion";
 import { NavRail, type Route } from "./NavRail";
 import { LibraryPage } from "./pages/Library";
@@ -148,6 +148,13 @@ export default function App() {
         data-theme={theme}
         data-nav-collapsed={navCollapsed ? "true" : "false"}
         className="app-shell relative h-screen w-screen overflow-hidden bg-[var(--color-bg)] text-[var(--color-text-primary)]"
+        onMouseDownCapture={suppressNonTextControlFocus}
+        onPointerUpCapture={blurActiveNonTextControl}
+        onKeyDownCapture={(event) => {
+          if (event.key.startsWith("Arrow")) {
+            blurActiveNonTextControl();
+          }
+        }}
       >
         <NavRail
           route={route}
@@ -275,4 +282,27 @@ function readStoredBoolean(key: string, fallback: boolean) {
   if (value === "true") return true;
   if (value === "false") return false;
   return fallback;
+}
+
+function suppressNonTextControlFocus(event: MouseEvent<HTMLElement>) {
+  const target = event.target;
+  if (!(target instanceof HTMLElement) || isTextEntryTarget(target)) return;
+  const control = target.closest("button, [role='button'], [tabindex]");
+  if (control instanceof HTMLElement && !control.closest("[data-allow-focus='true']")) {
+    event.preventDefault();
+  }
+}
+
+function blurActiveNonTextControl() {
+  const active = document.activeElement;
+  if (!(active instanceof HTMLElement) || isTextEntryTarget(active)) return;
+  if (active.matches("button, [role='button'], input[type='range'], [tabindex]")) {
+    active.blur();
+  }
+}
+
+function isTextEntryTarget(target: HTMLElement) {
+  if (target.isContentEditable) return true;
+  if (target instanceof HTMLTextAreaElement || target instanceof HTMLSelectElement) return true;
+  return target instanceof HTMLInputElement && target.type !== "range";
 }
